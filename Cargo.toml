@@ -10,7 +10,7 @@ license      = "MIT OR Apache-2.0"
 repository   = "https://github.com/lxl66566/openppp3-rs"
 
 [workspace.dependencies]
-aes      = "0.8"
+aes      = "0.9"
 cfb-mode = "0.8"
 chacha20 = "0.10"
 ctr      = "0.9"
