@@ -39,7 +39,7 @@ pub mod transmission;
 pub use config::ObfuscationKey;
 pub use crypto::cipher::{Method, SessionCipher};
 pub use error::{Error, Result};
-pub use transmission::Transmission;
+pub use transmission::{Transmission, TransmissionRx, TransmissionTx};
 
 /// 128-bit session identifier (openppp2 `Int128`).
 pub type SessionId = u128;

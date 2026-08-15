@@ -1,0 +1,25 @@
+[package]
+name         = "openppp3-common"
+description  = "Shared building blocks for the openppp3 proxy server and client"
+readme       = "../../README.md"
+keywords     = ["proxy", "anti-censorship", "network", "openppp2"]
+categories   = ["network-programming"]
+
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[dependencies]
+openppp3-core = { workspace = true }
+ipnet         = { workspace = true }
+serde         = { workspace = true }
+json5         = { workspace = true }
+thiserror     = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

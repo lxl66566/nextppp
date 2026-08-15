@@ -40,6 +40,7 @@ impl PipeChannel {
 }
 
 /// One end of an unbounded, thread-safe, blocking duplex pipe.
+#[derive(Clone)]
 pub struct PipeEnd {
     rx: PipeChannel,
     tx: PipeChannel,
@@ -374,4 +375,58 @@ fn abrupt_close_surfaces_io_error() {
     let err = client.handshake_client().unwrap_err();
     server_holder.join().unwrap();
     assert!(err.is_eof(), "expected EOF, got {err:?}");
+}
+
+#[test]
+fn split_halves_interop_with_unsplit_peer() {
+    // Both sides split, exchanging data concurrently in both directions:
+    // the classic two-thread pump model used by the proxy server/client.
+    for plaintext in [true, false] {
+        let key = ObfuscationKey {
+            plaintext,
+            ..ObfuscationKey::default()
+        };
+        let (client_io, server_io) = duplex_pair();
+        scope(|s| {
+            let server_key = key.clone();
+            let server = s.spawn(move || {
+                let mut server = Transmission::new(server_io, server_key);
+                server.handshake_server(TEST_SID, false).unwrap();
+                let (mut tx, mut rx) = {
+                    let rx_io = server.io().clone();
+                    server.split_with(rx_io)
+                };
+                // Upstream -> client while the client pumps the other way.
+                let pump = s.spawn(move || {
+                    for i in 0..50u32 {
+                        tx.write(format!("srv-{i}").as_bytes()).unwrap();
+                    }
+                    tx
+                });
+                for i in 0..50u32 {
+                    assert_eq!(rx.read().unwrap(), format!("cli-{i}").as_bytes());
+                }
+                pump.join().unwrap()
+            });
+
+            let mut client = Transmission::new(client_io, key);
+            client.handshake_client().unwrap();
+            let rx_io = client.io().clone();
+            let (mut tx, mut rx) = client.split_with(rx_io);
+            let pump = scope(|s2| {
+                let rx = s2.spawn(move || {
+                    for i in 0..50u32 {
+                        assert_eq!(rx.read().unwrap(), format!("srv-{i}").as_bytes());
+                    }
+                    rx
+                });
+                for i in 0..50u32 {
+                    tx.write(format!("cli-{i}").as_bytes()).unwrap();
+                }
+                rx.join().unwrap()
+            });
+            drop((tx, pump));
+            server.join().unwrap();
+        });
+    }
 }

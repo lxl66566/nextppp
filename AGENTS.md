@@ -21,9 +21,8 @@ temperature: 0
 
 核心要点：
 
-1. openppp2 使用自研协议，且该协议 bypass GFW 能力已经过广泛验证。你实现的协议**不需要与原版兼容**，但是为了 bypass GFW 而进行的特殊设计需要保留。
-   - 如果你认为有不合适的地方，例如没啥意义的特殊逻辑、密码学不安全、md5 不安全、性能不够高、随机算法等问题，都可以改。具体哪些有意义，哪些没有意义，需要你自己判断。
-2. 原版 openppp2 是工作在虚拟网卡上的 VPN，而本次重写目标是做一个代理而非 VPN，不涉及网卡等底层内容。
+1. openppp2 使用自研协议，且该协议 bypass GFW 能力已经过广泛验证。你实现的协议**不需要与原版兼容**，但是为了 bypass GFW 而进行的特殊设计需要保留。目前已经实现完成，详见 `crates/core/README.md`。
+2. 原版 openppp2 是工作在虚拟网卡上的 VPN，而本次重写目标是做一个代理工具而非 VPN，不涉及网卡等底层内容。
 3. 命令行等用户交互层的内容，完全重写，不需要考虑 openppp2 原版的实现。
 4. 对于 client 用户交互，使用 jsonc 配置文件，并且允许配置 direct/proxy/blocking 规则（可以暂时先不支持 geosite/geoip 等 source），Windows 上支持设置系统代理，且支持设置系统代理排除。
    - 低优先级：支持从 sing-box 配置生成 openppp3-rs 配置。
@@ -33,4 +32,3 @@ temperature: 0
 
 1. 性能优先，关键路径需要 simd。
 2. Rust 实现也必须跨 Windows/Linux/Macos 多平台。
-3. 需要把当前项目改造为 cargo workspace，核心实现放在 core lib

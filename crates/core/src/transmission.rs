@@ -50,7 +50,9 @@ use crate::{
 /// duplex byte transport.
 ///
 /// A `Transmission` is inherently single-threaded per direction; wrap it in
-/// your favorite executor or split the I/O to add async support.
+/// your favorite executor, or [`Transmission::split_with`] it into
+/// [`TransmissionTx`]/[`TransmissionRx`] halves for the classic two-thread
+/// bidirectional pump model.
 pub struct Transmission<T, R = StdRng> {
     io: T,
     rng: R,
@@ -368,5 +370,239 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
                 return Ok(id);
             }
         }
+    }
+}
+
+/// Sending half of a [`Transmission`] produced by
+/// [`Transmission::split_with`]. Owns the write side of the transport and the
+/// tx-direction cipher/framer state, so it can be moved to a dedicated
+/// writer thread while [`TransmissionRx`] keeps reading.
+pub struct TransmissionTx<T, R = StdRng> {
+    io: T,
+    rng: R,
+    key: ObfuscationKey,
+    b94: Base94Framer,
+    protocol_tx: SessionCipher,
+    transport_tx: SessionCipher,
+    handshaked: bool,
+    scratch: Vec<u8>,
+}
+
+impl<T, R: Rng> TransmissionTx<T, R> {
+    /// Whether the owning transmission completed its handshake.
+    #[must_use]
+    pub fn is_handshaked(&self) -> bool {
+        self.handshaked
+    }
+
+    /// Access to the underlying transport (write side).
+    #[must_use]
+    pub fn io(&self) -> &T {
+        &self.io
+    }
+
+    /// Mutable access to the underlying transport.
+    pub fn io_mut(&mut self) -> &mut T {
+        &mut self.io
+    }
+
+    /// Encrypts `plaintext` into a complete wire packet appended to `out`
+    /// (in-memory path; see [`Transmission::encrypt_into`]).
+    pub fn encrypt_into(&mut self, out: &mut Vec<u8>, plaintext: &[u8]) -> Result<()> {
+        if plaintext.is_empty() {
+            return Err(Error::ZeroLength);
+        }
+        if plaintext.len() > PPP_BUFFER_SIZE {
+            return Err(Error::FrameTooLarge {
+                len: plaintext.len(),
+            });
+        }
+
+        let flags = if self.handshaked {
+            PayloadFlags {
+                masked: self.key.masked,
+                shuffle: self.key.shuffle_data,
+                delta: self.key.delta_encode,
+            }
+        } else {
+            PayloadFlags::SAFEST
+        };
+        let (header, header_kf) = header_encrypt(
+            &mut self.rng,
+            self.key.kf,
+            Some(&mut self.protocol_tx),
+            plaintext.len(),
+        )?;
+
+        // Assemble the binary packet (header || transformed body) into `out`.
+        let body_start = out.len();
+        out.reserve(HEADER_SIZE + plaintext.len());
+        out.extend_from_slice(&header);
+        out.extend_from_slice(plaintext);
+        let body = &mut out[body_start + HEADER_SIZE..];
+        self.transport_tx.apply(body);
+        payload_obfuscate(body, &flags, header_kf, self.key.kf);
+
+        if !self.handshaked || self.key.plaintext {
+            // `out` currently holds the assembled binary packet; re-envelope
+            // it into a fresh region of `out`.
+            let wire = mem::take(out);
+            self.b94.encode_frame(&mut self.rng, out, &wire)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<T: Write, R: Rng> TransmissionTx<T, R> {
+    /// Writes one encrypted message to the transport (streaming).
+    pub fn write(&mut self, plaintext: &[u8]) -> Result<()> {
+        let mut out = mem::take(&mut self.scratch);
+        out.clear();
+        self.encrypt_into(&mut out, plaintext)?;
+        let result = self.io.write_all(&out).map_err(Error::Io);
+        self.scratch = out;
+        result?;
+        Ok(())
+    }
+}
+
+/// Receiving half of a [`Transmission`] produced by
+/// [`Transmission::split_with`]. Owns the read side of the transport and the
+/// rx-direction cipher/framer state.
+pub struct TransmissionRx<T> {
+    io: T,
+    key: ObfuscationKey,
+    b94: Base94Framer,
+    protocol_rx: SessionCipher,
+    transport_rx: SessionCipher,
+    handshaked: bool,
+}
+
+impl<T> TransmissionRx<T> {
+    /// Whether the owning transmission completed its handshake.
+    #[must_use]
+    pub fn is_handshaked(&self) -> bool {
+        self.handshaked
+    }
+
+    /// Access to the underlying transport (read side).
+    #[must_use]
+    pub fn io(&self) -> &T {
+        &self.io
+    }
+
+    /// Mutable access to the underlying transport.
+    pub fn io_mut(&mut self) -> &mut T {
+        &mut self.io
+    }
+}
+
+impl<T: Read> TransmissionRx<T> {
+    /// Reads and decrypts one message, blocking until a full frame arrives
+    /// (see [`Transmission::read`]).
+    pub fn read(&mut self) -> Result<Vec<u8>> {
+        if !self.handshaked || self.key.plaintext {
+            let binary = {
+                let Self { b94, io, .. } = self;
+                b94.read_frame(io)?
+            };
+            self.decrypt_packet(&binary)
+        } else {
+            let mut header = [0u8; HEADER_SIZE];
+            self.io.read_exact(&mut header).map_err(Error::Io)?;
+            let (len, header_kf) =
+                header_decrypt(self.key.kf, Some(&mut self.protocol_rx), &header)?;
+            if !(1..=PPP_BUFFER_SIZE).contains(&len) {
+                return Err(Error::FrameTooLarge { len });
+            }
+            let mut body = vec![0u8; len];
+            self.io.read_exact(&mut body).map_err(Error::Io)?;
+            self.decrypt_body(header_kf, &mut body);
+            Ok(body)
+        }
+    }
+
+    fn decrypt_packet(&mut self, binary: &[u8]) -> Result<Vec<u8>> {
+        if binary.len() <= HEADER_SIZE {
+            return Err(Error::InvalidFrame);
+        }
+        let header: [u8; HEADER_SIZE] = binary[..HEADER_SIZE].try_into().expect("length checked");
+        let (len, header_kf) = header_decrypt(self.key.kf, Some(&mut self.protocol_rx), &header)?;
+        if !(1..=PPP_BUFFER_SIZE).contains(&len) {
+            return Err(Error::FrameTooLarge { len });
+        }
+        // Truncation/splicing guard: length must match the buffer exactly.
+        if len + HEADER_SIZE != binary.len() {
+            return Err(Error::InvalidFrame);
+        }
+        let mut body = binary[HEADER_SIZE..].to_vec();
+        self.decrypt_body(header_kf, &mut body);
+        Ok(body)
+    }
+
+    fn decrypt_body(&mut self, header_kf: u32, body: &mut [u8]) {
+        let flags = if self.handshaked {
+            PayloadFlags {
+                masked: self.key.masked,
+                shuffle: self.key.shuffle_data,
+                delta: self.key.delta_encode,
+            }
+        } else {
+            PayloadFlags::SAFEST
+        };
+        payload_deobfuscate(body, &flags, header_kf, self.key.kf);
+        self.transport_rx.apply(body);
+    }
+}
+
+/// Split support: requires a duplex transport (read + write per half).
+impl<T: Read + Write, R: Rng> Transmission<T, R> {
+    /// Splits the transmission into independent sending/receiving halves for
+    /// the classic two-thread bidirectional pump model:
+    ///
+    /// * `TransmissionTx` keeps `self.io` as its **write** side;
+    /// * `TransmissionRx` uses `rx_io` as its **read** side — the caller must
+    ///   pass a handle aliasing the *same* connection (e.g.
+    ///   `TcpStream::try_clone`), which must happen **before** the split
+    ///   while the original stream is still owned by the caller.
+    ///
+    /// Per-direction cipher nonces and base94 first-frame states are already
+    /// tracked independently inside `Transmission`, so the halves stay
+    /// wire-compatible with an unsplit peer.
+    pub fn split_with(self, rx_io: T) -> (TransmissionTx<T, R>, TransmissionRx<T>) {
+        let Self {
+            io,
+            rng,
+            key,
+            b94,
+            protocol_tx,
+            protocol_rx,
+            transport_tx,
+            transport_rx,
+            handshaked,
+            session_id: _,
+            scratch_a,
+            scratch_b: _,
+        } = self;
+        let tx = TransmissionTx {
+            io,
+            rng,
+            key: key.clone(),
+            b94: b94.clone(),
+            protocol_tx,
+            transport_tx,
+            handshaked,
+            scratch: scratch_a,
+        };
+        let rx = TransmissionRx {
+            io: rx_io,
+            key,
+            b94,
+            protocol_rx,
+            transport_rx,
+            handshaked,
+        };
+        (tx, rx)
     }
 }
