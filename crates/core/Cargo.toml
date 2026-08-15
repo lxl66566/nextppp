@@ -1,0 +1,26 @@
+[package]
+name         = "openppp3-core"
+description  = "Core protocol and cryptography algorithms of the openppp3 anti-censorship proxy"
+readme       = "../../README.md"
+keywords     = ["proxy", "anti-censorship", "network", "openppp2"]
+categories   = ["network-programming"]
+
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[dependencies]
+aes       = { workspace = true }
+cfb-mode  = { workspace = true }
+chacha20  = { workspace = true }
+ctr       = { workspace = true }
+hkdf      = { workspace = true }
+hmac      = { workspace = true }
+rand      = { workspace = true }
+sha2      = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
