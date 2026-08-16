@@ -4,8 +4,10 @@
 //! wrapping data in `FRAME_DATA` frames and propagating half-closes as
 //! `FRAME_EOF` (the nextppp framing itself has no in-band EOF).
 //!
-//! Pumps classify how each direction ended (clean close / routine reset /
-//! fault) so callers can log connection teardown at the right level.
+//! Pumps classify how each direction ended (graceful half-close / routine
+//! reset / fault) so callers can log connection teardown at the right level.
+//! A non-graceful end shuts down both sockets, waking the sibling pump;
+//! a graceful half-close (`FRAME_EOF`) leaves the other direction running.
 
 use std::{
     io::{self, ErrorKind, Read, Write},
@@ -25,7 +27,10 @@ const CHUNK: usize = 16 * 1024;
 /// How one pump direction terminated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PumpEnd {
-    /// Clean or routine teardown (EOF, reset, broken pipe, timeout); the
+    /// Graceful in-band half-close (`FRAME_EOF` sent/received): the sibling
+    /// direction may still be legitimately active, so the session stays up.
+    Eof(&'static str),
+    /// Routine transport teardown (EOF, reset, broken pipe, timeout); the
     /// short static cause feeds the connection-close log.
     Closed(&'static str),
     /// Protocol violation or unexpected I/O failure; worth a warning.
@@ -101,8 +106,13 @@ fn tunnel_up(mut tx: TransmissionTx<TcpStream>, mut local: TcpStream) -> (u64, P
     loop {
         match local.read(&mut buf) {
             Ok(0) => {
-                let _ = tx.write(&[FRAME_EOF]);
-                return (total, PumpEnd::Closed("local eof"));
+                // Best-effort FRAME_EOF; if the tunnel is already dead the
+                // write fails and the session is torn down (non-graceful)
+                // instead of reported as a clean half-close.
+                return match tx.write(&[FRAME_EOF]) {
+                    Ok(()) => (total, PumpEnd::Eof("local eof")),
+                    Err(e) => (total, classify_core(e)),
+                };
             },
             Ok(n) => {
                 frame.clear();
@@ -139,7 +149,7 @@ fn tunnel_down(mut rx: TransmissionRx<TcpStream>, mut local: TcpStream) -> (u64,
                     },
                     FRAME_EOF => {
                         let _ = local.shutdown(Shutdown::Write);
-                        return (total, PumpEnd::Closed("remote eof"));
+                        return (total, PumpEnd::Eof("remote eof"));
                     },
                     _ => {
                         // Unknown frame kind: protocol violation.
@@ -196,7 +206,7 @@ impl PumpEnd {
     #[must_use]
     pub fn cause(&self) -> &str {
         match self {
-            Self::Closed(why) => why,
+            Self::Eof(why) | Self::Closed(why) => why,
             Self::Fault(e) => e.as_str(),
         }
     }
@@ -205,6 +215,38 @@ impl PumpEnd {
     #[must_use]
     pub fn is_fault(&self) -> bool {
         matches!(self, Self::Fault(_))
+    }
+
+    /// Whether this end kills the whole session: everything except a
+    /// graceful in-band half-close means the sibling pump can never make
+    /// progress again and must be woken up via socket shutdown.
+    fn kills_session(&self) -> bool {
+        !matches!(self, Self::Eof(_))
+    }
+}
+
+/// Session teardown handles. Dropping one clone of a socket never wakes a
+/// thread blocked in `read` on another clone (no FIN is sent while handles
+/// remain); `shutdown` acts on the socket itself and does. Both pumps keep
+/// one of these so a non-graceful end can unblock its sibling instead of
+/// leaving it parked on a dead connection forever (NAT timeouts and network
+/// partitions make this routine on proxied networks).
+struct KillSwitch {
+    tunnel: TcpStream,
+    local: TcpStream,
+}
+
+impl KillSwitch {
+    fn new(tunnel: &TcpStream, local: &TcpStream) -> Self {
+        Self {
+            tunnel: tunnel.try_clone().expect("tcp stream clone"),
+            local: local.try_clone().expect("tcp stream clone"),
+        }
+    }
+
+    fn activate(&self) {
+        let _ = self.tunnel.shutdown(Shutdown::Both);
+        let _ = self.local.shutdown(Shutdown::Both);
     }
 }
 
@@ -218,8 +260,22 @@ pub fn pump_tunnel(
 ) -> PumpStats {
     let local_w = local.try_clone().expect("tcp stream clone");
     thread::scope(|s| {
-        let down = s.spawn(move || tunnel_down(rx, local_w));
-        let up = s.spawn(move || tunnel_up(tx, local));
+        let up_kill = KillSwitch::new(rx.io(), &local);
+        let down_kill = KillSwitch::new(tx.io(), &local_w);
+        let down = s.spawn(move || {
+            let r = tunnel_down(rx, local_w);
+            if r.1.kills_session() {
+                down_kill.activate();
+            }
+            r
+        });
+        let up = s.spawn(move || {
+            let r = tunnel_up(tx, local);
+            if r.1.kills_session() {
+                up_kill.activate();
+            }
+            r
+        });
         let (up, up_end) = up
             .join()
             .unwrap_or((0, PumpEnd::Fault("up pump panicked".into())));
