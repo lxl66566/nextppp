@@ -31,3 +31,7 @@ temperature: 0
 
 1. 性能优先，关键路径需要 simd。
 2. Rust 实现也必须跨 Windows/Linux/Macos 多平台。
+
+crate 偏好：
+
+- 使用 spdlog-rs 打日志

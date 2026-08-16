@@ -1,17 +1,17 @@
 {
-    // Local SOCKS5 inbound. Point a front-end proxy (e.g. sing-box's
-    // socks outbound) here; routing/splitting is its job.
-    "listen": "127.0.0.1:1080",
+  // Local SOCKS5 inbound. Point a front-end proxy (e.g. sing-box's
+  // socks outbound) here; routing/splitting is its job.
+  "listen": "127.0.0.1:1080",
 
-    // Shared tunnel password; must match the server. Backs both
-    // obfuscation cipher keys when they are left unset.
-    "password": "CHANGE_ME",
+  // Shared tunnel password; must match the server. Backs both
+  // obfuscation cipher keys when they are left unset.
+  "password": "CHANGE_ME",
 
-    // Remote openppp3 server.
-    "server": {
-        "address": "your.server.example:6666",
-        // "connect_timeout": 10,
-        // Must mirror the server configuration (password included).
-        // "obfuscation": { ... },
-    },
+  // Remote openppp3 server.
+  "server": {
+    "address": "your.server.example:6666",
+    // "connect_timeout": 10,
+    // Must mirror the server configuration (password included).
+    // "obfuscation": { ... },
+  },
 }

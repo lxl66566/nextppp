@@ -1,10 +1,9 @@
 # openppp3-rs
 
-用 Rust 重写的 [openppp2](https://github.com/user/swp) 抗封锁传输协议，定位是**代理**（proxy）而非 VPN。
+用 Rust 重写的 [openppp2](https://github.com/user/swp) 抗封锁传输协议，定位是代理（proxy）而非 VPN。
 
 - 抗封锁传输协议：base94 可打印外壳、随机化帧头、NOP 噪声前奏、每连接独立密钥，握手前流量无加密特征。
-- 单二进制双角色：`openppp3 server` / `openppp3 client`。
-- 客户端是纯粹的 **SOCKS5 入站 -> openppp3 隧道** 转发器，分流交给 sing-box 等前端。
+- 客户端是纯粹的 SOCKS5 入站 -> openppp3 隧道，分流交给 sing-box 等前端。
 - 跨平台（Windows / Linux / macOS）。
 
 ## 快速开始
@@ -51,14 +50,9 @@ cargo build --release
 - `password` 部署时必须修改（仍为内置占位符时启动会告警）。
 - 配置文件为 jsonc，支持注释与尾逗号。
 
-## 日志
+## 其他
 
-基于 [spdlog-rs](https://github.com/SpriteOvO/spdlog-rs)（低开销、无锁热路径）。
-
-- `info`：连接生命周期（建立 / 目标 / 字节数 / 时长 / 关闭原因）、服务端每 60s 心跳
-  （uptime、活跃与累计会话、失败握手数、双向流量）。
-- `warn`：握手失败（探测 / 密钥错误）、数据面协议错误、隧道建立失败。
-- 级别通过 `SPDLOG_RS_LEVEL` 环境变量控制（`debug` / `trace` / `off`），默认 `info`。
+- 日志级别通过 `SPDLOG_RS_LEVEL` 环境变量控制（`debug` / `trace` / `off`），默认 `info`。
 
 ## 测试与基准
 
