@@ -137,8 +137,20 @@ impl ObfuscationConfig {
     ///
     /// # Errors
     ///
-    /// Unknown cipher method name or empty password.
+    /// Unknown cipher method name, empty password or out-of-range NOP
+    /// exponents.
     pub fn to_key(&self, shared_password: Option<&str>) -> Result<ObfuscationKey, String> {
+        // kl/kh feed `1 << exp` and a rounds sampler in the core handshake;
+        // unchecked, values >= 32 overflow the u32 shift, and large values
+        // below that stall the handshake under thousands of noise packets
+        // (2^20 rounds / 1400 is already ~750).
+        const MAX_NOP_EXPONENT: u8 = 20;
+        if self.kl > MAX_NOP_EXPONENT || self.kh > MAX_NOP_EXPONENT {
+            return Err(format!(
+                "kl/kh must be <= {MAX_NOP_EXPONENT} (got kl={}, kh={})",
+                self.kl, self.kh
+            ));
+        }
         Ok(ObfuscationKey {
             kf: self.kf,
             kl: self.kl,
@@ -344,6 +356,21 @@ mod tests {
             ..ObfuscationConfig::default()
         };
         assert!(cfg.to_key(None).unwrap_err().contains("unknown cipher"));
+    }
+
+    #[test]
+    fn nop_exponent_overflow_rejected() {
+        // kl feeds `1 << kl` in the core handshake; >= 32 would overflow.
+        let cfg = ObfuscationConfig {
+            kl: 32,
+            ..ObfuscationConfig::default()
+        };
+        assert!(cfg.to_key(None).unwrap_err().contains("kl/kh"));
+        let cfg = ObfuscationConfig {
+            kh: 21,
+            ..ObfuscationConfig::default()
+        };
+        assert!(cfg.to_key(None).unwrap_err().contains("kl/kh"));
     }
 
     #[test]
