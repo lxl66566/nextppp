@@ -1,6 +1,6 @@
-//! Shared building blocks for the openppp3 proxy server and client:
+//! Shared building blocks for the nextppp proxy server and client:
 //! configuration loading (jsonc), the application layer tunneled above the
-//! openppp3 transmission, and bidirectional pump helpers for the synchronous
+//! nextppp transmission, and bidirectional pump helpers for the synchronous
 //! two-thread connection model.
 //!
 //! Routing/splitting is deliberately out of scope: the client is a plain

@@ -881,6 +881,73 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextppp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hotpath",
+ "nextppp-client",
+ "nextppp-common",
+ "nextppp-server",
+ "spdlog-rs",
+]
+
+[[package]]
+name = "nextppp-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hotpath",
+ "libc",
+ "nextppp-common",
+ "nextppp-core",
+ "nextppp-server",
+ "spdlog-rs",
+]
+
+[[package]]
+name = "nextppp-common"
+version = "0.1.0"
+dependencies = [
+ "hotpath",
+ "json5",
+ "nextppp-core",
+ "serde",
+ "spdlog-rs",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "nextppp-core"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "base94-simd",
+ "cfb-mode",
+ "chacha20",
+ "criterion",
+ "ctr",
+ "hkdf",
+ "hotpath",
+ "rand",
+ "sha2",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "nextppp-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hotpath",
+ "nextppp-common",
+ "nextppp-core",
+ "rand",
+ "spdlog-rs",
+]
+
+[[package]]
 name = "nom"
 version = "8.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -924,73 +991,6 @@ name = "oorandom"
 version = "11.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
-
-[[package]]
-name = "openppp3"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "hotpath",
- "openppp3-client",
- "openppp3-common",
- "openppp3-server",
- "spdlog-rs",
-]
-
-[[package]]
-name = "openppp3-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "hotpath",
- "libc",
- "openppp3-common",
- "openppp3-core",
- "openppp3-server",
- "spdlog-rs",
-]
-
-[[package]]
-name = "openppp3-common"
-version = "0.1.0"
-dependencies = [
- "hotpath",
- "json5",
- "openppp3-core",
- "serde",
- "spdlog-rs",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "openppp3-core"
-version = "0.1.0"
-dependencies = [
- "aes",
- "base94-simd",
- "cfb-mode",
- "chacha20",
- "criterion",
- "ctr",
- "hkdf",
- "hotpath",
- "rand",
- "sha2",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "openppp3-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "hotpath",
- "openppp3-common",
- "openppp3-core",
- "rand",
- "spdlog-rs",
-]
 
 [[package]]
 name = "page_size"

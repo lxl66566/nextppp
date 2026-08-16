@@ -168,11 +168,11 @@ impl SessionCipher {
         // The salt mixes role + method, giving every (layer, cipher) pair an
         // independent key domain; sharing one password across layers is then
         // safe by construction.
-        let salt = format!("openppp3/{}/{}", role.name(), method.name());
+        let salt = format!("nextppp/{}/{}", role.name(), method.name());
         let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), &ikm);
         let mut okm = [0u8; KEY_MAX + NONCE_MAX];
         // Length is fixed and well below the HKDF limit; cannot fail.
-        hk.expand(b"openppp3-session-key", &mut okm)
+        hk.expand(b"nextppp-session-key", &mut okm)
             .expect("static HKDF output length");
 
         let mut key = [0u8; KEY_MAX];

@@ -6,7 +6,7 @@ members  = ["crates/*"]
 version      = "0.1.0"
 edition      = "2024"
 rust-version = "1.85"
-repository   = "https://github.com/lxl66566/openppp3-rs"
+repository   = "https://github.com/lxl66566/nextppp"
 license      = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -29,10 +29,10 @@ base94-simd     = { path = "crates/base94", version = "0.1.0" }
 clap            = { version = "4", features = ["derive"] }
 hotpath         = "0.23"
 json5           = "1.3"
-openppp3-client = { path = "crates/client" }
-openppp3-common = { path = "crates/common" }
-openppp3-core   = { path = "crates/core" }
-openppp3-server = { path = "crates/server" }
+nextppp-client = { path = "crates/client" }
+nextppp-common = { path = "crates/common" }
+nextppp-core   = { path = "crates/core" }
+nextppp-server = { path = "crates/server" }
 serde           = { version = "1", features = ["derive"] }
 spdlog-rs       = "0.5"
 

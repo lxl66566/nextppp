@@ -1,40 +1,40 @@
-# openppp3-rs
+# nextppp
 
-用 Rust 重写的 [openppp2](https://github.com/user/swp) 抗封锁传输协议，定位是代理（proxy）而非 VPN。
+Rust 写的代理，bypass GFW。协议魔改自 [openppp2](https://github.com/liulilittle/openppp2)。
 
-- 抗封锁传输协议：base94 可打印外壳、随机化帧头、NOP 噪声前奏、每连接独立密钥，握手前流量无加密特征。
-- 客户端是纯粹的 SOCKS5 入站 -> openppp3 隧道，分流交给 sing-box 等前端。
-- 跨平台（Windows / Linux / macOS）。
+- 抗封锁传输协议：base94、随机化帧头、NOP 噪声前奏、每连接独立密钥，握手前流量无加密特征。
+- 不差的性能，详见[端到端吞吐量](#端到端吞吐量)。
+
+## 安装
+
+从 [Release](https://github.com/lxl66566/nextppp/releases) 下载 prebuilt binary。
 
 ## 快速开始
 
 ```sh
-# 构建
-cargo build --release
-
 # 服务端：生成示例配置并编辑（务必修改 password）
-./target/release/openppp3 server --init
-./target/release/openppp3 server -c openppp3-server.jsonc
+nextppp server --init
+nextppp server -c nextppp-server.jsonc
 
 # 客户端：生成示例配置并编辑（server 地址 + 与服务器一致的 password）
-./target/release/openppp3 client --init
-./target/release/openppp3 client -c openppp3-client.jsonc
+nextppp client --init
+nextppp client -c nextppp-client.jsonc
 ```
 
-客户端默认监听 `127.0.0.1:1080`。直接把 SOCKS5 应用指向该地址即可；
+客户端默认监听 `127.0.0.1:1080`。直接把系统代理指向该 SOCKS5 地址即可；
 更常见的用法是作为 sing-box 的 outbound，由 sing-box 负责分流：
 
 ```jsonc
-// sing-box 配置示意：apps -> sing-box (规则/geosite/geoip) -> openppp3-client -> 隧道
+// sing-box 配置示意：apps -> sing-box (规则/geosite/geoip) -> nextppp-client -> 隧道
 {
   "inbounds": [{ "type": "mixed", "listen": "127.0.0.1", "listen_port": 2080 }],
   "outbounds": [
-    { "type": "socks", "tag": "openppp3", "server": "127.0.0.1", "server_port": 1080 },
+    { "type": "socks", "tag": "nextppp", "server": "127.0.0.1", "server_port": 1080 },
     { "type": "direct", "tag": "direct" },
   ],
   "route": {
     "rules": [{ "domain_suffix": [".cn"], "outbound": "direct" }],
-    "final": "openppp3",
+    "final": "nextppp",
   },
 }
 ```
@@ -59,22 +59,14 @@ cargo build --release
 ### 端到端吞吐量
 
 集成测试 `crates/client/tests/throughput.rs` 走完整链路（socks5 入站 -> client ->
-openppp3 隧道 -> server -> 本地 echo），测单向字节速率，server 与 client 均为单核：
+nextppp 隧道 -> server -> 本地 echo），测单向字节速率，server 与 client 均为单核：
 
 ```sh
-cargo test -p openppp3-client --release --test throughput -- --ignored --nocapture
-# throughput: 268435456 bytes (256 MiB) in 2.62s = 97.88 MiB/s (server cpu 0, client cpu 1)
+cargo test -p nextppp-client --release --test throughput -- --ignored --nocapture
+# throughput: 268435456 bytes (256 MiB) in 1.64s = 156.45 MiB/s (server cpu 0, client cpu 1)
 ```
 
 ## 文档
 
 - 协议规范：[crates/core/README.md](crates/core/README.md)
 - 原版 openppp2 算法复现规范：[docs/openppp2-algo.md](docs/openppp2-algo.md)
-
-## MSRV
-
-Rust 1.85（edition 2024）。
-
-## License
-
-MIT OR Apache-2.0。

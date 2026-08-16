@@ -1,5 +1,5 @@
 //! Throughput benchmark for the full tunnel: socks5 inbound -> client ->
-//! openppp3 tunnel -> server -> loopback echo target.
+//! nextppp tunnel -> server -> loopback echo target.
 //!
 //! The server and client accept loops are each pinned to a single, distinct
 //! CPU via `sched_setaffinity(2)` (and their per-connection threads inherit
@@ -9,10 +9,10 @@
 //! It is `#[ignore]`d: it moves 256 MiB and must be run in release mode.
 //!
 //! ```text
-//! cargo test -p openppp3-client --release --test throughput -- --ignored --nocapture
+//! cargo test -p nextppp-client --release --test throughput -- --ignored --nocapture
 //! ```
 //!
-//! Override the transfer size with `OPENPPP3_THROUGHPUT_BYTES`.
+//! Override the transfer size with `NEXTPPP_THROUGHPUT_BYTES`.
 //!
 //! With `--features hotpath` the whole in-process stack (server + client +
 //! pumps) is hotpath-instrumented and the report prints on exit; combine
@@ -30,9 +30,9 @@ use std::{
     time::Duration,
 };
 
-use openppp3_client::ClientRuntime;
-use openppp3_common::config::{ClientConfig, ObfuscationConfig, ServerConfig, ServerSection};
-use openppp3_server::ServerRuntime;
+use nextppp_client::ClientRuntime;
+use nextppp_common::config::{ClientConfig, ObfuscationConfig, ServerConfig, ServerSection};
+use nextppp_server::ServerRuntime;
 
 /// Echo buffer: large enough that the loopback echo is never the bottleneck
 /// next to single-core crypto.
@@ -122,7 +122,7 @@ fn start_server(cpu: usize) -> SocketAddr {
         .name(format!("throughput-server@{cpu}"))
         .spawn(move || {
             pin_thread(cpu);
-            openppp3_server::serve(listener, rt).unwrap();
+            nextppp_server::serve(listener, rt).unwrap();
         })
         .unwrap();
     addr
@@ -146,7 +146,7 @@ fn start_client(cpu: usize, server: SocketAddr) -> SocketAddr {
         .name(format!("throughput-client@{cpu}"))
         .spawn(move || {
             pin_thread(cpu);
-            openppp3_client::serve(listener, rt).unwrap();
+            nextppp_client::serve(listener, rt).unwrap();
         })
         .unwrap();
     addr
@@ -225,7 +225,7 @@ fn blast(stream: &mut TcpStream, size: usize) -> (f64, Duration) {
 }
 
 fn total_bytes() -> usize {
-    std::env::var("OPENPPP3_THROUGHPUT_BYTES")
+    std::env::var("NEXTPPP_THROUGHPUT_BYTES")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_BYTES)

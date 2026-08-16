@@ -1,6 +1,6 @@
 [package]
-name        = "openppp3-server"
-description = "openppp3 anti-censorship proxy server"
+name        = "nextppp-server"
+description = "nextppp anti-censorship proxy server"
 readme      = "../../README.md"
 keywords    = ["anti-censorship", "network", "openppp2", "proxy"]
 categories  = ["network-programming"]
@@ -14,16 +14,16 @@ license.workspace      = true
 [dependencies]
 anyhow          = { workspace = true }
 hotpath         = { workspace = true, optional = true }
-openppp3-common = { workspace = true }
-openppp3-core   = { workspace = true }
+nextppp-common = { workspace = true }
+nextppp-core   = { workspace = true }
 rand            = { workspace = true }
 spdlog-rs       = { workspace = true }
 
 [features]
-# Profiling instrumentation; see openppp3-core's feature docs.
-hotpath       = ["dep:hotpath", "hotpath/hotpath", "openppp3-common/hotpath"]
-hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "openppp3-common/hotpath-alloc"]
-hotpath-cpu   = ["hotpath", "hotpath/hotpath-cpu", "openppp3-common/hotpath-cpu"]
+# Profiling instrumentation; see nextppp-core's feature docs.
+hotpath       = ["dep:hotpath", "hotpath/hotpath", "nextppp-common/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "nextppp-common/hotpath-alloc"]
+hotpath-cpu   = ["hotpath", "hotpath/hotpath-cpu", "nextppp-common/hotpath-cpu"]
 
 [lints]
 workspace = true

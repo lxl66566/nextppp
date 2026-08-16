@@ -1,22 +1,22 @@
-//! Outbound: every request goes through the openppp3 tunnel. Splitting and
+//! Outbound: every request goes through the nextppp tunnel. Splitting and
 //! direct connections are the front-end proxy's (sing-box & co.) job.
 
 use std::net::TcpStream;
 
 use anyhow::Context;
-use openppp3_common::{addr::ProxyAddr, proto::STATUS_OK, pump};
-use openppp3_core::{Transmission, TransmissionRx, TransmissionTx};
+use nextppp_common::{addr::ProxyAddr, proto::STATUS_OK, pump};
+use nextppp_core::{Transmission, TransmissionRx, TransmissionTx};
 use spdlog::prelude::*;
 
 use crate::ClientRuntime;
 
-/// A split openppp3 tunnel ready for the pump.
+/// A split nextppp tunnel ready for the pump.
 pub type Tunnel = (
     Box<TransmissionTx<TcpStream>>,
     Box<TransmissionRx<TcpStream>>,
 );
 
-/// Connects to the remote server, runs the openppp3 handshake, forwards the
+/// Connects to the remote server, runs the nextppp handshake, forwards the
 /// connect request and splits the transmission.
 ///
 /// # Errors
@@ -40,11 +40,11 @@ pub fn tunnel_connect(addr: &ProxyAddr, rt: &ClientRuntime) -> anyhow::Result<Tu
     let rx_io = stream.try_clone().context("clone stream")?;
 
     let mut tx = Transmission::new(stream, rt.server_key.clone());
-    let (sid, _mux) = tx.handshake_client().context("openppp3 handshake")?;
+    let (sid, _mux) = tx.handshake_client().context("nextppp handshake")?;
     debug!(
         "tunnel {sid:016x} to {} handshaked in {}",
         rt.server_address,
-        openppp3_common::fmt_duration(started.elapsed())
+        nextppp_common::fmt_duration(started.elapsed())
     );
     tx.write(&addr.encode()).context("send request")?;
     let reply = tx.read().context("read reply")?;

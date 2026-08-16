@@ -1,6 +1,6 @@
 [package]
-name        = "openppp3-common"
-description = "Shared building blocks for the openppp3 proxy server and client"
+name        = "nextppp-common"
+description = "Shared building blocks for the nextppp proxy server and client"
 readme      = "../../README.md"
 keywords    = ["anti-censorship", "network", "openppp2", "proxy"]
 categories  = ["network-programming"]
@@ -14,16 +14,16 @@ license.workspace      = true
 [dependencies]
 hotpath       = { workspace = true, optional = true }
 json5         = { workspace = true }
-openppp3-core = { workspace = true }
+nextppp-core = { workspace = true }
 serde         = { workspace = true }
 spdlog-rs     = { workspace = true }
 thiserror     = { workspace = true }
 
 [features]
-# Profiling instrumentation; see openppp3-core's feature docs.
-hotpath       = ["dep:hotpath", "hotpath/hotpath", "openppp3-core/hotpath"]
-hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "openppp3-core/hotpath-alloc"]
-hotpath-cpu   = ["hotpath", "hotpath/hotpath-cpu", "openppp3-core/hotpath-cpu"]
+# Profiling instrumentation; see nextppp-core's feature docs.
+hotpath       = ["dep:hotpath", "hotpath/hotpath", "nextppp-core/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "nextppp-core/hotpath-alloc"]
+hotpath-cpu   = ["hotpath", "hotpath/hotpath-cpu", "nextppp-core/hotpath-cpu"]
 
 [lints]
 workspace = true

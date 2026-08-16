@@ -184,7 +184,7 @@ use base94_simd::{
     decimal_encode as base94_decimal_encode, decode_into as base94_decode_into,
     encode_into as base94_encode_into,
 };
-use openppp3_core::{
+use nextppp_core::{
     ObfuscationKey,
     crypto::ssea::{delta_encode, lcg_next, masked_xor_random_next, shuffle},
     frame::{

@@ -1,4 +1,4 @@
-//! openppp3-core: anti-censorship transmission protocol core.
+//! nextppp-core: anti-censorship transmission protocol core.
 //!
 //! A Rust rewrite of the openppp2 transport algorithms (framing, handshake,
 //! obfuscation) as the core of a proxy (not a VPN). The wire protocol is not
@@ -17,7 +17,7 @@
 //! subtractor generator, no RC4.
 //!
 //! ```no_run
-//! use openppp3_core::{ObfuscationKey, Transmission};
+//! use nextppp_core::{ObfuscationKey, Transmission};
 //!
 //! # fn main() -> std::io::Result<()> {
 //! let io = std::net::TcpStream::connect("1.2.3.4:1234")?;

@@ -1,5 +1,5 @@
-//! openppp3 proxy client: a plain SOCKS5 inbound that forwards every
-//! CONNECT through the openppp3 tunnel. No local routing — chain it
+//! nextppp proxy client: a plain SOCKS5 inbound that forwards every
+//! CONNECT through the nextppp tunnel. No local routing — chain it
 //! behind a front-end proxy (e.g. sing-box) via its socks outbound.
 //!
 //! Logging contract: `info` for proxied connection open/close (with byte
@@ -9,8 +9,8 @@
 use std::{net::TcpListener, sync::Arc, thread, time::Duration};
 
 use anyhow::Context;
-use openppp3_common::{addr::Host, config::ClientConfig};
-use openppp3_core::ObfuscationKey;
+use nextppp_common::{addr::Host, config::ClientConfig};
+use nextppp_core::ObfuscationKey;
 use spdlog::prelude::*;
 
 pub mod outbound;
@@ -19,7 +19,7 @@ pub mod socks5;
 /// Immutable runtime parameters derived from the configuration.
 #[derive(Clone)]
 pub struct ClientRuntime {
-    /// Remote openppp3 server address (`host:port`, kept unresolved).
+    /// Remote nextppp server address (`host:port`, kept unresolved).
     pub server_address: String,
     /// Obfuscation parameters shared with the server.
     pub server_key: ObfuscationKey,
@@ -40,7 +40,7 @@ impl ClientRuntime {
             .to_key(cfg.password.as_deref())
             .map_err(anyhow::Error::msg)
             .context("obfuscation config")?;
-        openppp3_common::ObfuscationConfig::warn_placeholder(&key);
+        nextppp_common::ObfuscationConfig::warn_placeholder(&key);
         parse_host_port(&cfg.server.address)
             .with_context(|| format!("invalid server address {:?}", cfg.server.address))?;
         Ok(Self {
@@ -84,7 +84,7 @@ pub fn parse_host_port(s: &str) -> anyhow::Result<(Host, u16)> {
 #[allow(clippy::needless_pass_by_value)]
 pub fn serve(listener: TcpListener, rt: Arc<ClientRuntime>) -> anyhow::Result<()> {
     info!(
-        "openppp3 client socks5 inbound on {}",
+        "nextppp client socks5 inbound on {}",
         listener.local_addr()?.to_string()
     );
     for stream in listener.incoming() {
@@ -92,7 +92,7 @@ pub fn serve(listener: TcpListener, rt: Arc<ClientRuntime>) -> anyhow::Result<()
             Ok(stream) => {
                 let rt = rt.clone();
                 let spawned = thread::Builder::new()
-                    .name("openppp3-inbound".to_owned())
+                    .name("nextppp-inbound".to_owned())
                     .spawn(move || socks5::handle(stream, &rt));
                 if let Err(e) = spawned {
                     error!("inbound spawn failed: {e}");

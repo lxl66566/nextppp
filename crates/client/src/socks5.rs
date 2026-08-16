@@ -1,5 +1,5 @@
 //! SOCKS5 inbound: no-auth negotiation + CONNECT, always forwarded through
-//! the openppp3 tunnel (routing is the front-end proxy's job).
+//! the nextppp tunnel (routing is the front-end proxy's job).
 //!
 //! Every proxied connection logs its lifecycle: open (target + tunnel) at
 //! `info`, close (byte counts, duration, cause) at `info`, setup failures
@@ -13,7 +13,7 @@ use std::{
 };
 
 use anyhow::Context;
-use openppp3_common::{
+use nextppp_common::{
     PumpStats,
     addr::{Host, ProxyAddr},
     fmt::{fmt_bytes, fmt_duration},

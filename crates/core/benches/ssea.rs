@@ -7,7 +7,7 @@ use base94_simd::{
     encoded_len as base94_encoded_len,
 };
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use openppp3_core::crypto::{
+use nextppp_core::crypto::{
     cipher::{CipherRole, Method, SessionCipher},
     ssea::{delta_decode, delta_encode, masked_xor_random_next, shuffle, unshuffle},
 };

@@ -1,6 +1,6 @@
 //! Crate error types.
 
-/// Errors produced by the openppp3 core protocol stack.
+/// Errors produced by the nextppp core protocol stack.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Underlying transport I/O failure (connection reset, EOF, timeout, ...).

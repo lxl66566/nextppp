@@ -1,8 +1,8 @@
 //! Bidirectional connection pumps for the synchronous two-thread model.
 //!
-//! The single shape: a local TCP peer against a split openppp3 tunnel,
+//! The single shape: a local TCP peer against a split nextppp tunnel,
 //! wrapping data in `FRAME_DATA` frames and propagating half-closes as
-//! `FRAME_EOF` (the openppp3 framing itself has no in-band EOF).
+//! `FRAME_EOF` (the nextppp framing itself has no in-band EOF).
 //!
 //! Pumps classify how each direction ended (clean close / routine reset /
 //! fault) so callers can log connection teardown at the right level.
@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use openppp3_core::{Error as CoreError, TransmissionRx, TransmissionTx};
+use nextppp_core::{Error as CoreError, TransmissionRx, TransmissionTx};
 
 use crate::{FRAME_DATA, FRAME_EOF, addr::Host};
 
@@ -46,7 +46,7 @@ fn classify_io(err: &io::Error) -> PumpEnd {
     }
 }
 
-/// Classifies a tunnel (openppp3) error.
+/// Classifies a tunnel (nextppp) error.
 fn classify_core(err: CoreError) -> PumpEnd {
     if err.is_eof() {
         PumpEnd::Closed("eof")
@@ -208,7 +208,7 @@ impl PumpEnd {
     }
 }
 
-/// Pumps a local TCP peer against a split openppp3 tunnel until either side
+/// Pumps a local TCP peer against a split nextppp tunnel until either side
 /// closes or fails; returns per-direction byte counts and end reasons.
 #[must_use = "stats feed connection logs"]
 pub fn pump_tunnel(

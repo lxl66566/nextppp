@@ -6,7 +6,7 @@
 
 use std::{fs, path::Path};
 
-use openppp3_core::{Method, ObfuscationKey};
+use nextppp_core::{Method, ObfuscationKey};
 use serde::Deserialize;
 use spdlog::prelude::*;
 use thiserror::Error;
@@ -105,7 +105,7 @@ impl Default for ObfuscationConfig {
 }
 
 /// Built-in placeholder password; every real deployment must override it.
-const PLACEHOLDER_PASSWORD: &str = "openppp3";
+const PLACEHOLDER_PASSWORD: &str = "nextppp";
 
 impl ObfuscationConfig {
     fn method(name: &str) -> Result<Method, String> {
@@ -175,7 +175,7 @@ impl ObfuscationConfig {
     }
 }
 
-/// Server configuration (`openppp3-server.jsonc`).
+/// Server configuration (`nextppp-server.jsonc`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -197,7 +197,7 @@ pub struct ServerConfig {
     pub obfuscation: ObfuscationConfig,
 }
 
-/// Client configuration (`openppp3-client.jsonc`).
+/// Client configuration (`nextppp-client.jsonc`).
 ///
 /// Intentionally minimal: the client is a plain SOCKS5-to-tunnel forwarder;
 /// all routing (direct/block/geosite/...) belongs to the front-end proxy
@@ -312,7 +312,7 @@ mod tests {
         let key = cfg.to_key(None).unwrap();
         assert_eq!(key.protocol_key, "sekrit");
         // Unset transport key falls back to the placeholder.
-        assert_eq!(key.transport_key, "openppp3");
+        assert_eq!(key.transport_key, "nextppp");
         assert_eq!(key.transport, Method::Aes256Cfb);
     }
 

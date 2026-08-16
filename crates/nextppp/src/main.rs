@@ -1,9 +1,9 @@
-//! openppp3 unified binary: `openppp3 server` / `openppp3 client`.
+//! nextppp unified binary: `nextppp server` / `nextppp client`.
 //!
 //! One binary, two roles: the protocol core (and most of the anti-blocking
 //! machinery) is shared anyway, and shipping both ends together keeps their
-//! versions from drifting. Role logic lives in the `openppp3-server` /
-//! `openppp3-client` library crates; this crate is CLI glue only.
+//! versions from drifting. Role logic lives in the `nextppp-server` /
+//! `nextppp-client` library crates; this crate is CLI glue only.
 
 use std::{
     fs,
@@ -15,11 +15,11 @@ use std::{
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 
-const SERVER_EXAMPLE_CONFIG: &str = include_str!("../examples/openppp3-server.jsonc");
+const SERVER_EXAMPLE_CONFIG: &str = include_str!("../examples/nextppp-server.jsonc");
 
-const CLIENT_EXAMPLE_CONFIG: &str = include_str!("../examples/openppp3-client.jsonc");
+const CLIENT_EXAMPLE_CONFIG: &str = include_str!("../examples/nextppp-client.jsonc");
 
-/// openppp3 anti-censorship proxy (single binary, server + client).
+/// nextppp anti-censorship proxy (single binary, server + client).
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
@@ -32,21 +32,21 @@ enum Role {
     /// Run the proxy server.
     Server {
         /// Configuration file path (jsonc).
-        #[arg(short, long, default_value = "openppp3-server.jsonc")]
+        #[arg(short, long, default_value = "nextppp-server.jsonc")]
         config: PathBuf,
 
         /// Write a commented example configuration to PATH and exit.
-        #[arg(long, value_name = "PATH", default_missing_value = "openppp3-server.jsonc", num_args = 0..=1)]
+        #[arg(long, value_name = "PATH", default_missing_value = "nextppp-server.jsonc", num_args = 0..=1)]
         init: Option<PathBuf>,
     },
     /// Run the local socks5 -> tunnel forwarder client.
     Client {
         /// Configuration file path (jsonc).
-        #[arg(short, long, default_value = "openppp3-client.jsonc")]
+        #[arg(short, long, default_value = "nextppp-client.jsonc")]
         config: PathBuf,
 
         /// Write a commented example configuration to PATH and exit.
-        #[arg(long, value_name = "PATH", default_missing_value = "openppp3-client.jsonc", num_args = 0..=1)]
+        #[arg(long, value_name = "PATH", default_missing_value = "nextppp-client.jsonc", num_args = 0..=1)]
         init: Option<PathBuf>,
     },
 }
@@ -66,20 +66,20 @@ fn run_server(config: &Path, init: Option<PathBuf>) -> anyhow::Result<()> {
     if let Some(path) = init {
         return write_example(&path, SERVER_EXAMPLE_CONFIG);
     }
-    let cfg = openppp3_common::ServerConfig::load(config)?;
+    let cfg = nextppp_common::ServerConfig::load(config)?;
     let listener = bind_listen(&cfg.listen)?;
-    let rt = openppp3_server::ServerRuntime::from_config(&cfg)?;
-    openppp3_server::serve(listener, rt)
+    let rt = nextppp_server::ServerRuntime::from_config(&cfg)?;
+    nextppp_server::serve(listener, rt)
 }
 
 fn run_client(config: &Path, init: Option<PathBuf>) -> anyhow::Result<()> {
     if let Some(path) = init {
         return write_example(&path, CLIENT_EXAMPLE_CONFIG);
     }
-    let cfg = openppp3_common::ClientConfig::load(config)?;
+    let cfg = nextppp_common::ClientConfig::load(config)?;
     let listener = bind_listen(&cfg.listen)?;
-    let rt = Arc::new(openppp3_client::ClientRuntime::from_config(&cfg)?);
-    openppp3_client::serve(listener, rt)
+    let rt = Arc::new(nextppp_client::ClientRuntime::from_config(&cfg)?);
+    nextppp_client::serve(listener, rt)
 }
 
 fn bind_listen(spec: &str) -> anyhow::Result<TcpListener> {

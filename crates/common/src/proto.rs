@@ -1,6 +1,6 @@
-//! Application layer tunneled above the openppp3 transmission.
+//! Application layer tunneled above the nextppp transmission.
 //!
-//! Once the openppp3 handshake completes, the connection carries a tiny
+//! Once the nextppp handshake completes, the connection carries a tiny
 //! proxy protocol:
 //!
 //! ```text
@@ -11,7 +11,7 @@
 //! ```
 //!
 //! `FRAME_EOF` propagates half-closes across the tunnel: without it a local
-//! `shutdown(write)` could never reach the far end, since the openppp3
+//! `shutdown(write)` could never reach the far end, since the nextppp
 //! framing has no in-band EOF.
 
 /// Data frame marker: the rest of the message is payload.

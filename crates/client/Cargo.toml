@@ -1,6 +1,6 @@
 [package]
-name        = "openppp3-client"
-description = "openppp3 anti-censorship proxy client (socks5 -> tunnel forwarder)"
+name        = "nextppp-client"
+description = "nextppp anti-censorship proxy client (socks5 -> tunnel forwarder)"
 readme      = "../../README.md"
 keywords    = ["anti-censorship", "network", "openppp2", "proxy"]
 categories  = ["network-programming"]
@@ -14,35 +14,35 @@ license.workspace      = true
 [dependencies]
 anyhow          = { workspace = true }
 hotpath         = { workspace = true, optional = true }
-openppp3-common = { workspace = true }
-openppp3-core   = { workspace = true }
+nextppp-common = { workspace = true }
+nextppp-core   = { workspace = true }
 spdlog-rs       = { workspace = true }
 
 [dev-dependencies]
 hotpath         = { workspace = true }
-openppp3-server = { workspace = true }
+nextppp-server = { workspace = true }
 libc            = { workspace = true }
 
 [features]
-# Profiling instrumentation; see openppp3-core's feature docs. The dev-dep
+# Profiling instrumentation; see nextppp-core's feature docs. The dev-dep
 # passthrough keeps the in-process e2e/throughput tests profiled end to end.
 hotpath = [
     "dep:hotpath",
     "hotpath/hotpath",
-    "openppp3-common/hotpath",
-    "openppp3-server/hotpath",
+    "nextppp-common/hotpath",
+    "nextppp-server/hotpath",
 ]
 hotpath-alloc = [
     "hotpath",
     "hotpath/hotpath-alloc",
-    "openppp3-common/hotpath-alloc",
-    "openppp3-server/hotpath-alloc",
+    "nextppp-common/hotpath-alloc",
+    "nextppp-server/hotpath-alloc",
 ]
 hotpath-cpu = [
     "hotpath",
     "hotpath/hotpath-cpu",
-    "openppp3-common/hotpath-cpu",
-    "openppp3-server/hotpath-cpu",
+    "nextppp-common/hotpath-cpu",
+    "nextppp-server/hotpath-cpu",
 ]
 
 [lints]

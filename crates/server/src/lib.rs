@@ -1,8 +1,8 @@
-//! openppp3 proxy server: accepts openppp3-tunneled connections, connects
+//! nextppp proxy server: accepts nextppp-tunneled connections, connects
 //! to the requested target and pumps bytes both ways.
 //!
 //! Connection model: one handshake thread per accepted stream, then the
-//! classic two-thread pump ([`openppp3_common::pump`]). Session ids are
+//! classic two-thread pump ([`nextppp_common::pump`]). Session ids are
 //! `random_base + counter`, never zero.
 //!
 //! Logging contract:
@@ -23,14 +23,14 @@ use std::{
 };
 
 use anyhow::Context;
-use openppp3_common::{
+use nextppp_common::{
     PumpStats,
     addr::ProxyAddr,
     config::{ObfuscationConfig, ServerConfig},
     fmt::{fmt_bytes, fmt_duration},
     proto, pump,
 };
-use openppp3_core::{ObfuscationKey, Transmission};
+use nextppp_core::{ObfuscationKey, Transmission};
 use rand::Rng;
 use spdlog::prelude::*;
 
@@ -102,7 +102,7 @@ impl Drop for ActiveGuard<'_> {
 #[allow(clippy::needless_pass_by_value)]
 pub fn serve(listener: TcpListener, rt: ServerRuntime) -> anyhow::Result<()> {
     info!(
-        "openppp3 server listening on {}",
+        "nextppp server listening on {}",
         listener.local_addr()?.to_string()
     );
     let stats: Arc<ServerStats> = Arc::new(ServerStats::default());
@@ -121,7 +121,7 @@ pub fn serve(listener: TcpListener, rt: ServerRuntime) -> anyhow::Result<()> {
                     sid = 1;
                 }
                 let spawned = thread::Builder::new()
-                    .name(format!("openppp3-{sid:016x}"))
+                    .name(format!("nextppp-{sid:016x}"))
                     .spawn(move || handle_conn(stream, &rt, sid, &stats));
                 if let Err(e) = spawned {
                     error!("session {sid:016x} spawn failed: {e}");
@@ -137,7 +137,7 @@ pub fn serve(listener: TcpListener, rt: ServerRuntime) -> anyhow::Result<()> {
 fn spawn_heartbeat(stats: Arc<ServerStats>) {
     let started = Instant::now();
     let spawned = thread::Builder::new()
-        .name("openppp3-heartbeat".to_owned())
+        .name("nextppp-heartbeat".to_owned())
         .spawn(move || {
             loop {
                 thread::sleep(HEARTBEAT_INTERVAL);
@@ -264,9 +264,9 @@ fn is_clean_close(e: &anyhow::Error) -> bool {
             ) {
                 return false;
             }
-        } else if let Some(core) = cause.downcast_ref::<openppp3_core::Error>() {
+        } else if let Some(core) = cause.downcast_ref::<nextppp_core::Error>() {
             match core {
-                openppp3_core::Error::Io(_) | openppp3_core::Error::HandshakeFailed(_) => {},
+                nextppp_core::Error::Io(_) | nextppp_core::Error::HandshakeFailed(_) => {},
                 _ => return false,
             }
         }

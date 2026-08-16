@@ -1,5 +1,5 @@
 //! End-to-end tests: real sockets through
-//! socks5 inbound -> openppp3 tunnel -> server -> echo target, covering
+//! socks5 inbound -> nextppp tunnel -> server -> echo target, covering
 //! IP/domain targets, connect failures and half-close propagation.
 
 use std::{
@@ -10,12 +10,12 @@ use std::{
     time::Duration,
 };
 
-use openppp3_client::ClientRuntime;
-use openppp3_common::{
+use nextppp_client::ClientRuntime;
+use nextppp_common::{
     addr::Host,
     config::{ClientConfig, ObfuscationConfig, ServerConfig, ServerSection},
 };
-use openppp3_server::ServerRuntime;
+use nextppp_server::ServerRuntime;
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -62,7 +62,7 @@ fn start_server() -> SocketAddr {
     };
     let rt = ServerRuntime::from_config(&cfg).unwrap();
     thread::spawn(move || {
-        openppp3_server::serve(listener, rt).unwrap();
+        nextppp_server::serve(listener, rt).unwrap();
     });
     addr
 }
@@ -81,7 +81,7 @@ fn start_client(server: SocketAddr) -> SocketAddr {
     };
     let rt = Arc::new(ClientRuntime::from_config(&cfg).unwrap());
     thread::spawn(move || {
-        openppp3_client::serve(listener, rt).unwrap();
+        nextppp_client::serve(listener, rt).unwrap();
     });
     addr
 }

@@ -1,6 +1,6 @@
 [package]
-name        = "openppp3-core"
-description = "Core protocol and cryptography algorithms of the openppp3 anti-censorship proxy"
+name        = "nextppp-core"
+description = "Core protocol and cryptography algorithms of the nextppp anti-censorship proxy"
 readme      = "../../README.md"
 keywords    = ["anti-censorship", "network", "openppp2", "proxy"]
 categories  = ["network-programming"]

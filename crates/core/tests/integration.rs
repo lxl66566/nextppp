@@ -10,7 +10,7 @@ use std::{
     thread::scope,
 };
 
-use openppp3_core::{Error, Method, ObfuscationKey, Transmission};
+use nextppp_core::{Error, Method, ObfuscationKey, Transmission};
 
 // ---------------------------------------------------------------------------
 // Minimal blocking in-memory duplex pipe (std::io::duplex is still unstable).

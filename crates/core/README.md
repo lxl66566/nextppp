@@ -1,4 +1,4 @@
-# openppp3-core 协议文档
+# nextppp-core 协议文档
 
 > 本文档是 `crates/core` 的完整协议规范：从配置参数、密码学原语、帧格式、握手流程到数据面调度，
 > 所有公式、字节布局与状态机均与 Rust 实现一一对应（代码索引格式为 `文件:行号`）。
@@ -19,7 +19,7 @@
 
 ## 1. 概述与定位
 
-`openppp3-core` 是协议核心库：**帧化、混淆、握手、会话密码**，全部与 I/O 传输解耦。
+`nextppp-core` 是协议核心库：**帧化、混淆、握手、会话密码**，全部与 I/O 传输解耦。
 它不关心 TCP/UDP/网卡，只提供两种使用方式：
 
 - **流式**：`Transmission<T: Read + Write>` 直接包住任意双工字节流（TCP 等），提供
@@ -54,9 +54,9 @@
 | `kh` | 12 | NOP 前奏轮数上限指数 |
 | `kx` | 128 | 握手包 padding 量（实际取 `kx % 256`） |
 | `protocol` | `Aes128Cfb` | 帧头长度字段保护密码 |
-| `protocol_key` | `"openppp3"` | 协议密码口令，**部署必须修改** |
+| `protocol_key` | `"nextppp"` | 协议密码口令，**部署必须修改** |
 | `transport` | `Aes256Cfb` | 负载保护密码 |
-| `transport_key` | `"openppp3"` | 传输密码口令，**部署必须修改** |
+| `transport_key` | `"nextppp"` | 传输密码口令，**部署必须修改** |
 | `masked` | true | 负载 masked-XOR 开关（数据面；握手前强制开启） |
 | `plaintext` | true | 握手后是否保留 base94 可打印外壳；`false` 则切换紧凑 3 字节二进制帧头 |
 | `delta_encode` | true | 负载 delta 编码开关 |
@@ -209,8 +209,8 @@ base94_decimal_decode(s):   # 校验每个字符 c >= 0x20 且 c - 0x20 < 94
 
 ```
 ikm = password_bytes || ('+' if ivv > 0) || base32(ivv)
-salt = "openppp3/" + role.name() + "/" + method.name()
-okm = HKDF-SHA256(ikm, salt, info = "openppp3-session-key", L = 48)
+salt = "nextppp/" + role.name() + "/" + method.name()
+okm = HKDF-SHA256(ikm, salt, info = "nextppp-session-key", L = 48)
 key     = okm[0..32]
 base_iv = okm[32..48]
 ```
@@ -225,8 +225,8 @@ base_iv = okm[32..48]
 
 **可以，且不损失安全性**。分析如下：
 
-- 两个 cipher 的派生 salt 不同（`openppp3/protocol/{method}` vs
-  `openppp3/transport/{method}`），HKDF 的域分离保证即使口令、method 全部相同，
+- 两个 cipher 的派生 salt 不同（`nextppp/protocol/{method}` vs
+  `nextppp/transport/{method}`），HKDF 的域分离保证即使口令、method 全部相同，
   protocol（帧头长度字段，每包 2 字节）与 transport（负载）也永远派生不同的
   key/IV，即不同的 keystream。
 - 若**没有** role 域分离：当用户把两个 method 配成相同且口令相同时，两层会派生
@@ -691,7 +691,7 @@ split_with(rx_io) -> (TransmissionTx, TransmissionRx)
 ## 12. 使用示例
 
 ```rust
-use openppp3_core::{ObfuscationKey, Transmission};
+use nextppp_core::{ObfuscationKey, Transmission};
 
 // 客户端
 let io = std::net::TcpStream::connect("1.2.3.4:1234")?;

@@ -10,7 +10,7 @@ use std::{
 };
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use openppp3_core::{ObfuscationKey, Transmission};
+use nextppp_core::{ObfuscationKey, Transmission};
 
 /// IO sink that discards writes and never reads: the in-memory codec paths
 /// (`encrypt_into`/`decrypt`) never touch it.

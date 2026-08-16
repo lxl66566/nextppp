@@ -1,6 +1,6 @@
 [package]
-name        = "openppp3"
-description = "openppp3 anti-censorship proxy (unified server/client binary)"
+name        = "nextppp"
+description = "nextppp anti-censorship proxy (unified server/client binary)"
 readme      = "../../README.md"
 keywords    = ["anti-censorship", "network", "openppp2", "proxy"]
 categories  = ["network-programming"]
@@ -15,22 +15,22 @@ license.workspace      = true
 anyhow          = { workspace = true }
 clap            = { workspace = true }
 hotpath         = { workspace = true, optional = true }
-openppp3-client = { workspace = true }
-openppp3-common = { workspace = true }
-openppp3-server = { workspace = true }
+nextppp-client = { workspace = true }
+nextppp-common = { workspace = true }
+nextppp-server = { workspace = true }
 spdlog-rs       = { workspace = true }
 
 [features]
-# Profiling instrumentation; see openppp3-core's feature docs. With the
+# Profiling instrumentation; see nextppp-core's feature docs. With the
 # feature on, a localhost metrics server (port 6770) also comes up for the
 # hotpath TUI while the process runs.
-hotpath       = ["dep:hotpath", "hotpath/hotpath", "openppp3-client/hotpath"]
+hotpath       = ["dep:hotpath", "hotpath/hotpath", "nextppp-client/hotpath"]
 hotpath-alloc = [
     "hotpath",
     "hotpath/hotpath-alloc",
-    "openppp3-client/hotpath-alloc",
+    "nextppp-client/hotpath-alloc",
 ]
-hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "openppp3-client/hotpath-cpu"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "nextppp-client/hotpath-cpu"]
 
 [lints]
 workspace = true
