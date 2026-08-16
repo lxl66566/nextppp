@@ -24,13 +24,24 @@ spdlog-rs      = { workspace = true }
 # Profiling instrumentation; see nextppp-core's feature docs. With the
 # feature on, a localhost metrics server (port 6770) also comes up for the
 # hotpath TUI while the process runs.
-hotpath       = ["dep:hotpath", "hotpath/hotpath", "nextppp-client/hotpath"]
+hotpath       = [
+  "dep:hotpath",
+  "hotpath/hotpath",
+  "nextppp-client/hotpath",
+  "nextppp-server/hotpath",
+]
 hotpath-alloc = [
   "hotpath",
   "hotpath/hotpath-alloc",
   "nextppp-client/hotpath-alloc",
+  "nextppp-server/hotpath-alloc",
 ]
-hotpath-cpu   = ["hotpath", "hotpath/hotpath-cpu", "nextppp-client/hotpath-cpu"]
+hotpath-cpu   = [
+  "hotpath",
+  "hotpath/hotpath-cpu",
+  "nextppp-client/hotpath-cpu",
+  "nextppp-server/hotpath-cpu",
+]
 
 [lints]
 workspace = true
