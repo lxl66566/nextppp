@@ -709,6 +709,7 @@ name = "openppp3-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "openppp3-common",
  "openppp3-core",
  "openppp3-server",

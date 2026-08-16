@@ -19,6 +19,7 @@ spdlog-rs       = { workspace = true }
 
 [dev-dependencies]
 openppp3-server = { workspace = true }
+libc            = { workspace = true }
 
 [lints]
 workspace = true

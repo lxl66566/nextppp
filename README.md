@@ -60,6 +60,18 @@ cargo build --release
 - `warn`：握手失败（探测 / 密钥错误）、数据面协议错误、隧道建立失败。
 - 级别通过 `SPDLOG_RS_LEVEL` 环境变量控制（`debug` / `trace` / `off`），默认 `info`。
 
+## 测试与基准
+
+### 端到端吞吐量
+
+集成测试 `crates/client/tests/throughput.rs` 走完整链路（socks5 入站 -> client ->
+openppp3 隧道 -> server -> 本地 echo），测单向字节速率，server 与 client 均为单核：
+
+```sh
+cargo test -p openppp3-client --release --test throughput -- --ignored --nocapture
+# throughput: 268435456 bytes (256 MiB) in 2.62s = 97.88 MiB/s (server cpu 0, client cpu 1)
+```
+
 ## 文档
 
 - 协议规范：[crates/core/README.md](crates/core/README.md)
