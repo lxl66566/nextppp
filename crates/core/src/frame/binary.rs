@@ -157,15 +157,16 @@ mod tests {
     use rand::{SeedableRng, rngs::StdRng};
 
     use super::*;
-    use crate::crypto::cipher::Method;
+    use crate::crypto::cipher::{CipherRole, Method};
 
     fn roundtrip_case(flags: PayloadFlags, use_protocol: bool, len: usize) {
         let kf = 154_543_927u32;
         let mut rng = StdRng::seed_from_u64(len as u64);
         // Mirror the real transmission: separate tx/rx instances derived from
         // the same password, so their nonce counters stay in lockstep.
-        let mut proto_tx = SessionCipher::new(Method::Aes128Cfb, "test");
-        let mut proto_rx = SessionCipher::new(Method::Aes128Cfb, "test").for_decryption();
+        let mut proto_tx = SessionCipher::new(Method::Aes128Cfb, CipherRole::Protocol, "test");
+        let mut proto_rx =
+            SessionCipher::new(Method::Aes128Cfb, CipherRole::Protocol, "test").for_decryption();
 
         let plaintext: Vec<u8> = (0..len).map(|i| (i * 89 + 7) as u8).collect();
         let (header, hkf) = header_encrypt(

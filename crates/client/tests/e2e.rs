@@ -55,6 +55,7 @@ fn start_server() -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     let cfg = ServerConfig {
         listen: addr.to_string(),
+        password: None,
         connect_timeout: 5,
         handshake_timeout: 10,
         obfuscation: ObfuscationConfig::default(),
@@ -71,6 +72,7 @@ fn start_client(server: SocketAddr) -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     let cfg = ClientConfig {
         listen: addr.to_string(),
+        password: None,
         server: ServerSection {
             address: server.to_string(),
             connect_timeout: 5,
@@ -85,7 +87,6 @@ fn start_client(server: SocketAddr) -> SocketAddr {
 }
 
 fn timed(stream: TcpStream) -> TcpStream {
-    init_tracing();
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
@@ -93,18 +94,6 @@ fn timed(stream: TcpStream) -> TcpStream {
         .set_write_timeout(Some(Duration::from_secs(10)))
         .unwrap();
     stream
-}
-
-/// Enables debug logs for whichever test runs first.
-fn init_tracing() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        tracing_subscriber::fmt()
-            .with_env_filter("trace")
-            .with_test_writer()
-            .init();
-    });
 }
 
 /// Performs the SOCKS5 no-auth + CONNECT handshake, asserting success.

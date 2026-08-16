@@ -1,18 +1,17 @@
 //! openppp3 proxy client: a plain SOCKS5 inbound that forwards every
 //! CONNECT through the openppp3 tunnel. No local routing — chain it
 //! behind a front-end proxy (e.g. sing-box) via its socks outbound.
+//!
+//! Logging contract: `info` for proxied connection open/close (with byte
+//! counts and duration), `warn` for tunnel setup failures and protocol
+//! faults, `debug` for negotiation detail.
 
-use std::{
-    net::{TcpListener, TcpStream},
-    sync::Arc,
-    thread,
-    time::Duration,
-};
+use std::{net::TcpListener, sync::Arc, thread, time::Duration};
 
 use anyhow::Context;
-use openppp3_common::{addr::Host, config::ClientConfig, pump};
+use openppp3_common::{addr::Host, config::ClientConfig};
 use openppp3_core::ObfuscationKey;
-use tracing::{info, warn};
+use spdlog::prelude::*;
 
 pub mod outbound;
 pub mod socks5;
@@ -38,9 +37,10 @@ impl ClientRuntime {
         let key = cfg
             .server
             .obfuscation
-            .to_key()
+            .to_key(cfg.password.as_deref())
             .map_err(anyhow::Error::msg)
             .context("obfuscation config")?;
+        openppp3_common::ObfuscationConfig::warn_placeholder(&key);
         parse_host_port(&cfg.server.address)
             .with_context(|| format!("invalid server address {:?}", cfg.server.address))?;
         Ok(Self {
@@ -93,29 +93,13 @@ pub fn serve(listener: TcpListener, rt: Arc<ClientRuntime>) -> anyhow::Result<()
                 let rt = rt.clone();
                 let spawned = thread::Builder::new()
                     .name("openppp3-inbound".to_owned())
-                    .spawn(move || {
-                        if let Err(e) = handle_inbound(stream, &rt) {
-                            tracing::debug!("inbound ended: {e:#}");
-                        }
-                    });
+                    .spawn(move || socks5::handle(stream, &rt));
                 if let Err(e) = spawned {
-                    warn!("spawn failed: {e}");
+                    error!("inbound spawn failed: {e}");
                 }
             },
             Err(e) => warn!("accept failed: {e}"),
         }
     }
     Ok(())
-}
-
-/// Negotiation timeout: bounds the socks5 negotiation against slow clients;
-/// the handler clears it before the data-plane pump takes over.
-const INBOUND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Handles one SOCKS5 connection.
-fn handle_inbound(stream: TcpStream, rt: &Arc<ClientRuntime>) -> anyhow::Result<()> {
-    pump::nodelay(&stream);
-    stream.set_read_timeout(Some(INBOUND_HANDSHAKE_TIMEOUT))?;
-    stream.set_write_timeout(Some(INBOUND_HANDSHAKE_TIMEOUT))?;
-    socks5::handle(stream, rt)
 }

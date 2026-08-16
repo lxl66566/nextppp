@@ -16,7 +16,8 @@ openppp3-core   = { workspace = true }
 openppp3-common = { workspace = true }
 anyhow          = { workspace = true }
 rand            = { workspace = true }
-tracing         = { workspace = true }
+spdlog-rs       = { workspace = true }
 
 [lints]
 workspace = true
+

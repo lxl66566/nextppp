@@ -31,7 +31,7 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use crate::{
     PPP_BUFFER_SIZE, SessionId,
     config::ObfuscationKey,
-    crypto::cipher::SessionCipher,
+    crypto::cipher::{CipherRole, SessionCipher},
     error::{Error, Result},
     frame::{
         base94::Base94Framer,
@@ -82,10 +82,14 @@ impl<T, R: Rng> Transmission<T, R> {
     /// Creates a transmission with an explicit RNG (deterministic tests).
     #[must_use]
     pub fn with_rng(io: T, key: ObfuscationKey, rng: R) -> Self {
-        let protocol_tx = SessionCipher::new(key.protocol, &key.protocol_key);
-        let protocol_rx = SessionCipher::new(key.protocol, &key.protocol_key).for_decryption();
-        let transport_tx = SessionCipher::new(key.transport, &key.transport_key);
-        let transport_rx = SessionCipher::new(key.transport, &key.transport_key).for_decryption();
+        let protocol_tx = SessionCipher::new(key.protocol, CipherRole::Protocol, &key.protocol_key);
+        let protocol_rx = SessionCipher::new(key.protocol, CipherRole::Protocol, &key.protocol_key)
+            .for_decryption();
+        let transport_tx =
+            SessionCipher::new(key.transport, CipherRole::Transport, &key.transport_key);
+        let transport_rx =
+            SessionCipher::new(key.transport, CipherRole::Transport, &key.transport_key)
+                .for_decryption();
         let b94 = Base94Framer::new(key.kf);
         Self {
             io,
@@ -218,16 +222,32 @@ impl<T, R: Rng> Transmission<T, R> {
 
     /// Rebuilds all four cipher instances with per-connection key material.
     fn rekey(&mut self, ivv: u128) {
-        self.protocol_tx =
-            SessionCipher::derive(self.key.protocol, &self.key.protocol_key, Some(ivv));
-        self.protocol_rx =
-            SessionCipher::derive(self.key.protocol, &self.key.protocol_key, Some(ivv))
-                .for_decryption();
-        self.transport_tx =
-            SessionCipher::derive(self.key.transport, &self.key.transport_key, Some(ivv));
-        self.transport_rx =
-            SessionCipher::derive(self.key.transport, &self.key.transport_key, Some(ivv))
-                .for_decryption();
+        self.protocol_tx = SessionCipher::derive(
+            self.key.protocol,
+            CipherRole::Protocol,
+            &self.key.protocol_key,
+            Some(ivv),
+        );
+        self.protocol_rx = SessionCipher::derive(
+            self.key.protocol,
+            CipherRole::Protocol,
+            &self.key.protocol_key,
+            Some(ivv),
+        )
+        .for_decryption();
+        self.transport_tx = SessionCipher::derive(
+            self.key.transport,
+            CipherRole::Transport,
+            &self.key.transport_key,
+            Some(ivv),
+        );
+        self.transport_rx = SessionCipher::derive(
+            self.key.transport,
+            CipherRole::Transport,
+            &self.key.transport_key,
+            Some(ivv),
+        )
+        .for_decryption();
     }
 }
 

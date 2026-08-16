@@ -8,9 +8,12 @@
 
 pub mod addr;
 pub mod config;
+pub mod fmt;
 pub mod proto;
 pub mod pump;
 
 pub use addr::{Host, ProxyAddr};
 pub use config::{ClientConfig, ConfigError, ObfuscationConfig, ServerConfig};
+pub use fmt::{fmt_bytes, fmt_duration};
 pub use proto::{FRAME_DATA, FRAME_EOF, STATUS_OK, STATUS_REFUSED};
+pub use pump::{PumpEnd, PumpStats};

@@ -209,7 +209,7 @@ base94_decimal_decode(s):   # 校验每个字符 c >= 0x20 且 c - 0x20 < 94
 
 ```
 ikm = password_bytes || ('+' if ivv > 0) || base32(ivv)
-salt = "openppp3/" + method.name()
+salt = "openppp3/" + role.name() + "/" + method.name()
 okm = HKDF-SHA256(ikm, salt, info = "openppp3-session-key", L = 48)
 key     = okm[0..32]
 base_iv = okm[32..48]
@@ -217,9 +217,30 @@ base_iv = okm[32..48]
 
 - `base32` 为小写字母表 `0123456789abcdefghijklmnopqrstuv`（`cipher.rs:246-259`），
   最少位数（`ivv=0` → `"0"`），保留原版 `"+" + base32(ivv)` 的 ivv 字符串格式。
-- `SessionCipher::new(method, password)` 等价于 `derive(method, password, None)`，
+- `SessionCipher::new(method, role, password)` 等价于 `derive(method, role, password, None)`，
   用于握手前阶段（与原版在 ITransmission 构造时初始化密码一致）。
 - 每连接由客户端随机 `ivv` 派生独立工作密钥，防多连接指纹关联。
+
+#### 5.2.1 `protocol_key` 与 `transport_key` 能否共用同一个口令？
+
+**可以，且不损失安全性**。分析如下：
+
+- 两个 cipher 的派生 salt 不同（`openppp3/protocol/{method}` vs
+  `openppp3/transport/{method}`），HKDF 的域分离保证即使口令、method 全部相同，
+  protocol（帧头长度字段，每包 2 字节）与 transport（负载）也永远派生不同的
+  key/IV，即不同的 keystream。
+- 若**没有** role 域分离：当用户把两个 method 配成相同且口令相同时，两层会派生
+  出完全相同的 key+base_iv，且两层 nonce 计数器都从 0 起——同包内 2 字节长度字段
+  与负载前缀使用同一 keystream 段（two-time pad），攻击者可用已知明文的负载恢复
+  keystream 进而解密长度字段。虽然长度字段本身敏感度低（线上帧长大致可见），
+  但这违反密钥分离原则，因此实现中加入了 role 域分离，从根本上排除该情况。
+- 域分离后，"两层用同一个口令"与"两个独立口令"的安全边界完全一致：
+  单个口令的熵足够时（长随机口令），两层密钥互不影响；
+  口令过弱时（弱口令被猜出），无论一层还是两层配独立弱口令，攻击者同样能各自
+  派生——分层口令并不会显著提高抗口令猜测强度（HKDF 单一出口）。
+
+结论：应用层配置提供统一的 `password` 选项（`protocol_key`/`transport_key`
+留空时回退到它）是安全的默认。
 
 ### 5.3 nonce 管理（`cipher.rs:222-241`）
 
@@ -532,8 +553,8 @@ else:
 
 ```
 ivv_str = "+" + base32(ivv)                   # ivv > 0 恒成立（零值被拒绝）
-protocol_tx/rx  = SessionCipher::derive(protocol, protocol_key, Some(ivv))
-transport_tx/rx = SessionCipher::derive(transport, transport_key, Some(ivv))
+protocol_tx/rx  = SessionCipher::derive(protocol, Protocol, protocol_key, Some(ivv))
+transport_tx/rx = SessionCipher::derive(transport, Transport, transport_key, Some(ivv))
 ```
 
 四个密码实例全部重建，nonce 计数器归零。此后数据面使用新密钥。

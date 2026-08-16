@@ -37,7 +37,7 @@ pub mod handshake;
 pub mod transmission;
 
 pub use config::ObfuscationKey;
-pub use crypto::cipher::{Method, SessionCipher};
+pub use crypto::cipher::{CipherRole, Method, SessionCipher};
 pub use error::{Error, Result};
 pub use transmission::{Transmission, TransmissionRx, TransmissionTx};
 

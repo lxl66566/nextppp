@@ -13,11 +13,11 @@
 # 构建
 cargo build --release
 
-# 服务端：生成示例配置并编辑（务必修改两个密码）
+# 服务端：生成示例配置并编辑（务必修改 password）
 ./target/release/openppp3 server --init
 ./target/release/openppp3 server -c openppp3-server.jsonc
 
-# 客户端：生成示例配置并编辑（server 地址 + 与服务器一致的密码）
+# 客户端：生成示例配置并编辑（server 地址 + 与服务器一致的 password）
 ./target/release/openppp3 client --init
 ./target/release/openppp3 client -c openppp3-client.jsonc
 ```
@@ -44,9 +44,21 @@ cargo build --release
 
 `--init` 生成的示例配置已带注释，按注释修改即可。要点：
 
+- 顶层 `password` 是共享隧道口令，同时充当两层 cipher 的密钥；
+  需要分层密钥时才在 `obfuscation` 里覆写 `protocol_key` / `transport_key`
+  （共用一个口令是安全的，核心 KDF 对两层做了域分离，见协议文档 §5.2.1）。
 - 两端 `obfuscation` 段必须一致（含密码）；除密码外所有字段参与握手校验，不一致会显式报错。
-- 密码（`protocol_key` / `transport_key`）部署时必须修改。
+- `password` 部署时必须修改（仍为内置占位符时启动会告警）。
 - 配置文件为 jsonc，支持注释与尾逗号。
+
+## 日志
+
+基于 [spdlog-rs](https://github.com/SpriteOvO/spdlog-rs)（低开销、无锁热路径）。
+
+- `info`：连接生命周期（建立 / 目标 / 字节数 / 时长 / 关闭原因）、服务端每 60s 心跳
+  （uptime、活跃与累计会话、失败握手数、双向流量）。
+- `warn`：握手失败（探测 / 密钥错误）、数据面协议错误、隧道建立失败。
+- 级别通过 `SPDLOG_RS_LEVEL` 环境变量控制（`debug` / `trace` / `off`），默认 `info`。
 
 ## 文档
 

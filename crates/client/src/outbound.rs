@@ -6,6 +6,7 @@ use std::net::TcpStream;
 use anyhow::Context;
 use openppp3_common::{addr::ProxyAddr, proto::STATUS_OK, pump};
 use openppp3_core::{Transmission, TransmissionRx, TransmissionTx};
+use spdlog::prelude::*;
 
 use crate::ClientRuntime;
 
@@ -22,6 +23,7 @@ pub type Tunnel = (
 ///
 /// Connect / handshake / remote-refused failure.
 pub fn tunnel_connect(addr: &ProxyAddr, rt: &ClientRuntime) -> anyhow::Result<Tunnel> {
+    let started = std::time::Instant::now();
     let (host, port) = crate::parse_host_port(&rt.server_address)?;
     let stream = pump::tcp_connect(&host, port, rt.connect_timeout)
         .with_context(|| format!("connect server {}", rt.server_address))?;
@@ -37,7 +39,12 @@ pub fn tunnel_connect(addr: &ProxyAddr, rt: &ClientRuntime) -> anyhow::Result<Tu
     let rx_io = stream.try_clone().context("clone stream")?;
 
     let mut tx = Transmission::new(stream, rt.server_key.clone());
-    tx.handshake_client().context("openppp3 handshake")?;
+    let (sid, _mux) = tx.handshake_client().context("openppp3 handshake")?;
+    debug!(
+        "tunnel {sid:016x} to {} handshaked in {}",
+        rt.server_address,
+        openppp3_common::fmt_duration(started.elapsed())
+    );
     tx.write(&addr.encode()).context("send request")?;
     let reply = tx.read().context("read reply")?;
     if reply.first() != Some(&STATUS_OK) {

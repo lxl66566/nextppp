@@ -1,18 +1,25 @@
 //! SOCKS5 inbound: no-auth negotiation + CONNECT, always forwarded through
 //! the openppp3 tunnel (routing is the front-end proxy's job).
+//!
+//! Every proxied connection logs its lifecycle: open (target + tunnel) at
+//! `info`, close (byte counts, duration, cause) at `info`, setup failures
+//! and protocol faults at `warn`.
 
 use std::{
     io::{ErrorKind, Read, Write},
     net::TcpStream,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
 use openppp3_common::{
+    PumpStats,
     addr::{Host, ProxyAddr},
+    fmt::{fmt_bytes, fmt_duration},
     pump,
 };
-use tracing::debug;
+use spdlog::prelude::*;
 
 use crate::{ClientRuntime, outbound};
 
@@ -31,27 +38,72 @@ const REP_GENERAL: u8 = 0x01;
 const REP_CMD_UNSUPPORTED: u8 = 0x07;
 const REP_ATYP_UNSUPPORTED: u8 = 0x08;
 
-/// Handles one SOCKS5 connection.
-///
-/// # Errors
-///
-/// Any protocol or I/O failure ends the session.
-pub fn handle(mut stream: TcpStream, rt: &Arc<ClientRuntime>) -> anyhow::Result<()> {
+/// Negotiation timeout: bounds the socks5 negotiation against slow clients;
+/// cleared before the data-plane pump takes over.
+const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Handles one SOCKS5 connection end to end, logging its full lifecycle.
+pub fn handle(stream: TcpStream, rt: &Arc<ClientRuntime>) {
+    pump::nodelay(&stream);
+    let peer = stream
+        .peer_addr()
+        .map_or_else(|_| String::from("?"), |a| a.to_string());
+
+    if let Err(e) = negotiate_and_forward(stream, rt, &peer) {
+        // Local apps poking the inbound with non-socks5 traffic or vanishing
+        // mid-negotiation are routine; anything else deserves a warning.
+        let clean = e.chain().all(|c| {
+            c.downcast_ref::<std::io::Error>()
+                .is_some_and(is_routine_io)
+        });
+        if clean {
+            debug!("[{peer}] inbound session ended: {e:#}");
+        } else {
+            warn!("[{peer}] inbound session failed: {e:#}");
+        }
+    }
+}
+
+/// Whether an I/O error is a routine close rather than a fault.
+fn is_routine_io(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        ErrorKind::UnexpectedEof
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::TimedOut
+            | ErrorKind::WouldBlock
+            | ErrorKind::Interrupted
+    )
+}
+
+/// Negotiation + CONNECT + tunnel forwarding. Failure points log at their
+/// proper levels before returning the error for the routine/fault split.
+fn negotiate_and_forward(
+    mut stream: TcpStream,
+    rt: &Arc<ClientRuntime>,
+    peer: &str,
+) -> anyhow::Result<()> {
+    let _ = stream.set_read_timeout(Some(NEGOTIATION_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(NEGOTIATION_TIMEOUT));
     negotiate(&mut stream).context("greeting")?;
 
     let mut head = [0u8; 4];
     stream.read_exact(&mut head).context("read request head")?;
     if head[0] != VER {
+        warn!("[{peer}] bad SOCKS version {:#04x}", head[0]);
         anyhow::bail!("bad SOCKS version {:#04x}", head[0]);
     }
     if head[1] != CMD_CONNECT {
+        warn!("[{peer}] unsupported command {:#04x}", head[1]);
         let _ = reply(&mut stream, REP_CMD_UNSUPPORTED);
         anyhow::bail!("unsupported command {:#04x}", head[1]);
     }
     let addr = match read_addr(&mut stream, head[3]) {
         Ok(addr) => addr,
         Err(e) => {
-            let rep = if matches!(e.kind(), ErrorKind::InvalidData) {
+            let rep = if e.kind() == ErrorKind::InvalidData {
                 REP_ATYP_UNSUPPORTED
             } else {
                 REP_GENERAL
@@ -60,23 +112,40 @@ pub fn handle(mut stream: TcpStream, rt: &Arc<ClientRuntime>) -> anyhow::Result<
             return Err(e).context("read request address");
         },
     };
-
-    debug!("socks5 connect {}", addr.host.to_display());
+    let target = format!("{}:{}", addr.host.to_display(), addr.port);
 
     match outbound::tunnel_connect(&addr, rt) {
         Ok((tx, rx)) => {
             reply(&mut stream, REP_SUCCEEDED).context("reply succeeded")?;
-            // The inbound handshake timeout must not apply to the data plane.
+            // The inbound negotiation timeout must not apply to the data plane.
             stream.set_read_timeout(None)?;
             stream.set_write_timeout(None)?;
-            let (up, down) = pump::pump_tunnel(*tx, *rx, stream);
-            debug!("socks5 tunnel closed (up {up}, down {down})");
+            let started = Instant::now();
+            let s = pump::pump_tunnel(*tx, *rx, stream);
+            log_close(peer, &target, &s, started);
             Ok(())
         },
         Err(e) => {
+            warn!("[{peer}] tunnel connect to {target} failed: {e:#}");
             let _ = reply(&mut stream, REP_GENERAL);
             Err(e.context("outbound connect"))
         },
+    }
+}
+
+/// Logs the teardown: faults escalate to `warn`.
+fn log_close(peer: &str, target: &str, s: &PumpStats, started: Instant) {
+    let summary = format!(
+        "up {} down {} in {} ({})",
+        fmt_bytes(s.up),
+        fmt_bytes(s.down),
+        fmt_duration(started.elapsed()),
+        s.end_causes(),
+    );
+    if let Some(fault) = s.fault() {
+        warn!("[{peer}] {target} aborted: {summary}, fault: {fault}");
+    } else {
+        info!("[{peer}] {target} closed: {summary}");
     }
 }
 

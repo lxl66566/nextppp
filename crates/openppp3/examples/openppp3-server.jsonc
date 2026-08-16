@@ -1,0 +1,33 @@
+{
+    // Listen address for openppp3 client connections.
+    "listen": "0.0.0.0:6666",
+
+    // Shared tunnel password. Backs both obfuscation cipher keys when they
+    // are left unset; sharing one password is safe (the core KDF separates
+    // the two cipher roles). Must be changed per deployment.
+    "password": "CHANGE_ME",
+
+    // Outbound (server -> target) connect timeout, seconds.
+    "connect_timeout": 10,
+
+    // Handshake timeout, seconds. Raises the cost of slow-loris probing.
+    "handshake_timeout": 15,
+
+    // Obfuscation parameters; every field except the passwords feeds the
+    // handshake flag-canary, so they must match the client configuration.
+    // Per-layer key overrides (seldom needed):
+    // "obfuscation": {
+    //     "kf": 154543927,
+    //     "kl": 10,
+    //     "kh": 12,
+    //     "kx": 128,
+    //     "protocol": "aes-128-cfb",
+    //     "protocol_key": "optional, defaults to password",
+    //     "transport": "aes-256-cfb",
+    //     "transport_key": "optional, defaults to password",
+    //     "masked": true,
+    //     "plaintext": true,
+    //     "delta_encode": true,
+    //     "shuffle_data": true,
+    // },
+}

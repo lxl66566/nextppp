@@ -14,58 +14,10 @@ use std::{
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use tracing_subscriber::EnvFilter;
 
-const SERVER_EXAMPLE_CONFIG: &str = r#"{
-    // Listen address for openppp3 client connections.
-    "listen": "0.0.0.0:6666",
+const SERVER_EXAMPLE_CONFIG: &str = include_str!("../examples/openppp3-server.jsonc");
 
-    // Outbound (server -> target) connect timeout, seconds.
-    "connect_timeout": 10,
-
-    // Handshake timeout, seconds. Raises the cost of slow-loris probing.
-    "handshake_timeout": 15,
-
-    // Obfuscation parameters; every field except the passwords feeds the
-    // handshake flag-canary, so they must match the client configuration.
-    // Secrets must be changed per deployment.
-    "obfuscation": {
-        // "kf": 154543927,
-        // "kl": 10,
-        // "kh": 12,
-        // "kx": 128,
-        // "protocol": "aes-128-cfb",
-        "protocol_key": "CHANGE_ME",
-        // "transport": "aes-256-cfb",
-        "transport_key": "CHANGE_ME_TOO",
-        // "masked": true,
-        // "plaintext": true,
-        // "delta_encode": true,
-        // "shuffle_data": true,
-    },
-}
-"#;
-
-const CLIENT_EXAMPLE_CONFIG: &str = r#"{
-    // Local SOCKS5 inbound. Point a front-end proxy (e.g. sing-box's
-    // socks outbound) here; routing/splitting is its job.
-    "listen": "127.0.0.1:1080",
-
-    // Remote openppp3 server.
-    "server": {
-        "address": "your.server.example:6666",
-        // "connect_timeout": 10,
-        // Must mirror the server configuration (secrets included).
-        "obfuscation": {
-            // "kf": 154543927,
-            // "protocol": "aes-128-cfb",
-            "protocol_key": "CHANGE_ME",
-            // "transport": "aes-256-cfb",
-            "transport_key": "CHANGE_ME_TOO",
-        },
-    },
-}
-"#;
+const CLIENT_EXAMPLE_CONFIG: &str = include_str!("../examples/openppp3-client.jsonc");
 
 /// openppp3 anti-censorship proxy (single binary, server + client).
 #[derive(Parser)]
@@ -100,12 +52,9 @@ enum Role {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
+    // Runtime level control via SPDLOG_RS_LEVEL (e.g. `debug`, `trace`,
+    // `off`); info+ by default.
+    spdlog::init_env_level()?;
     match Args::parse().role {
         Role::Server { config, init } => run_server(&config, init),
         Role::Client { config, init } => run_client(&config, init),

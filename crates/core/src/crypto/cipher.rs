@@ -20,6 +20,30 @@
 use hkdf::Hkdf;
 use sha2::Sha256;
 
+/// Which protocol layer a cipher instance protects. Mixed into the KDF salt
+/// so the protocol and transport ciphers never derive the same keystream,
+/// even when both use the same method *and* the same password — without this
+/// domain separation the 2-byte header length field and the payload would be
+/// encrypted under identical key/IV/nonce (two-time pad).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CipherRole {
+    /// Frame-header length protection (the "protocol" cipher).
+    Protocol,
+    /// Packet payload protection (the "transport" cipher).
+    Transport,
+}
+
+impl CipherRole {
+    /// Lowercase name mixed into the KDF salt.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Protocol => "protocol",
+            Self::Transport => "transport",
+        }
+    }
+}
+
 /// Supported stream-cipher methods (compile-time checked, replaces openppp2's
 /// runtime cipher-name strings).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -108,15 +132,15 @@ impl SessionCipher {
     /// Derives a cipher from `password` alone (pre-handshake phase; openppp2
     /// initializes its ciphers in the ITransmission constructor the same way).
     #[must_use]
-    pub fn new(method: Method, password: &str) -> Self {
-        Self::derive(method, password, None)
+    pub fn new(method: Method, role: CipherRole, password: &str) -> Self {
+        Self::derive(method, role, password, None)
     }
 
     /// Derives a cipher from `password` seasoned with the per-connection
     /// `ivv` (post-handshake rekey). The ivv string keeps the openppp2
     /// format: `"+" + base32(ivv)`.
     #[must_use]
-    pub fn derive(method: Method, password: &str, ivv: Option<u128>) -> Self {
+    pub fn derive(method: Method, role: CipherRole, password: &str, ivv: Option<u128>) -> Self {
         let mut ikm = Vec::with_capacity(password.len() + 40);
         ikm.extend_from_slice(password.as_bytes());
         if let Some(ivv) = ivv {
@@ -129,7 +153,10 @@ impl SessionCipher {
             ikm.extend_from_slice(&buf[..len]);
         }
 
-        let salt = format!("openppp3/{}", method.name());
+        // The salt mixes role + method, giving every (layer, cipher) pair an
+        // independent key domain; sharing one password across layers is then
+        // safe by construction.
+        let salt = format!("openppp3/{}/{}", role.name(), method.name());
         let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), &ikm);
         let mut okm = [0u8; KEY_MAX + NONCE_MAX];
         // Length is fixed and well below the HKDF limit; cannot fail.
@@ -297,8 +324,9 @@ mod tests {
     #[test]
     fn encrypt_decrypt_roundtrip_all_methods() {
         for m in all_methods() {
-            let mut enc = SessionCipher::new(m, "password-1");
-            let mut dec = SessionCipher::new(m, "password-1").for_decryption();
+            let mut enc = SessionCipher::new(m, CipherRole::Transport, "password-1");
+            let mut dec =
+                SessionCipher::new(m, CipherRole::Transport, "password-1").for_decryption();
             let plaintext: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
 
             let mut ciphertext = plaintext.clone();
@@ -311,11 +339,26 @@ mod tests {
     }
 
     #[test]
+    fn roles_derive_independent_keystreams() {
+        // Same method + same password must still yield independent keys for
+        // the protocol and transport layers (domain separation in the salt).
+        for m in all_methods() {
+            let mut p = SessionCipher::new(m, CipherRole::Protocol, "shared");
+            let mut t = SessionCipher::new(m, CipherRole::Transport, "shared");
+            let mut header = [0u8; 32];
+            let mut body = [0u8; 32];
+            p.apply(&mut header);
+            t.apply(&mut body);
+            assert_ne!(header, body, "{m:?} role separation failed");
+        }
+    }
+
+    #[test]
     fn nonce_never_repeats() {
         // Encrypting the same plaintext twice must yield different ciphertexts
         // (openppp2's per-packet EVP re-init failed this: identical keystream).
         for m in all_methods() {
-            let mut c = SessionCipher::new(m, "pw");
+            let mut c = SessionCipher::new(m, CipherRole::Transport, "pw");
             let mut a = [0x41u8; 32];
             let mut b = [0x41u8; 32];
             c.apply(&mut a);
@@ -331,8 +374,8 @@ mod tests {
         // tx and rx counters advance independently: interleaved use must not
         // desync two parties running mirrored instances.
         for m in all_methods() {
-            let mut enc = SessionCipher::new(m, "pw");
-            let mut dec = SessionCipher::new(m, "pw").for_decryption();
+            let mut enc = SessionCipher::new(m, CipherRole::Transport, "pw");
+            let mut dec = SessionCipher::new(m, CipherRole::Transport, "pw").for_decryption();
             for n in [1usize, 2, 3, 17, 100] {
                 let original: Vec<u8> = (0..n).map(|i| (i * 37) as u8).collect();
                 let mut wire = original.clone();
@@ -347,8 +390,13 @@ mod tests {
 
     #[test]
     fn ivv_changes_derived_keys() {
-        let mut a = SessionCipher::new(Method::Aes256Cfb, "pw");
-        let mut b = SessionCipher::derive(Method::Aes256Cfb, "pw", Some(0xdead_beef));
+        let mut a = SessionCipher::new(Method::Aes256Cfb, CipherRole::Transport, "pw");
+        let mut b = SessionCipher::derive(
+            Method::Aes256Cfb,
+            CipherRole::Transport,
+            "pw",
+            Some(0xdead_beef),
+        );
         let mut buf_a = [0u8; 16];
         let mut buf_b = [0u8; 16];
         a.apply(&mut buf_a);

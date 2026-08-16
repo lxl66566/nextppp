@@ -8,6 +8,7 @@ use std::{fs, path::Path};
 
 use openppp3_core::{Method, ObfuscationKey};
 use serde::Deserialize;
+use spdlog::prelude::*;
 use thiserror::Error;
 
 /// Errors while loading or validating a configuration file.
@@ -65,12 +66,14 @@ pub struct ObfuscationConfig {
     pub kx: u32,
     /// Protocol cipher name (frame header).
     pub protocol: String,
-    /// Protocol cipher password.
-    pub protocol_key: String,
+    /// Protocol cipher password. Falls back to the shared `password`,
+    /// then the built-in placeholder.
+    pub protocol_key: Option<String>,
     /// Transport cipher name (payload).
     pub transport: String,
-    /// Transport cipher password.
-    pub transport_key: String,
+    /// Transport cipher password. Falls back to the shared `password`,
+    /// then the built-in placeholder.
+    pub transport_key: Option<String>,
     /// Payload masked-XOR switch.
     pub masked: bool,
     /// Keep the printable base94 shell after the handshake.
@@ -90,9 +93,9 @@ impl Default for ObfuscationConfig {
             kh: k.kh,
             kx: k.kx,
             protocol: k.protocol.name().to_owned(),
-            protocol_key: k.protocol_key,
+            protocol_key: None,
             transport: k.transport.name().to_owned(),
-            transport_key: k.transport_key,
+            transport_key: None,
             masked: k.masked,
             plaintext: k.plaintext,
             delta_encode: k.delta_encode,
@@ -100,6 +103,9 @@ impl Default for ObfuscationConfig {
         }
     }
 }
+
+/// Built-in placeholder password; every real deployment must override it.
+const PLACEHOLDER_PASSWORD: &str = "openppp3";
 
 impl ObfuscationConfig {
     fn method(name: &str) -> Result<Method, String> {
@@ -111,26 +117,61 @@ impl ObfuscationConfig {
         })
     }
 
+    fn resolve_password(
+        key: Option<&str>,
+        shared: Option<&str>,
+        field: &str,
+    ) -> Result<String, String> {
+        match key.or(shared) {
+            Some(p) if !p.is_empty() => Ok(p.to_owned()),
+            // An explicitly set but empty string is almost certainly a mistake.
+            Some(_) => Err(format!("empty password for {field}")),
+            None => Ok(String::from(PLACEHOLDER_PASSWORD)),
+        }
+    }
+
     /// Validates and converts into the core [`ObfuscationKey`].
+    /// `shared_password` (the top-level `password` field) backs any cipher
+    /// key left unset; sharing one password across layers is safe because
+    /// the core KDF domain-separates cipher roles.
     ///
     /// # Errors
     ///
-    /// Unknown cipher method name.
-    pub fn to_key(&self) -> Result<ObfuscationKey, String> {
+    /// Unknown cipher method name or empty password.
+    pub fn to_key(&self, shared_password: Option<&str>) -> Result<ObfuscationKey, String> {
         Ok(ObfuscationKey {
             kf: self.kf,
             kl: self.kl,
             kh: self.kh,
             kx: self.kx,
+            protocol_key: Self::resolve_password(
+                self.protocol_key.as_deref(),
+                shared_password,
+                "protocol_key",
+            )?,
             protocol: Self::method(&self.protocol)?,
-            protocol_key: self.protocol_key.clone(),
+            transport_key: Self::resolve_password(
+                self.transport_key.as_deref(),
+                shared_password,
+                "transport_key",
+            )?,
             transport: Self::method(&self.transport)?,
-            transport_key: self.transport_key.clone(),
             masked: self.masked,
             plaintext: self.plaintext,
             delta_encode: self.delta_encode,
             shuffle_data: self.shuffle_data,
         })
+    }
+
+    /// Emits a startup warning when the deployment still runs on the
+    /// built-in placeholder password (trivially bypassable by anyone).
+    pub fn warn_placeholder(key: &ObfuscationKey) {
+        if key.protocol_key == PLACEHOLDER_PASSWORD && key.transport_key == PLACEHOLDER_PASSWORD {
+            warn!(
+                "obfuscation passwords are left at the built-in placeholder; set `password` (or \
+                 `protocol_key`/`transport_key`) per deployment"
+            );
+        }
     }
 }
 
@@ -140,6 +181,11 @@ impl ObfuscationConfig {
 pub struct ServerConfig {
     /// Listen address, e.g. `"0.0.0.0:6666"`.
     pub listen: String,
+    /// Shared tunnel password; backs any obfuscation cipher key left unset.
+    /// Prefer this over writing `protocol_key`/`transport_key` twice —
+    /// sharing is safe (the core KDF separates the two cipher roles).
+    #[serde(default)]
+    pub password: Option<String>,
     /// Outbound (server -> target) connect timeout in seconds.
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout: u64,
@@ -161,6 +207,10 @@ pub struct ServerConfig {
 pub struct ClientConfig {
     /// Local SOCKS5 inbound listen address.
     pub listen: String,
+    /// Shared tunnel password; backs any obfuscation cipher key left unset.
+    /// Must match the server.
+    #[serde(default)]
+    pub password: Option<String>,
     /// Remote server section.
     pub server: ServerSection,
 }
@@ -174,7 +224,7 @@ pub struct ServerSection {
     /// Connect + handshake timeout in seconds.
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout: u64,
-    /// Obfuscation parameters, must match the server (except secrets).
+    /// Obfuscation parameters, must match the server.
     #[serde(default)]
     pub obfuscation: ObfuscationConfig,
 }
@@ -216,7 +266,7 @@ impl ClientConfig {
         let cfg: Self = load_jsonc(path)?;
         cfg.server
             .obfuscation
-            .to_key()
+            .to_key(cfg.password.as_deref())
             .map_err(|e| validate(&path_str, e))?;
         Ok(cfg)
     }
@@ -232,7 +282,7 @@ impl ServerConfig {
         let path_str = path.display().to_string();
         let cfg: Self = load_jsonc(path)?;
         cfg.obfuscation
-            .to_key()
+            .to_key(cfg.password.as_deref())
             .map_err(|e| validate(&path_str, e))?;
         Ok(cfg)
     }
@@ -245,7 +295,7 @@ mod tests {
     #[test]
     fn obfuscation_defaults_match_core() {
         assert_eq!(
-            ObfuscationConfig::default().to_key().unwrap(),
+            ObfuscationConfig::default().to_key(None).unwrap(),
             ObfuscationKey::default()
         );
     }
@@ -257,11 +307,34 @@ mod tests {
             "protocol_key": "sekrit",
         }"#;
         let cfg: ObfuscationConfig = json5::from_str(text).unwrap();
-        assert_eq!(cfg.protocol_key, "sekrit");
+        assert_eq!(cfg.protocol_key.as_deref(), Some("sekrit"));
         assert_eq!(cfg.kf, ObfuscationKey::default().kf);
-        let key = cfg.to_key().unwrap();
+        let key = cfg.to_key(None).unwrap();
         assert_eq!(key.protocol_key, "sekrit");
+        // Unset transport key falls back to the placeholder.
+        assert_eq!(key.transport_key, "openppp3");
         assert_eq!(key.transport, Method::Aes256Cfb);
+    }
+
+    #[test]
+    fn shared_password_backs_unset_keys() {
+        let cfg: ObfuscationConfig = json5::from_str("{}").unwrap();
+        let key = cfg.to_key(Some("shared")).unwrap();
+        assert_eq!(key.protocol_key, "shared");
+        assert_eq!(key.transport_key, "shared");
+        // Explicit per-layer keys win over the shared password.
+        let cfg: ObfuscationConfig =
+            json5::from_str(r#"{ "protocol_key": "one", "transport_key": "two" }"#).unwrap();
+        let key = cfg.to_key(Some("shared")).unwrap();
+        assert_eq!(key.protocol_key, "one");
+        assert_eq!(key.transport_key, "two");
+    }
+
+    #[test]
+    fn empty_password_rejected() {
+        let cfg: ObfuscationConfig = json5::from_str(r#"{ "protocol_key": "" }"#).unwrap();
+        let err = cfg.to_key(Some("shared")).unwrap_err();
+        assert!(err.contains("empty password"));
     }
 
     #[test]
@@ -270,7 +343,7 @@ mod tests {
             transport: String::from("rc4-md5"),
             ..ObfuscationConfig::default()
         };
-        assert!(cfg.to_key().unwrap_err().contains("unknown cipher"));
+        assert!(cfg.to_key(None).unwrap_err().contains("unknown cipher"));
     }
 
     #[test]
@@ -278,12 +351,21 @@ mod tests {
         let text = r#"{
             // local socks5 inbound
             "listen": "127.0.0.1:1080",
+            "password": "sekrit",
             "server": { "address": "example.com:6666" },
         }"#;
         let cfg: ClientConfig = json5::from_str(text).unwrap();
         assert_eq!(cfg.listen, "127.0.0.1:1080");
         assert_eq!(cfg.server.address, "example.com:6666");
         assert_eq!(cfg.server.connect_timeout, 10);
+        assert_eq!(cfg.password.as_deref(), Some("sekrit"));
+        let key = cfg
+            .server
+            .obfuscation
+            .to_key(cfg.password.as_deref())
+            .unwrap();
+        assert_eq!(key.protocol_key, "sekrit");
+        assert_eq!(key.transport_key, "sekrit");
     }
 
     #[test]

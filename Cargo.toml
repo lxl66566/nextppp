@@ -29,8 +29,7 @@ openppp3-common   = { path = "crates/common" }
 openppp3-server   = { path = "crates/server" }
 openppp3-client   = { path = "crates/client" }
 serde             = { version = "1", features = ["derive"] }
-tracing           = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+spdlog-rs         = "0.5"
 
 [workspace.lints.rust]
 unsafe_code           = "warn"

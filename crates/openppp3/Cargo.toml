@@ -17,7 +17,8 @@ openppp3-common     = { workspace = true }
 openppp3-server     = { workspace = true }
 anyhow              = { workspace = true }
 clap                = { workspace = true }
-tracing-subscriber  = { workspace = true }
+spdlog-rs           = { workspace = true }
 
 [lints]
 workspace = true
+
