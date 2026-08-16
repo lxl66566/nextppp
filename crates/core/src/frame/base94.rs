@@ -42,11 +42,8 @@ pub const HEADER_SIMPLE: usize = 4;
 pub const HEADER_EXTENDED: usize = 7;
 
 /// Stateful base94 frame codec. Transmit and receive first-frame states are
-/// tracked independently, mirroring openppp2's `frame_tn_`/`frame_rn_`.
-///
-/// `Clone` exists for [`crate::Transmission::split`]: each half keeps its own
-/// copy and only ever touches its own direction's first-frame flag.
-#[derive(Clone)]
+/// tracked independently, mirroring openppp2's `frame_tn_`/`frame_rn_` — one
+/// framer per direction works as well as one shared framer.
 pub struct Base94Framer {
     kf: u32,
     mod_: u32,
