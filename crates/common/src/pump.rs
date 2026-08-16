@@ -193,9 +193,8 @@ fn tunnel_down(mut rx: TransmissionRx<TcpStream>, mut local: TcpStream) -> (u64,
     loop {
         match rx.read_buf() {
             Ok(msg) => {
-                let Some((&tag, payload)) = msg.split_first() else {
-                    continue; // zero-payload data frame: harmless no-op
-                };
+                // The core read path guarantees non-empty messages.
+                let (&tag, payload) = msg.split_first().expect("messages are non-empty");
                 match tag {
                     FRAME_DATA if !payload.is_empty() => {
                         if let Err(e) = local.write_all(payload) {
@@ -206,6 +205,11 @@ fn tunnel_down(mut rx: TransmissionRx<TcpStream>, mut local: TcpStream) -> (u64,
                     FRAME_EOF => {
                         let _ = local.shutdown(Shutdown::Write);
                         return (total, PumpEnd::Eof("remote eof"));
+                    },
+                    FRAME_DATA => {
+                        // proto.rs: data frames must carry a non-empty
+                        // payload; an empty one is a protocol violation.
+                        return (total, PumpEnd::Fault(String::from("empty data frame")));
                     },
                     _ => {
                         // Unknown frame kind: protocol violation.

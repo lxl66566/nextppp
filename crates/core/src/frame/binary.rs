@@ -15,8 +15,6 @@
 // header_kf byte masking intentionally uses the low byte only (C++ `Byte(x)`).
 #![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 
-use std::io::Read;
-
 use rand::{Rng, RngExt};
 
 use crate::{
@@ -56,15 +54,6 @@ impl PayloadFlags {
         shuffle: true,
         delta: true,
     };
-
-    #[must_use]
-    pub fn or(self, other: Self) -> Self {
-        Self {
-            masked: self.masked || other.masked,
-            shuffle: self.shuffle || other.shuffle,
-            delta: self.delta || other.delta,
-        }
-    }
 }
 
 /// Builds the 3-byte encrypted header. Returns the header and the derived
@@ -144,14 +133,6 @@ pub fn payload_deobfuscate(data: &mut [u8], flags: &PayloadFlags, header_kf: u32
     if flags.masked {
         masked_xor_random_next(data, header_kf);
     }
-}
-
-/// Reads `len` bytes from `r` into a fresh buffer (used by the streaming
-/// binary-frame receive path).
-pub fn read_payload<Rd: Read>(r: &mut Rd, len: usize) -> Result<Vec<u8>> {
-    let mut payload = vec![0u8; len];
-    r.read_exact(&mut payload).map_err(Error::Io)?;
-    Ok(payload)
 }
 
 #[cfg(test)]
