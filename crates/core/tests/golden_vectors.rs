@@ -179,12 +179,14 @@ mod vectors {
     ];
 }
 
+use base94_simd::{
+    DECIMAL_MAX_LEN as BASE94_DECIMAL_MAX_LEN, decimal_decode as base94_decimal_decode,
+    decimal_encode as base94_decimal_encode, decode_into as base94_decode_into,
+    encode_into as base94_encode_into,
+};
 use openppp3_core::{
     ObfuscationKey,
-    crypto::ssea::{
-        BASE94_DECIMAL_MAX_LEN, base94_decimal_decode, base94_decimal_encode, base94_decode_into,
-        base94_encode_into, delta_encode, lcg_next, masked_xor_random_next, shuffle,
-    },
+    crypto::ssea::{delta_encode, lcg_next, masked_xor_random_next, shuffle},
     frame::{
         base94::Base94Framer,
         binary::{PayloadFlags, header_decrypt, payload_deobfuscate},

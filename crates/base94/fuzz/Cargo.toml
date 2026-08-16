@@ -1,0 +1,27 @@
+[package]
+name    = "base94-simd-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+base94-simd   = { path = ".." }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc  = false
+
+[[bin]]
+name = "decode_matches_reference"
+path = "fuzz_targets/decode_matches_reference.rs"
+test = false
+doc  = false

@@ -1,0 +1,26 @@
+[package]
+name          = "base94-simd"
+description   = "SIMD-accelerated base94 codec"
+readme        = "README.md"
+keywords      = ["base94", "simd", "encoding", "ascii", "printable"]
+categories    = ["encoding"]
+exclude       = ["fuzz"]
+version       = "0.1.0"
+edition       = "2024"
+rust-version  = "1.85"
+repository    = "https://github.com/lxl66566/openppp3-rs"
+license       = "MIT OR Apache-2.0"
+
+[lints.clippy]
+all                     = { level = "warn", priority = -1 }
+cargo                   = { level = "warn", priority = -1 }
+doc_markdown            = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+multiple_crate_versions = "allow"
+pedantic                = { level = "warn", priority = -1 }
+wildcard_imports        = "allow"
+
+[lints.rust]
+unsafe_code           = "allow"
+unused_qualifications = "warn"

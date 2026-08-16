@@ -22,14 +22,16 @@
 
 use std::io::Read;
 
+use base94_simd::{
+    DECIMAL_MAX_LEN as BASE94_DECIMAL_MAX_LEN, decimal_decode as base94_decimal_decode,
+    decimal_encode as base94_decimal_encode, decode_into as base94_decode_into,
+    encode_into as base94_encode_into, encoded_len as base94_encoded_len,
+};
 use rand::{Rng, RngExt};
 
 use crate::{
     BASE94_MAX_FRAME, MOD_MAX, MOD_MIN,
-    crypto::ssea::{
-        BASE94_DECIMAL_MAX_LEN, base94_decimal_decode, base94_decimal_encode, base94_decode_into,
-        base94_encode_into, base94_encoded_len, lcg_range, shuffle, unshuffle,
-    },
+    crypto::ssea::{lcg_range, shuffle, unshuffle},
     error::{Error, Result},
     frame::checksum::inet_chksum,
 };

@@ -25,6 +25,7 @@ libc      = "0.2"
 
 # app crates
 anyhow          = "1"
+base94-simd     = { path = "crates/base94", version = "0.1.0" }
 clap            = { version = "4", features = ["derive"] }
 hotpath         = "0.23"
 json5           = "1.3"

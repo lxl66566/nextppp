@@ -81,3 +81,9 @@ impl PartialEq for Error {
 }
 
 impl Eq for Error {}
+
+impl From<base94_simd::DecodeError> for Error {
+    fn from(_: base94_simd::DecodeError) -> Self {
+        Self::InvalidBase94
+    }
+}

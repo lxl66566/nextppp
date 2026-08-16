@@ -20,13 +20,14 @@ harness = false
 name    = "pipeline"
 
 [dependencies]
-aes       = { workspace = true }
-chacha20  = { workspace = true }
-hkdf      = { workspace = true }
-hotpath   = { workspace = true, optional = true }
-rand      = { workspace = true }
-sha2      = { workspace = true }
-thiserror = { workspace = true }
+aes         = { workspace = true }
+base94-simd = { workspace = true }
+chacha20    = { workspace = true }
+hkdf        = { workspace = true }
+hotpath     = { workspace = true, optional = true }
+rand        = { workspace = true }
+sha2        = { workspace = true }
+thiserror   = { workspace = true }
 
 [features]
 # Profiling instrumentation (linux dev tooling; noop and zero-cost when off,

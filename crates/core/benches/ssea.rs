@@ -2,13 +2,14 @@
 
 use std::hint::black_box;
 
+use base94_simd::{
+    decode_into as base94_decode_into, encode_into as base94_encode_into,
+    encoded_len as base94_encoded_len,
+};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use openppp3_core::crypto::{
     cipher::{CipherRole, Method, SessionCipher},
-    ssea::{
-        base94_decode_into, base94_encode_into, base94_encoded_len, delta_decode, delta_encode,
-        masked_xor_random_next, shuffle, unshuffle,
-    },
+    ssea::{delta_decode, delta_encode, masked_xor_random_next, shuffle, unshuffle},
 };
 
 const N: usize = 65536;
