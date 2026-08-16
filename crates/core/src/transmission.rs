@@ -26,7 +26,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use std::{
-    io::{Read, Write},
+    io::{self, Read, Write},
     mem,
 };
 
@@ -144,8 +144,11 @@ impl<R: Rng> TxCore<R> {
     fn write(&mut self, io: &mut impl Write, plaintext: &[u8]) -> Result<()> {
         let mut out = mem::take(&mut self.scratch_out);
         out.clear();
-        self.encrypt_into(&mut out, plaintext)?;
-        let result = io.write_all(&out).map_err(Error::Io);
+        // Restore the scratch even on failure: dropping it here would cost
+        // the allocation on every subsequent packet.
+        let result = self
+            .encrypt_into(&mut out, plaintext)
+            .and_then(|()| io.write_all(&out).map_err(Error::Io));
         self.scratch_out = out;
         result
     }
@@ -199,15 +202,11 @@ impl RxCore {
     /// Decrypts one complete wire packet (in-memory inverse of
     /// [`TxCore::encrypt_into`]).
     fn decrypt(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
-        let binary = if !self.handshaked || self.key.plaintext {
+        let mut binary = if !self.handshaked || self.key.plaintext {
             self.b94.decode_packet(packet)?
         } else {
             packet.to_vec()
         };
-        self.decrypt_packet(&binary)
-    }
-
-    fn decrypt_packet(&mut self, binary: &[u8]) -> Result<Vec<u8>> {
         if binary.len() <= HEADER_SIZE {
             return Err(Error::InvalidFrame);
         }
@@ -220,9 +219,10 @@ impl RxCore {
         if len + HEADER_SIZE != binary.len() {
             return Err(Error::InvalidFrame);
         }
-        let mut body = binary[HEADER_SIZE..].to_vec();
-        self.decrypt_body(header_kf, &mut body);
-        Ok(body)
+        // Decrypt in place, then drop the header: one allocation total.
+        binary.drain(..HEADER_SIZE);
+        self.decrypt_body(header_kf, &mut binary);
+        Ok(binary)
     }
 
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "RxCore"))]
@@ -282,9 +282,21 @@ impl RxCore {
                 return Err(Error::FrameTooLarge { len });
             }
             // No binary header here: the wire header was consumed above.
+            // take+read_to_end writes into spare capacity directly, skipping
+            // the zeroing that resize+read_exact would do first.
             scratch_body.clear();
-            scratch_body.resize(len, 0);
-            io.read_exact(scratch_body).map_err(Error::Io)?;
+            scratch_body.reserve(len);
+            let n = io
+                .by_ref()
+                .take(len as u64)
+                .read_to_end(scratch_body)
+                .map_err(Error::Io)?;
+            if n != len {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated binary frame",
+                )));
+            }
             (header_kf, 0)
         };
         let Self {

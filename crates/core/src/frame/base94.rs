@@ -21,7 +21,7 @@
 // truncating casts are part of the protocol semantics.
 #![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 
-use std::io::Read;
+use std::io::{self, Read};
 
 use base94_simd::{
     DECIMAL_MAX_LEN as BASE94_DECIMAL_MAX_LEN, decimal_decode as base94_decimal_decode,
@@ -132,11 +132,11 @@ impl Base94Framer {
         h.swap(2, 3);
 
         if self.tx_first {
+            const CHECKSUM_LEN: usize = HEADER_EXTENDED - HEADER_SIMPLE;
             // Extended header: 3 checksum digits, shuffled with kf.
             let chk = u32::from(inet_chksum(&h[..HEADER_SIMPLE])) ^ length as u32;
             let cn = (chk + self.kf_mod) % self.mod_;
             let cl = base94_decimal_encode(u64::from(cn), &mut digits);
-            const CHECKSUM_LEN: usize = HEADER_EXTENDED - HEADER_SIMPLE;
             if cl == 0 || cl > CHECKSUM_LEN {
                 return Err(Error::InvalidFrame); // unreachable: cn < mod_ <= 94^3
             }
@@ -244,8 +244,20 @@ impl Base94Framer {
         };
 
         scratch.clear();
-        scratch.resize(len, 0);
-        r.read_exact(scratch).map_err(Error::Io)?;
+        // take+read_to_end writes into spare capacity directly, skipping
+        // the zeroing that resize+read_exact would do first.
+        scratch.reserve(len);
+        let n = r
+            .by_ref()
+            .take(len as u64)
+            .read_to_end(scratch)
+            .map_err(Error::Io)?;
+        if n != len {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated base94 frame",
+            )));
+        }
         out.clear();
         out.reserve(len);
         base94_decode_into(out, scratch, self.kf)?;
