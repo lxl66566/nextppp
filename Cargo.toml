@@ -1,41 +1,37 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members  = ["crates/*"]
 
 [workspace.package]
 version      = "0.1.0"
 edition      = "2024"
 rust-version = "1.85"
-license      = "MIT OR Apache-2.0"
 repository   = "https://github.com/lxl66566/openppp3-rs"
+license      = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-aes      = "0.8"
-cfb-mode = "0.8"
-chacha20 = "0.10"
-ctr      = "0.9"
-hkdf     = "0.12"
-rand     = "0.9"
-sha2     = "0.10"
+aes       = "0.9"
+cfb-mode  = "0.9"
+chacha20  = "0.10"
+ctr       = "0.10"
+hkdf      = "0.13"
+rand      = "0.10"
+sha2      = "0.11"
 thiserror = "2"
 
 # bench / test only
-criterion = "0.5"
+criterion = "0.8"
 
 # app crates
-anyhow            = "1"
-clap              = { version = "4", features = ["derive"] }
-json5             = "0.4"
-openppp3-core     = { path = "crates/core" }
-openppp3-common   = { path = "crates/common" }
-openppp3-server   = { path = "crates/server" }
-openppp3-client   = { path = "crates/client" }
-serde             = { version = "1", features = ["derive"] }
-spdlog-rs         = "0.5"
-
-[workspace.lints.rust]
-unsafe_code           = "warn"
-unused_qualifications = "warn"
+anyhow          = "1"
+clap            = { version = "4", features = ["derive"] }
+json5           = "1.3"
+openppp3-client = { path = "crates/client" }
+openppp3-common = { path = "crates/common" }
+openppp3-core   = { path = "crates/core" }
+openppp3-server = { path = "crates/server" }
+serde           = { version = "1", features = ["derive"] }
+spdlog-rs       = "0.5"
 
 [workspace.lints.clippy]
 all                     = { level = "warn", priority = -1 }
@@ -47,9 +43,14 @@ multiple_crate_versions = "allow"
 pedantic                = { level = "warn", priority = -1 }
 wildcard_imports        = "allow"
 
+[workspace.lints.rust]
+unsafe_code           = "warn"
+unused_qualifications = "warn"
+
 # If you are building bin target, uncomment this
-# [profile.release]
-# lto       = true
-# opt-level = "s"
-# panic     = "abort"
-# strip     = true
+[profile.release]
+opt-level     = "s"
+strip         = true
+lto           = true
+panic         = "unwind"
+codegen-units = 1

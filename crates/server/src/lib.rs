@@ -31,7 +31,7 @@ use openppp3_common::{
     proto, pump,
 };
 use openppp3_core::{ObfuscationKey, Transmission};
-use rand::RngCore;
+use rand::Rng;
 use spdlog::prelude::*;
 
 /// Heartbeat interval for the health/stats log line.

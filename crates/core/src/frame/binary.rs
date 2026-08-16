@@ -17,7 +17,7 @@
 
 use std::io::Read;
 
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 use crate::{
     PPP_BUFFER_SIZE,

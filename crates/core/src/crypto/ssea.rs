@@ -6,13 +6,13 @@
 //! mixing) stays identical to the battle-tested C++ implementation.
 //!
 //! Performance notes (wire output unchanged):
-//! * shuffle/unshuffle replace the hardware `%` (~20+ cycle `div` inside a
-//!   serial swap chain) with Lemire's two-multiply fastmod.
-//! * `lcg_next` computes the three LCG steps with a 2-multiply dependency
-//!   depth instead of 3 chained multiplies (next2/next3 both derive from
-//!   next1), which matters because masked-XOR is bound by the LCG chain.
-//! * base94 encode/decode are branchless: escape decisions become cmovs,
-//!   validation runs as one SIMD bulk pass plus cold error branches.
+//! * shuffle/unshuffle replace the hardware `%` (~20+ cycle `div` inside a serial swap chain) with
+//!   Lemire's two-multiply fastmod.
+//! * `lcg_next` computes the three LCG steps with a 2-multiply dependency depth instead of 3
+//!   chained multiplies (next2/next3 both derive from next1), which matters because masked-XOR is
+//!   bound by the LCG chain.
+//! * base94 encode/decode are branchless: escape decisions become cmovs, validation runs as one
+//!   SIMD bulk pass plus cold error branches.
 
 // Intentional truncating/wrapping casts below mirror the C++ `Byte(int)`
 // conversions: the protocol relies on low-byte / modulo-256 semantics.
@@ -176,7 +176,8 @@ pub fn base94_encode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) {
     let dst = out.as_mut_ptr();
     let mut p = start;
     let mut idx = 0usize;
-    while idx + UNROLL <= src.len() {        let chunk: [u8; UNROLL] = src[idx..idx + UNROLL].try_into().expect("fixed size");
+    while idx + UNROLL <= src.len() {
+        let chunk: [u8; UNROLL] = src[idx..idx + UNROLL].try_into().expect("fixed size");
         let mut offs = [0usize; UNROLL];
         let mut cursor = 0usize;
         for (k, &b) in chunk.iter().enumerate() {
@@ -189,7 +190,11 @@ pub fn base94_encode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) {
             // Escape: c1 = 0x7D + (v >= 186), c2 = 0x20 + v - 93 - 93*(v >= 186).
             // Single: c1 = 0x20 + v (c2 unused, overwritten by a later leader).
             let q2 = u8::from(v >= 2 * BASE93_RADIX);
-            let c1 = if esc != 0 { 0x7d + q2 } else { 0x20 + v };
+            let c1 = if esc != 0 {
+                0x7d + q2
+            } else {
+                0x20 + v
+            };
             let c2 = 0x20u8.wrapping_add(
                 v.wrapping_sub(BASE93_RADIX)
                     .wrapping_sub(BASE93_RADIX.wrapping_mul(q2)),
@@ -208,7 +213,11 @@ pub fn base94_encode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) {
         let v = b.wrapping_sub(kf8);
         let esc = u8::from(v >= BASE93_RADIX);
         let q2 = u8::from(v >= 2 * BASE93_RADIX);
-        let c1 = if esc != 0 { 0x7d + q2 } else { 0x20 + v };
+        let c1 = if esc != 0 {
+            0x7d + q2
+        } else {
+            0x20 + v
+        };
         let c2 = 0x20u8.wrapping_add(
             v.wrapping_sub(BASE93_RADIX)
                 .wrapping_sub(BASE93_RADIX.wrapping_mul(q2)),
@@ -266,11 +275,15 @@ pub fn base94_decode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) -> Result<()> 
         let bad = esc
             & (u16::from(b > 94)
                 | u16::from(b2 > u16::from(BASE93_RADIX))
-                | u16::from(v_esc > 0xFF));
+                | u16::from(v_esc > 0xff));
         if bad != 0 {
             return Err(Error::InvalidBase94);
         }
-        let val = if esc != 0 { v_esc } else { b };
+        let val = if esc != 0 {
+            v_esc
+        } else {
+            b
+        };
         // SAFETY: at most one output byte per input char, and `p` advanced
         // only by committed bytes within the reserved capacity.
         unsafe { *dst.add(p) = val.wrapping_add(kf16) as u8 };
@@ -385,7 +398,14 @@ mod tests {
             s
         };
         let divisors: Vec<u32> = (2u32..3000)
-            .chain([4096, 65536, 65539, 830_584, u32::MAX / 2 + 1, 2u32.pow(31) - 1])
+            .chain([
+                4096,
+                65536,
+                65539,
+                830_584,
+                u32::MAX / 2 + 1,
+                2u32.pow(31) - 1,
+            ])
             .collect();
         for d in divisors {
             let magic = fastmod_magic(d);
@@ -494,7 +514,9 @@ mod tests {
         };
         // Random data (~50% escapes), all-escape and no-escape shapes, plus
         // lengths that hit the SIMD tails and the trailing-single-char path.
-        let all_escape: Vec<u8> = (0..2000).map(|i| 93u8.wrapping_add(i as u8 % 163)).collect();
+        let all_escape: Vec<u8> = (0..2000)
+            .map(|i| 93u8.wrapping_add(i as u8 % 163))
+            .collect();
         let no_escape: Vec<u8> = vec![7u8; 2001];
         for dataset in [all_escape, no_escape] {
             for kf in [0u32, 0x5a5a_5a5a] {

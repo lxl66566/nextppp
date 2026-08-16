@@ -1,15 +1,23 @@
 [package]
-name         = "openppp3-core"
-description  = "Core protocol and cryptography algorithms of the openppp3 anti-censorship proxy"
-readme       = "../../README.md"
-keywords     = ["proxy", "anti-censorship", "network", "openppp2"]
-categories   = ["network-programming"]
+name        = "openppp3-core"
+description = "Core protocol and cryptography algorithms of the openppp3 anti-censorship proxy"
+readme      = "../../README.md"
+keywords    = ["anti-censorship", "network", "openppp2", "proxy"]
+categories  = ["network-programming"]
 
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
-license.workspace      = true
 repository.workspace   = true
+license.workspace      = true
+
+[[bench]]
+harness = false
+name    = "ssea"
+
+[[bench]]
+harness = false
+name    = "pipeline"
 
 [dependencies]
 aes       = { workspace = true }
@@ -23,14 +31,6 @@ thiserror = { workspace = true }
 cfb-mode  = { workspace = true }
 criterion = { workspace = true }
 ctr       = { workspace = true }
-
-[[bench]]
-name    = "ssea"
-harness = false
-
-[[bench]]
-name       = "pipeline"
-harness    = false
 
 [lints]
 workspace = true

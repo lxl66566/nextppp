@@ -26,7 +26,7 @@ use std::{
     mem,
 };
 
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{Rng, RngExt, SeedableRng, rngs::StdRng};
 
 use crate::{
     PPP_BUFFER_SIZE, SessionId,
@@ -77,7 +77,11 @@ impl<T> Transmission<T, StdRng> {
     /// Creates a transmission with an OS-seeded CSPRNG.
     #[must_use]
     pub fn new(io: T, key: ObfuscationKey) -> Self {
-        Self::with_rng(io, key, StdRng::from_os_rng())
+        // rand 0.10 removed SeedableRng::from_os_rng; SysRng is the stateless
+        // OS-entropy interface, StdRng::try_from_rng seeds it from there.
+        let rng = StdRng::try_from_rng(&mut rand::rngs::SysRng)
+            .expect("failed to seed StdRng from OS entropy");
+        Self::with_rng(io, key, rng)
     }
 }
 
@@ -545,9 +549,7 @@ impl<T: Read> TransmissionRx<T> {
         if !self.handshaked || self.key.plaintext {
             let binary = {
                 let Self {
-                    b94,
-                    io,
-                    scratch, ..
+                    b94, io, scratch, ..
                 } = self;
                 b94.read_frame_with(io, scratch)?
             };

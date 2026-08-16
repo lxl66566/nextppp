@@ -1,6 +1,8 @@
 //! Micro-benchmarks for the SSEA obfuscation primitives (hot per-packet path).
 
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use openppp3_core::crypto::{
     cipher::{CipherRole, Method, SessionCipher},
     ssea::{
@@ -70,8 +72,7 @@ fn bench(c: &mut Criterion) {
     drop(encoded);
 
     // Session cipher: large payload (transport) and 2-byte header (protocol).
-    let mut transport =
-        SessionCipher::new(Method::Aes256Cfb, CipherRole::Transport, "bench-key");
+    let mut transport = SessionCipher::new(Method::Aes256Cfb, CipherRole::Transport, "bench-key");
     g.bench_function("cipher_aes256cfb_payload", |b| {
         b.iter(|| transport.apply(black_box(&mut buf)));
     });

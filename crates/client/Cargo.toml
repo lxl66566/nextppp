@@ -1,25 +1,24 @@
 [package]
-name         = "openppp3-client"
-description  = "openppp3 anti-censorship proxy client (socks5 -> tunnel forwarder)"
-readme       = "../../README.md"
-keywords     = ["proxy", "anti-censorship", "network", "openppp2"]
-categories   = ["network-programming"]
+name        = "openppp3-client"
+description = "openppp3 anti-censorship proxy client (socks5 -> tunnel forwarder)"
+readme      = "../../README.md"
+keywords    = ["anti-censorship", "network", "openppp2", "proxy"]
+categories  = ["network-programming"]
 
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
-license.workspace      = true
 repository.workspace   = true
+license.workspace      = true
 
 [dependencies]
-openppp3-core      = { workspace = true }
-openppp3-common    = { workspace = true }
-anyhow             = { workspace = true }
-spdlog-rs          = { workspace = true }
+anyhow          = { workspace = true }
+openppp3-common = { workspace = true }
+openppp3-core   = { workspace = true }
+spdlog-rs       = { workspace = true }
 
 [dev-dependencies]
 openppp3-server = { workspace = true }
 
 [lints]
 workspace = true
-

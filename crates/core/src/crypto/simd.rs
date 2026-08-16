@@ -11,7 +11,11 @@
 #![allow(unsafe_code)]
 // Intrinsic parameters are i8 lanes; u8 <-> i8 bit reinterpretation (and the
 // matching truncating casts on extract) is the intended semantic.
-#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+#![allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 
 // Reference implementations: selected on targets without a SIMD backend and
 // reused by arch backends for sub-block tails; the equivalence tests also
@@ -62,7 +66,9 @@ mod arch {
 
     // SSE2 lane-0 byte replacement mask (SSE2 has no insert_epi8, which is
     // SSE4.1): value = (v & keep15) | (set1(x) & lane0).
-    const KEEP15: [i8; 16] = [0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1];
+    const KEEP15: [i8; 16] = [
+        0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    ];
     const LANE0: [i8; 16] = [-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
     pub(super) fn count_sub_ge(src: &[u8], sub: u8, threshold: u8) -> usize {
@@ -94,7 +100,7 @@ mod arch {
             // SAFETY: chunk length is exactly 16 bytes.
             let v = unsafe { _mm_loadu_si128(c.as_ptr().cast()) };
             let m = unsafe { _mm_cmpgt_epi8(_mm_xor_si128(v, flip), vbound) };
-            ok &= unsafe { _mm_movemask_epi8(m) } as u32 == 0xFFFF;
+            ok &= unsafe { _mm_movemask_epi8(m) } as u32 == 0xffff;
         }
         ok && chunks.remainder().iter().all(|&b| b >= threshold)
     }
@@ -195,7 +201,7 @@ mod arch {
         for c in &mut chunks {
             // SAFETY: chunk length is exactly 16 bytes.
             let v = unsafe { vld1q_u8(c.as_ptr()) };
-            ok &= unsafe { vminvq_u8(vcgeq_u8(v, vt)) } == 0xFF;
+            ok &= unsafe { vminvq_u8(vcgeq_u8(v, vt)) } == 0xff;
         }
         ok && chunks.remainder().iter().all(|&b| b >= threshold)
     }
@@ -317,7 +323,6 @@ mod tests {
                 );
                 assert_eq!(all_ge(&src, 1), scalar::all_ge(&src, 1), "all n={n}");
 
-
                 let mut a = src.clone();
                 let mut b = src.clone();
                 delta_encode(&mut a, kf);
@@ -342,5 +347,3 @@ mod tests {
         assert_eq!(data, src);
     }
 }
-
-

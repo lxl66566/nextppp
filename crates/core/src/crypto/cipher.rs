@@ -23,10 +23,7 @@
 //! Kept from the original: the "password + per-connection ivv string" key
 //! seasoning, so every connection derives independent working keys.
 
-use aes::cipher::{
-    BlockEncrypt, BlockSizeUser, KeyInit,
-    generic_array::{GenericArray, typenum::U16},
-};
+use aes::cipher::{Array, BlockCipherEncrypt, BlockSizeUser, KeyInit, typenum::U16};
 use hkdf::Hkdf;
 use sha2::Sha256;
 
@@ -115,7 +112,7 @@ impl Method {
     }
 }
 
-type Block = GenericArray<u8, U16>;
+type Block = Array<u8, U16>;
 
 /// Precomputed AES key schedule (see design note 4). One boxed-free enum
 /// holding either schedule; the variant size gap is inherent and harmless
@@ -185,10 +182,10 @@ impl SessionCipher {
 
         let core = match method {
             Method::Aes128Cfb | Method::Aes128Ctr => {
-                Core::Aes128(aes::Aes128::new(GenericArray::from_slice(&key[..16])))
+                Core::Aes128(aes::Aes128::new_from_slice(&key[..16]).expect("fixed key length"))
             },
             Method::Aes256Cfb | Method::Aes256Ctr | Method::ChaCha20 => {
-                Core::Aes256(aes::Aes256::new(GenericArray::from_slice(&key[..32])))
+                Core::Aes256(aes::Aes256::new_from_slice(&key[..32]).expect("fixed key length"))
             },
         };
 
@@ -236,14 +233,10 @@ impl SessionCipher {
             },
             // `Core` is derived from `method` at construction; these pairings
             // cannot exist.
-            (
-                Method::Aes128Cfb | Method::Aes128Ctr,
-                Core::Aes256(_),
-            )
-            | (
-                Method::Aes256Cfb | Method::Aes256Ctr,
-                Core::Aes128(_),
-            ) => unreachable!("cipher core must match method"),
+            (Method::Aes128Cfb | Method::Aes128Ctr, Core::Aes256(_))
+            | (Method::Aes256Cfb | Method::Aes256Ctr, Core::Aes128(_)) => {
+                unreachable!("cipher core must match method")
+            },
         }
     }
 
@@ -279,7 +272,7 @@ impl SessionCipher {
 /// AES-CFB128 over `data` with the per-packet `iv`.
 fn cfb_apply<E>(cipher: &E, iv: &[u8; NONCE_MAX], data: &mut [u8], encrypting: bool)
 where
-    E: BlockEncrypt + BlockSizeUser<BlockSize = U16>,
+    E: BlockCipherEncrypt + BlockSizeUser<BlockSize = U16>,
 {
     if encrypting {
         cfb_encrypt(cipher, iv, data);
@@ -293,7 +286,7 @@ where
 /// halves to keep per-block overhead off the AES latency chain.
 fn cfb_encrypt<E>(cipher: &E, iv: &[u8; NONCE_MAX], data: &mut [u8])
 where
-    E: BlockEncrypt + BlockSizeUser<BlockSize = U16>,
+    E: BlockCipherEncrypt + BlockSizeUser<BlockSize = U16>,
 {
     let mut fb: Block = (*iv).into();
     let mut chunks = data.chunks_exact_mut(16);
@@ -322,7 +315,7 @@ fn xor16_store(chunk: &mut [u8], ks: &Block) -> [u8; 16] {
 /// feedback chain.
 fn cfb_decrypt<E>(cipher: &E, iv: &[u8; NONCE_MAX], data: &mut [u8])
 where
-    E: BlockEncrypt + BlockSizeUser<BlockSize = U16>,
+    E: BlockCipherEncrypt + BlockSizeUser<BlockSize = U16>,
 {
     const BATCH: usize = 8;
     let nb = data.len() / 16;
@@ -355,7 +348,7 @@ where
 /// directions).
 fn xor_tail<E>(cipher: &E, feedback: &Block, rem: &mut [u8])
 where
-    E: BlockEncrypt + BlockSizeUser<BlockSize = U16>,
+    E: BlockCipherEncrypt + BlockSizeUser<BlockSize = U16>,
 {
     if rem.is_empty() {
         return;
@@ -370,7 +363,7 @@ where
 /// AES-CTR: fully parallel — 8 counter blocks encrypted and XORed per batch.
 fn ctr_apply<E>(cipher: &E, iv: &[u8; NONCE_MAX], data: &mut [u8])
 where
-    E: BlockEncrypt + BlockSizeUser<BlockSize = U16>,
+    E: BlockCipherEncrypt + BlockSizeUser<BlockSize = U16>,
 {
     const BATCH: usize = 8;
     let mut ks: [Block; BATCH] = core::array::from_fn(|_| Block::from([0u8; 16]));
@@ -499,8 +492,7 @@ mod tests {
         // desync two parties running mirrored instances.
         for m in all_methods() {
             let mut enc = SessionCipher::new(m, CipherRole::Transport, "pw");
-            let mut dec =
-                SessionCipher::new(m, CipherRole::Transport, "pw").for_decryption();
+            let mut dec = SessionCipher::new(m, CipherRole::Transport, "pw").for_decryption();
             for n in [1usize, 2, 3, 17, 100] {
                 let original: Vec<u8> = (0..n).map(|i| (i * 37) as u8).collect();
                 let mut wire = original.clone();
@@ -562,7 +554,11 @@ mod tests {
     /// Mirrors `next_nonce` for the reference drivers.
     fn ref_nonce(method: Method, base_iv: &[u8; NONCE_MAX], seq: u64) -> [u8; NONCE_MAX] {
         let mut nonce = *base_iv;
-        let xor_width = if method == Method::ChaCha20 { 4 } else { 8 };
+        let xor_width = if method == Method::ChaCha20 {
+            4
+        } else {
+            8
+        };
         let start = method.iv_len() - xor_width;
         let seq = seq.to_be_bytes();
         for i in 0..xor_width {
@@ -586,14 +582,21 @@ mod tests {
 
     #[test]
     fn manual_cfb_ctr_match_reference_crates() {
-        use aes::Aes128 as RefAes128;
-        use aes::Aes256 as RefAes256;
+        use aes::{Aes128 as RefAes128, Aes256 as RefAes256};
 
-        for method in [Method::Aes128Cfb, Method::Aes256Cfb, Method::Aes128Ctr, Method::Aes256Ctr]
-        {
+        for method in [
+            Method::Aes128Cfb,
+            Method::Aes256Cfb,
+            Method::Aes128Ctr,
+            Method::Aes256Ctr,
+        ] {
             for encrypting in [true, false] {
                 let base = SessionCipher::new(method, CipherRole::Transport, "cross-check");
-                let mut mine = if encrypting { base } else { base.for_decryption() };
+                let mut mine = if encrypting {
+                    base
+                } else {
+                    base.for_decryption()
+                };
                 // Lengths hit: partial tails, single blocks, multi-batch
                 // (> 8*16 = CFB decrypt / CTR batch boundary) and full frames.
                 for len in [0usize, 1, 2, 15, 16, 17, 31, 128, 129, 1000, 65536] {
@@ -604,25 +607,25 @@ mod tests {
                     let mut expected = data.clone();
                     match (method, encrypting) {
                         (Method::Aes128Cfb, true) => {
-                            use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
+                            use cfb_mode::cipher::KeyIvInit;
                             cfb_mode::Encryptor::<RefAes128>::new_from_slices(&key[..16], &nonce)
                                 .expect("static lengths")
                                 .encrypt(&mut expected);
                         },
                         (Method::Aes128Cfb, false) => {
-                            use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
+                            use cfb_mode::cipher::KeyIvInit;
                             cfb_mode::Decryptor::<RefAes128>::new_from_slices(&key[..16], &nonce)
                                 .expect("static lengths")
                                 .decrypt(&mut expected);
                         },
                         (Method::Aes256Cfb, true) => {
-                            use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
+                            use cfb_mode::cipher::KeyIvInit;
                             cfb_mode::Encryptor::<RefAes256>::new_from_slices(&key[..32], &nonce)
                                 .expect("static lengths")
                                 .encrypt(&mut expected);
                         },
                         (Method::Aes256Cfb, false) => {
-                            use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
+                            use cfb_mode::cipher::KeyIvInit;
                             cfb_mode::Decryptor::<RefAes256>::new_from_slices(&key[..32], &nonce)
                                 .expect("static lengths")
                                 .decrypt(&mut expected);
@@ -644,10 +647,12 @@ mod tests {
 
                     let mut got = data;
                     mine.apply(&mut got);
-                    assert_eq!(got, expected, "{method:?} encrypting={encrypting} len={len}");
+                    assert_eq!(
+                        got, expected,
+                        "{method:?} encrypting={encrypting} len={len}"
+                    );
                 }
             }
         }
     }
 }
-

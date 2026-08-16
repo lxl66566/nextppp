@@ -4,9 +4,12 @@
 //! timing), so each iteration measures exactly one packet through the hot
 //! path with warm scratch buffers and advancing nonce counters.
 
-use std::io::{Read, Write};
+use std::{
+    hint::black_box,
+    io::{Read, Write},
+};
 
-use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use openppp3_core::{ObfuscationKey, Transmission};
 
 /// IO sink that discards writes and never reads: the in-memory codec paths
@@ -21,6 +24,7 @@ impl Write for NullIo {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         Ok(buf.len())
     }
+
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }

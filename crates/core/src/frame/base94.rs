@@ -22,7 +22,7 @@
 
 use std::io::Read;
 
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 use crate::{
     BASE94_MAX_FRAME, MOD_MAX, MOD_MIN,

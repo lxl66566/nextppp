@@ -1,23 +1,22 @@
 [package]
-name         = "openppp3-common"
-description  = "Shared building blocks for the openppp3 proxy server and client"
-readme       = "../../README.md"
-keywords     = ["proxy", "anti-censorship", "network", "openppp2"]
-categories   = ["network-programming"]
+name        = "openppp3-common"
+description = "Shared building blocks for the openppp3 proxy server and client"
+readme      = "../../README.md"
+keywords    = ["anti-censorship", "network", "openppp2", "proxy"]
+categories  = ["network-programming"]
 
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
-license.workspace      = true
 repository.workspace   = true
+license.workspace      = true
 
 [dependencies]
+json5         = { workspace = true }
 openppp3-core = { workspace = true }
 serde         = { workspace = true }
-json5         = { workspace = true }
 spdlog-rs     = { workspace = true }
 thiserror     = { workspace = true }
 
 [lints]
 workspace = true
-

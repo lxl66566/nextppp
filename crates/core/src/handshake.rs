@@ -17,7 +17,7 @@
 // Low-byte extraction (`kf ^ kfs[i]` as u8) mirrors the C++ semantics.
 #![allow(clippy::cast_possible_truncation)]
 
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 use crate::{
     SessionId,
