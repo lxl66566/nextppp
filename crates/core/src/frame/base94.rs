@@ -14,7 +14,8 @@
 //! * Parity trick: `k` is **even** when `h[1]` is random filler (length took fewer than 3 digits)
 //!   and **odd** when `h[1]` is a real length digit.
 //! * The 3 checksum digits in the first frame carry `(inet_chksum(header) ^ length + kf_mod) %
-//!   mod`, shuffled — any stream corruption or a mismatched `kf` fails the check immediately.
+//!   mod`, right-aligned and zero (0x20) padded like the length digits, then shuffled — any
+//!   stream corruption or a mismatched `kf` fails the check immediately.
 
 // Length arithmetic intentionally mirrors the C++ int/u32/usize mixing:
 // truncating casts are part of the protocol semantics.
@@ -135,10 +136,15 @@ impl Base94Framer {
             let chk = u32::from(inet_chksum(&h[..HEADER_SIMPLE])) ^ length as u32;
             let cn = (chk + self.kf_mod) % self.mod_;
             let cl = base94_decimal_encode(u64::from(cn), &mut digits);
-            if cl != 3 {
-                return Err(Error::InvalidFrame);
+            const CHECKSUM_LEN: usize = HEADER_EXTENDED - HEADER_SIMPLE;
+            if cl == 0 || cl > CHECKSUM_LEN {
+                return Err(Error::InvalidFrame); // unreachable: cn < mod_ <= 94^3
             }
-            h[HEADER_SIMPLE..HEADER_EXTENDED].copy_from_slice(&digits[..3]);
+            // Fewer than 3 digits: right-align, leaving 0x20 (base94 zero)
+            // padding — decimal_decode accepts leading zeros transparently.
+            // openppp2 errored on `cl != 3` instead, deterministically
+            // failing the first frame for some (kf, length) pairs.
+            h[HEADER_EXTENDED - cl..HEADER_EXTENDED].copy_from_slice(&digits[..cl]);
             shuffle(&mut h[HEADER_SIMPLE..HEADER_EXTENDED], self.kf);
             self.tx_first = false;
             Ok((h, HEADER_EXTENDED))
@@ -392,6 +398,42 @@ mod tests {
         // Different kf yields a different kf_mod/mod -> checksum mismatch or
         // garbage length; either way decoding must fail.
         assert!(rx.read_frame(&mut stream).is_err());
+    }
+
+    #[test]
+    fn short_checksum_is_zero_padded() {
+        // cn = (chk + kf_mod) % mod_ can fall below 94^2, yielding fewer
+        // than 3 checksum digits; the sender must zero-pad (0x20) instead of
+        // failing. The printable header forces inet_chksum >= ~2^14, so cn
+        // only ducks under 94^2 via kf_mod near mod_ (wraparound) or a large
+        // length cancelling the checksum's high bits — exercise both. A
+        // 3-digit cn has a leading digit >= 1 (> 0x20), so leading 0x20
+        // after unshuffle reliably detects the padding path.
+        let mut padded = false;
+        let mut kf = 0u32;
+        'outer: for _ in 0..20_000 {
+            // Golden-ratio step: a well-spread tour of u32 kf values.
+            kf = kf.wrapping_add(0x9e37_79b9);
+            for len in [1usize, 65_536] {
+                let (mut tx, mut rx) = pair(kf);
+                let mut rng = rng();
+                let payload = vec![0xabu8; len];
+                let mut wire = Vec::new();
+                tx.encode_frame(&mut rng, &mut wire, &payload)
+                    .unwrap_or_else(|e| panic!("kf={kf} len={len}: {e}"));
+                let mut cksum = [wire[4], wire[5], wire[6]];
+                unshuffle(&mut cksum, kf);
+                if cksum[0] == 0x20 {
+                    padded = true;
+                }
+                let mut stream: &[u8] = &wire;
+                assert_eq!(rx.read_frame(&mut stream).unwrap(), payload);
+                if padded {
+                    break 'outer;
+                }
+            }
+        }
+        assert!(padded, "test must exercise the zero-padded checksum path");
     }
 
     #[test]
