@@ -459,7 +459,8 @@ mod tests {
             tx.encode_frame(&mut rng, &mut wire, &[]),
             Err(Error::ZeroLength)
         ));
-        assert!(wire.is_empty());
+        // A rejected frame must not emit partial output.
+        assert_eq!(wire, [] as [u8; 0]);
     }
 
     #[test]

@@ -281,10 +281,10 @@ mod arch {
                 // L[i] = R[i] & ~L[i-1] — a raw leader immediately after a
                 // consumed leader is itself consumed as a follower (legal
                 // "7d 7d" pairs). The recurrence's depth grows one lane per
-                // iteration from the run-head seed, so five rounds settle
-                // runs up to 7 raw leaders long. Longer runs (~1e-10 in
-                // legitimate traffic, only crafted inputs) fall back to the
-                // scalar path via the run-length check below.
+                // iteration from the run-head seed, so the five statements
+                // below settle runs up to 6 raw leaders long. Runs of 7+
+                // (~1e-10 in legitimate traffic, only crafted inputs) fall
+                // back to the scalar path via the run-length check below.
                 let mut lead = raw_lead;
                 if carry {
                     lead = _mm_andnot_si128(lane0, lead);

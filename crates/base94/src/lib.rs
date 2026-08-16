@@ -433,7 +433,7 @@ mod tests {
         assert_eq!(input.len(), 16);
         let mut out = Vec::new();
         assert!(decode_into(&mut out, &input, 125).is_err());
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [u8; 0]);
         // Same construct shifted to other lanes / with a leading carry.
         for shift in 0..15usize {
             let mut v = vec![0x41u8; 16];
@@ -449,7 +449,7 @@ mod tests {
         v[1] = 0x7d;
         let mut out = Vec::new();
         assert!(decode_into(&mut out, &v, 0).is_err());
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [u8; 0]);
     }
 
     #[test]
