@@ -112,8 +112,9 @@ mod compact {
 
 #[cfg(target_arch = "x86_64")]
 mod arch {
-    use super::compact::{COMPACT, SPREAD4};
     use core::arch::x86_64::*;
+
+    use super::compact::{COMPACT, SPREAD4};
 
     // SSE2 lane-0 byte replacement mask (SSE2 has no insert_epi8, which is
     // SSE4.1): value = (v & keep15) | (set1(x) & lane0).
@@ -460,8 +461,9 @@ mod arch {
 
 #[cfg(target_arch = "aarch64")]
 mod arch {
-    use super::compact::{COMPACT, SPREAD4};
     use core::arch::aarch64::*;
+
+    use super::compact::{COMPACT, SPREAD4};
 
     // Lane-0 select/clear mask, the NEON counterpart of the x86_64 LANE0.
     const LANE0: [u8; 16] = [0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -525,11 +527,7 @@ mod arch {
 
                 // c1 = esc ? 0x7D + (v >= 186) : 0x20 + v. Note 0x7D is odd,
                 // so the q2 bit must be *added*, not OR-ed in.
-                let c1 = vbslq_u8(
-                    esc,
-                    vaddq_u8(vandq_u8(hi, one), c1hi),
-                    vaddq_u8(v, c20),
-                );
+                let c1 = vbslq_u8(esc, vaddq_u8(vandq_u8(hi, one), c1hi), vaddq_u8(v, c20));
                 // c2 = 0x20 + v - 93 - 93*(v >= 186) (only meaningful on esc)
                 let c2 = vsubq_u8(vaddq_u8(v, c2_base), vandq_u8(hi, c93));
 

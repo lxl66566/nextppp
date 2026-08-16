@@ -94,8 +94,8 @@ fn write_example(path: &Path, example: &str) -> anyhow::Result<()> {
     // overwriting could destroy a real deployment's configuration.
     match path.try_exists() {
         Ok(true) => anyhow::bail!(
-            "{} already exists; refusing to overwrite (remove it first or pass an explicit \
-             --init PATH)",
+            "{} already exists; refusing to overwrite (remove it first or pass an explicit --init \
+             PATH)",
             path.display()
         ),
         Ok(false) => {},

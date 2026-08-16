@@ -5,6 +5,7 @@ edition      = "2024"
 rust-version = "1.85"
 description  = "SIMD-accelerated base94 codec"
 readme       = "README.md"
+homepage     = "https://github.com/lxl66566/nextppp/crates/base94"
 repository   = "https://github.com/lxl66566/nextppp"
 license      = "MIT OR Apache-2.0"
 keywords     = ["ascii", "base94", "encoding", "printable", "simd"]

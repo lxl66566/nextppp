@@ -235,7 +235,12 @@ fn handle_conn_inner(
             let s = pump::pump_tunnel(txh, rxh, target_stream);
             stats.bytes_to_targets.fetch_add(s.up, Ordering::Relaxed);
             stats.bytes_to_clients.fetch_add(s.down, Ordering::Relaxed);
-            pump::log_close(&format!("session {sid:016x} ({peer})"), &target, &s, started);
+            pump::log_close(
+                &format!("session {sid:016x} ({peer})"),
+                &target,
+                &s,
+                started,
+            );
             Ok(())
         },
         Err(e) => {

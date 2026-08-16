@@ -14,8 +14,8 @@
 //! * Parity trick: `k` is **even** when `h[1]` is random filler (length took fewer than 3 digits)
 //!   and **odd** when `h[1]` is a real length digit.
 //! * The 3 checksum digits in the first frame carry `(inet_chksum(header) ^ length + kf_mod) %
-//!   mod`, right-aligned and zero (0x20) padded like the length digits, then shuffled — any
-//!   stream corruption or a mismatched `kf` fails the check immediately.
+//!   mod`, right-aligned and zero (0x20) padded like the length digits, then shuffled — any stream
+//!   corruption or a mismatched `kf` fails the check immediately.
 
 // Length arithmetic intentionally mirrors the C++ int/u32/usize mixing:
 // truncating casts are part of the protocol semantics.

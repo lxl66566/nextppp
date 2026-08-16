@@ -87,7 +87,11 @@ impl<R: Rng> TxCore<R> {
             rng,
             b94: Base94Framer::new(key.kf),
             protocol_tx: SessionCipher::new(key.protocol, CipherRole::Protocol, &key.protocol_key),
-            transport_tx: SessionCipher::new(key.transport, CipherRole::Transport, &key.transport_key),
+            transport_tx: SessionCipher::new(
+                key.transport,
+                CipherRole::Transport,
+                &key.transport_key,
+            ),
             key: key.clone(),
             handshaked: false,
             scratch_bin: Vec::new(),
@@ -190,8 +194,12 @@ impl RxCore {
             b94: Base94Framer::new(key.kf),
             protocol_rx: SessionCipher::new(key.protocol, CipherRole::Protocol, &key.protocol_key)
                 .for_decryption(),
-            transport_rx: SessionCipher::new(key.transport, CipherRole::Transport, &key.transport_key)
-                .for_decryption(),
+            transport_rx: SessionCipher::new(
+                key.transport,
+                CipherRole::Transport,
+                &key.transport_key,
+            )
+            .for_decryption(),
             key: key.clone(),
             handshaked: false,
             scratch_read: Vec::new(),
@@ -659,6 +667,9 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
             rx,
             session_id: _,
         } = self;
-        (TransmissionTx { io, core: tx }, TransmissionRx { io: rx_io, core: rx })
+        (TransmissionTx { io, core: tx }, TransmissionRx {
+            io: rx_io,
+            core: rx,
+        })
     }
 }
