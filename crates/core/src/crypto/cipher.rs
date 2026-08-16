@@ -116,11 +116,14 @@ type Block = Array<u8, U16>;
 
 /// Precomputed AES key schedule (see design note 4). One boxed-free enum
 /// holding either schedule; the variant size gap is inherent and harmless
-/// (one instance per direction per connection).
+/// (one instance per direction per connection). ChaCha20 needs no schedule:
+/// its state init is just word writes (rounds run lazily per block), so
+/// per-packet construction in `apply` is cheap.
 #[allow(clippy::large_enum_variant)]
 enum Core {
     Aes128(aes::Aes128),
     Aes256(aes::Aes256),
+    ChaCha,
 }
 
 /// Max nonce width across methods (AES: 16 bytes).
@@ -184,9 +187,10 @@ impl SessionCipher {
             Method::Aes128Cfb | Method::Aes128Ctr => {
                 Core::Aes128(aes::Aes128::new_from_slice(&key[..16]).expect("fixed key length"))
             },
-            Method::Aes256Cfb | Method::Aes256Ctr | Method::ChaCha20 => {
+            Method::Aes256Cfb | Method::Aes256Ctr => {
                 Core::Aes256(aes::Aes256::new_from_slice(&key[..32]).expect("fixed key length"))
             },
+            Method::ChaCha20 => Core::ChaCha,
         };
 
         Self {
@@ -224,9 +228,7 @@ impl SessionCipher {
             (Method::Aes256Cfb, Core::Aes256(c)) => cfb_apply(c, &nonce, data, *encrypting),
             (Method::Aes128Ctr, Core::Aes128(c)) => ctr_apply(c, &nonce, data),
             (Method::Aes256Ctr, Core::Aes256(c)) => ctr_apply(c, &nonce, data),
-            (Method::ChaCha20, Core::Aes128(_) | Core::Aes256(_)) => {
-                // State init is just word writes (rounds run lazily per
-                // block), so per-packet construction is cheap.
+            (Method::ChaCha20, Core::ChaCha) => {
                 use chacha20::cipher::{KeyIvInit, StreamCipher};
                 let mut c = chacha20::ChaCha20::new_from_slices(&key[..32], &nonce[..12])
                     .expect("key/nonce lengths are fixed by Method");
@@ -234,8 +236,9 @@ impl SessionCipher {
             },
             // `Core` is derived from `method` at construction; these pairings
             // cannot exist.
-            (Method::Aes128Cfb | Method::Aes128Ctr, Core::Aes256(_))
-            | (Method::Aes256Cfb | Method::Aes256Ctr, Core::Aes128(_)) => {
+            (Method::Aes128Cfb | Method::Aes128Ctr, Core::Aes256(_) | Core::ChaCha)
+            | (Method::Aes256Cfb | Method::Aes256Ctr, Core::Aes128(_) | Core::ChaCha)
+            | (Method::ChaCha20, Core::Aes128(_) | Core::Aes256(_)) => {
                 unreachable!("cipher core must match method")
             },
         }
