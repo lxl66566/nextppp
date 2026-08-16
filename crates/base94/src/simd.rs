@@ -2,9 +2,11 @@
 //!
 //! x86_64 uses SSSE3 kernels (runtime-detected at dispatch; `_mm_shuffle_epi8`
 //! is SSSE3, not SSE2 — the pre-extraction code compiled it unconditionally).
-//! aarch64 uses baseline NEON for the helper scans; other targets use the
-//! portable scalar fallback. Wire semantics are identical across backends —
-//! the scalar code in `lib.rs` doubles as the reference definition.
+//! aarch64 uses baseline NEON kernels — `vqtbl1` zero-fills out-of-range
+//! control bytes exactly like `pshufb`, so the two backends share the
+//! compaction LUT; other targets use the portable scalar fallback. Wire
+//! semantics are identical across backends — the scalar code in `lib.rs`
+//! doubles as the reference definition.
 
 // Raw core::arch intrinsics require unsafe. Every block only touches
 // block-sized loads/stores over slices already split to exact block sizes,
@@ -36,17 +38,12 @@ mod scalar {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-mod arch {
-    use core::arch::x86_64::*;
-
-    // SSE2 lane-0 byte replacement mask (SSE2 has no insert_epi8, which is
-    // SSE4.1): value = (v & keep15) | (set1(x) & lane0).
-    const KEEP15: [i8; 16] = [
-        0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    ];
-    const LANE0: [i8; 16] = [-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-
+// Byte-shuffle control tables shared by the x86_64 (pshufb) and aarch64
+// (vqtbl1) backends: both zero-fill lanes whose control byte is out of
+// range (pshufb: high bit set; vqtbl1: index >= lane count), so the rows
+// work verbatim on either arch.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+mod compact {
     /// 16-entry table: spreads the 4 bits of `n` to even byte positions
     /// (bit 2k of the result = bit k of n) — feeds the quarter keep-mask
     /// computation in the encode fast path.
@@ -65,7 +62,65 @@ mod arch {
         }
         t
     }
-    const SPREAD4: [u8; 16] = build_spread4();
+    pub(super) static SPREAD4: [u8; 16] = build_spread4();
+
+    /// 256-entry x 16B shuffle control table: for an 8-lane leader mask `m`,
+    /// row `m` packs the non-leader lanes to the front (low half) and the
+    /// high-half variant with +8 lane offset (bytes 8..16 of the row).
+    /// Counts live beside it (`cnt[m]` / `cnt[256+m]`).
+    const fn build_compact_tables() -> ([u8; 256 * 16], [u8; 512]) {
+        let mut shuf = [0u8; 256 * 16];
+        let mut cnt = [0u8; 512];
+        let mut m = 0usize;
+        while m < 256 {
+            let mut k = 0usize;
+            let mut i = 0usize;
+            while i < 8 {
+                if m & (1 << i) == 0 {
+                    shuf[m * 16 + k] = i as u8;
+                    k += 1;
+                }
+                i += 1;
+            }
+            let mut j = k;
+            while j < 8 {
+                shuf[m * 16 + j] = 0x80;
+                j += 1;
+            }
+            cnt[m] = k as u8;
+            let mut k2 = 0usize;
+            let mut i2 = 0usize;
+            while i2 < 8 {
+                if m & (1 << i2) == 0 {
+                    shuf[m * 16 + 8 + k2] = (8 + i2) as u8;
+                    k2 += 1;
+                }
+                i2 += 1;
+            }
+            let mut j2 = 8 + k2;
+            while j2 < 16 {
+                shuf[m * 16 + j2] = 0x80;
+                j2 += 1;
+            }
+            cnt[256 + m] = k2 as u8;
+            m += 1;
+        }
+        (shuf, cnt)
+    }
+    pub(super) static COMPACT: ([u8; 256 * 16], [u8; 512]) = build_compact_tables();
+}
+
+#[cfg(target_arch = "x86_64")]
+mod arch {
+    use super::compact::{COMPACT, SPREAD4};
+    use core::arch::x86_64::*;
+
+    // SSE2 lane-0 byte replacement mask (SSE2 has no insert_epi8, which is
+    // SSE4.1): value = (v & keep15) | (set1(x) & lane0).
+    const KEEP15: [i8; 16] = [
+        0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    ];
+    const LANE0: [i8; 16] = [-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
     /// SIMD encode fast path (see [`crate::encode_into`]).
     ///
@@ -160,51 +215,6 @@ mod arch {
             off
         }
     }
-
-    /// 256-entry x 16B pshufb control table: for an 8-lane leader mask `m`,
-    /// row `m` packs the non-leader lanes to the front (low half) and the
-    /// high-half variant with +8 lane offset (bytes 8..16 of the row).
-    /// Counts live beside it (`cnt[m]` / `cnt[256+m]`).
-    const fn build_compact_tables() -> ([u8; 256 * 16], [u8; 512]) {
-        let mut shuf = [0u8; 256 * 16];
-        let mut cnt = [0u8; 512];
-        let mut m = 0usize;
-        while m < 256 {
-            let mut k = 0usize;
-            let mut i = 0usize;
-            while i < 8 {
-                if m & (1 << i) == 0 {
-                    shuf[m * 16 + k] = i as u8;
-                    k += 1;
-                }
-                i += 1;
-            }
-            let mut j = k;
-            while j < 8 {
-                shuf[m * 16 + j] = 0x80;
-                j += 1;
-            }
-            cnt[m] = k as u8;
-            let mut k2 = 0usize;
-            let mut i2 = 0usize;
-            while i2 < 8 {
-                if m & (1 << i2) == 0 {
-                    shuf[m * 16 + 8 + k2] = (8 + i2) as u8;
-                    k2 += 1;
-                }
-                i2 += 1;
-            }
-            let mut j2 = 8 + k2;
-            while j2 < 16 {
-                shuf[m * 16 + j2] = 0x80;
-                j2 += 1;
-            }
-            cnt[256 + m] = k2 as u8;
-            m += 1;
-        }
-        (shuf, cnt)
-    }
-    static COMPACT: ([u8; 256 * 16], [u8; 512]) = build_compact_tables();
 
     /// SIMD decode fast path (see [`crate::decode_into`]).
     ///
@@ -450,30 +460,308 @@ mod arch {
 
 #[cfg(target_arch = "aarch64")]
 mod arch {
+    use super::compact::{COMPACT, SPREAD4};
     use core::arch::aarch64::*;
+
+    // Lane-0 select/clear mask, the NEON counterpart of the x86_64 LANE0.
+    const LANE0: [u8; 16] = [0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    /// NEON has no movemask: weight 0x00/0xFF lanes with power-of-two bytes,
+    /// then pairwise-sum into a single u16 bitset (bit i = lane i's MSB).
+    /// Distinct powers of two never carry across the vpaddl chain.
+    #[inline]
+    fn movemask_u8(m: uint8x16_t) -> u16 {
+        const W: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        // SAFETY: baseline NEON data ops plus one 16-byte const load.
+        unsafe {
+            let t = vandq_u8(m, vld1q_u8(W.as_ptr()));
+            let t = vpaddlq_u8(t); // u16 lane j = bytes 2j + 2j+1
+            let t = vpaddlq_u16(t); // u32 lane k = u16 lanes 2k + 2k+1
+            let t = vpaddlq_u32(t); // u64 lane p = per-byte-half weight sums
+            (vgetq_lane_u64(t, 0) | (vgetq_lane_u64(t, 1) << 8)) as u16
+        }
+    }
+
+    /// Byte-lane shift left by one (`_mm_slli_si128(v, 1)` equivalent):
+    /// out[0] = 0, out[i] = v[i-1].
+    #[inline]
+    fn shl1(v: uint8x16_t, zero: uint8x16_t) -> uint8x16_t {
+        // SAFETY: baseline NEON lane shuffle.
+        unsafe { vextq_u8(zero, v, 15) }
+    }
+
+    /// SIMD encode fast path — NEON port of the SSSE3 kernel; see the x86_64
+    /// backend for the algorithm and the store-capacity safety contract.
+    /// NEON compares are natively unsigned, so the x86 ^0x80 flip trick and
+    /// its boundary constants disappear.
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn encode_simd(dst_ptr: *mut u8, pos: &mut usize, src: &[u8], kf8: u8) -> usize {
+        let n_blocks = src.len() / 16;
+        if n_blocks == 0 {
+            return 0;
+        }
+        // SAFETY: NEON is baseline on aarch64. Loads stay inside `src`; the
+        // 32-byte scratch is a stack array; stores into `dst_ptr` stay
+        // within the caller-reserved `2*src.len()+16` bytes (see the x86_64
+        // kernel for the padding argument).
+        unsafe {
+            let kf_vec = vdupq_n_u8(kf8);
+            let esc_v = vdupq_n_u8(93);
+            let hi_v = vdupq_n_u8(186);
+            let c20 = vdupq_n_u8(0x20);
+            // 0x20 - 93 (wrapping): first constant of the follower char.
+            let c2_base = vdupq_n_u8(0x20u8.wrapping_sub(93));
+            let c93 = vdupq_n_u8(93);
+            let c1hi = vdupq_n_u8(0x7d);
+            let one = vdupq_n_u8(1);
+
+            let mut scratch = [0u8; 32];
+            let mut off = 0usize;
+            for _ in 0..n_blocks {
+                let b = vld1q_u8(src.as_ptr().add(off));
+                let v = vsubq_u8(b, kf_vec);
+                let esc = vcgeq_u8(v, esc_v);
+                let hi = vcgeq_u8(v, hi_v);
+
+                // c1 = esc ? 0x7D + (v >= 186) : 0x20 + v. Note 0x7D is odd,
+                // so the q2 bit must be *added*, not OR-ed in.
+                let c1 = vbslq_u8(
+                    esc,
+                    vaddq_u8(vandq_u8(hi, one), c1hi),
+                    vaddq_u8(v, c20),
+                );
+                // c2 = 0x20 + v - 93 - 93*(v >= 186) (only meaningful on esc)
+                let c2 = vsubq_u8(vaddq_u8(v, c2_base), vandq_u8(hi, c93));
+
+                // Interleaved (c1_0, c2_0, c1_1, c2_1, ...) scratch.
+                vst1q_u8(scratch.as_mut_ptr(), vzip1q_u8(c1, c2));
+                vst1q_u8(scratch.as_mut_ptr().add(16), vzip2q_u8(c1, c2));
+
+                // Per-quarter compaction (mask math identical to x86_64):
+                // vqtbl1 takes a 16-entry table with 8 indices — zero-extend
+                // the quarter's 8 slots (a 16-byte load at q=3 would read
+                // past the 32-byte scratch), and let the row's 0x80 slots
+                // zero-fill deleted lanes like pshufb.
+                let m = movemask_u8(esc);
+                let zero8 = vdup_n_u8(0);
+                let mut q = 0usize;
+                while q < 4 {
+                    let nib = ((m >> (4 * q)) & 0xf) as usize;
+                    // spread nib to even bits, shift to odd slots: the keep
+                    // mask is 0x55 | (spread << 1); the delete mask is its
+                    // complement within the odd slots.
+                    let keep = 0x55u8 | ((SPREAD4[nib] << 1) & 0xaa);
+                    let del = keep ^ 0xff;
+                    let tbl = vcombine_u8(vld1_u8(scratch.as_ptr().add(8 * q)), zero8);
+                    let row = vld1_u8(COMPACT.0[del as usize * 16..].as_ptr());
+                    let packed = vqtbl1_u8(tbl, row);
+                    let cnt = COMPACT.1[del as usize] as usize;
+                    vst1_u8(dst_ptr.add(*pos), packed);
+                    *pos += cnt;
+                    q += 1;
+                }
+                off += 16;
+            }
+            off
+        }
+    }
+
+    /// SIMD decode fast path — NEON port of the SSSE3 kernel; see the x86_64
+    /// backend for the algorithm, the hand-off invariant and the
+    /// store-capacity safety contract.
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn decode_simd(
+        dst_ptr: *mut u8,
+        pos: &mut usize,
+        src: &[u8],
+        kf8: u8,
+    ) -> Result<(usize, usize), (usize, usize)> {
+        let n_blocks = src.len() / 16;
+        if n_blocks == 0 {
+            return Ok((0, 0));
+        }
+        // SAFETY: NEON is baseline on aarch64; same invariants as the x86_64
+        // kernel — 16-byte loads stay inside `src`, stores stay within the
+        // caller-reserved capacity.
+        unsafe {
+            let zero = vdupq_n_u8(0);
+            let lane0 = vld1q_u8(LANE0.as_ptr());
+            let lead_v = vdupq_n_u8(0x7d); // c >= 0x7D: raw leader
+            let bad_lead_v = vdupq_n_u8(0x7e); // c > 0x7E: invalid leader
+            let bad_foll_v = vdupq_n_u8(0x7d); // c > 0x7D: invalid follower
+            let kf_vec = vdupq_n_u8(kf8);
+            let c93_16 = vdupq_n_u16(93);
+            let c255_16 = vdupq_n_u16(255);
+            let sub20 = vdupq_n_u8(0x20);
+            let sub92 = vdupq_n_u8(92);
+
+            let mut off = 0usize; // consumed bytes
+            let mut carry = false; // lane0 of the next block is a follower
+            let mut prev_char = 0u8; // last byte of the previous block
+            // Last block boundary where no cross-boundary pair is pending
+            // (see the x86_64 kernel).
+            let mut safe = (0usize, 0usize);
+            let mut block = 0usize;
+            while block < n_blocks {
+                if !carry {
+                    safe = (off, *pos);
+                }
+                let v = vld1q_u8(src.as_ptr().add(off));
+                let raw_lead = vcgeq_u8(v, lead_v);
+                let bad_lead = vcgtq_u8(v, bad_lead_v);
+
+                // Effective leaders under sequential consumption (see the
+                // x86_64 kernel for the recurrence and the run-length cap
+                // that keeps it exact).
+                let mut lead = raw_lead;
+                if carry {
+                    lead = vbicq_u8(lead, lane0);
+                }
+                let r16 = movemask_u8(lead);
+                let long_run = r16
+                    & (r16 << 1)
+                    & (r16 << 2)
+                    & (r16 << 3)
+                    & (r16 << 4)
+                    & (r16 << 5)
+                    & (r16 << 6);
+                if long_run != 0 {
+                    *pos = safe.1;
+                    return Err(safe);
+                }
+                let mut l = vbicq_u8(lead, shl1(lead, zero));
+                l = vbicq_u8(lead, shl1(l, zero));
+                l = vbicq_u8(lead, shl1(l, zero));
+                l = vbicq_u8(lead, shl1(l, zero));
+                l = vbicq_u8(lead, shl1(l, zero));
+                let lead_eff = l;
+                let mk = movemask_u8(lead_eff);
+                let carry_out = mk & 0x8000 != 0;
+
+                // Follower lanes (lane0 patched by the incoming carry).
+                let mut fmask = shl1(lead_eff, zero);
+                if carry {
+                    fmask = vorrq_u8(fmask, lane0);
+                }
+
+                // Escape value = 93*(prev-0x20-92) + (c-0x20), computed in
+                // u16 lanes; garbage on non-follower lanes is blended away.
+                let mut vl = shl1(v, zero);
+                vl = vsetq_lane_u8(prev_char, vl, 0);
+                let b = vsubq_u8(v, sub20);
+                let bl = vsubq_u8(vl, sub20);
+                let q = vsubq_u8(bl, sub92);
+                let q_lo = vmovl_u8(vget_low_u8(q));
+                let q_hi = vmovl_u8(vget_high_u8(q));
+                let b_lo = vmovl_u8(vget_low_u8(b));
+                let b_hi = vmovl_u8(vget_high_u8(b));
+                let ev_lo = vmlaq_u16(b_lo, q_lo, c93_16);
+                let ev_hi = vmlaq_u16(b_hi, q_hi, c93_16);
+                // Overflow (> 0xFF) is only an error on follower lanes. The
+                // u16 compare masks are 0x00/0xFFFF, so a plain truncating
+                // narrow gives the byte-lane masks (no packs/saturate
+                // subtleties like on x86).
+                let ovf = vcombine_u8(
+                    vmovn_u16(vcgtq_u16(ev_lo, c255_16)),
+                    vmovn_u16(vcgtq_u16(ev_hi, c255_16)),
+                );
+                // Any invalid lane: bad leader (> 0x7E), escape value
+                // overflow or out-of-range follower (0x7E) on a follower
+                // lane (a 0x7D leader with a 0x7E follower evades the
+                // overflow check yet is invalid — found by cargo-fuzz on
+                // the x86_64 kernel).
+                let bad = vorrq_u8(
+                    vorrq_u8(bad_lead, vandq_u8(ovf, fmask)),
+                    vandq_u8(vcgtq_u8(v, bad_foll_v), fmask),
+                );
+                if vmaxvq_u8(bad) != 0 {
+                    // Invalid construct: roll back to the last safe boundary
+                    // so the scalar reference path sees whole pairs and
+                    // reports the exact error.
+                    *pos = safe.1;
+                    return Err(safe);
+                }
+                // Truncating narrow is safe: follower lanes proved <= 0xFF
+                // above; the remaining lanes are replaced by the blend.
+                let ev8 = vcombine_u8(vmovn_u16(ev_lo), vmovn_u16(ev_hi));
+
+                // val = follower ? esc_val : (c - 0x20), plus kf (wrapping).
+                let val = vaddq_u8(vbslq_u8(fmask, ev8, b), kf_vec);
+
+                // Compact out the leader lanes via the shared LUT: row low
+                // halves pack lanes 0..8; the high-half rows pack lanes
+                // 8..16 into result bytes 8..16 (see `compact` and the
+                // x86_64 kernel).
+                let lo = (mk & 0xff) as usize;
+                let hi = (mk >> 8) as usize;
+                let row_lo = vld1q_u8(COMPACT.0[lo * 16..].as_ptr());
+                let row_hi = vld1q_u8(COMPACT.0[hi * 16..].as_ptr());
+                let lo_packed = vqtbl1q_u8(val, row_lo);
+                let hi_packed = vqtbl1q_u8(val, row_hi);
+                let cnt_lo = COMPACT.1[lo] as usize;
+                let cnt_hi = COMPACT.1[256 + hi] as usize;
+                let outp = dst_ptr.add(*pos);
+                vst1_u8(outp, vget_low_u8(lo_packed));
+                vst1_u8(outp.add(cnt_lo), vget_high_u8(hi_packed));
+                *pos += cnt_lo + cnt_hi;
+                off += 16;
+                prev_char = *src.as_ptr().add(off - 1);
+                carry = carry_out;
+                block += 1;
+
+                // The last processed block may end with a leader whose
+                // follower lies in the scalar tail; consume it here so the
+                // scalar tail never starts with an orphaned follower (see
+                // the x86_64 kernel).
+                if carry && block == n_blocks {
+                    if let Some(c2) = src.get(off).copied() {
+                        let q15 = u32::from(prev_char) - 0x20 - 92;
+                        let b2 = u32::from(c2) - 0x20;
+                        let v_esc = q15.wrapping_mul(93) + b2;
+                        if !(1..=2).contains(&q15) || b2 > 93 || v_esc > 0xff {
+                            *pos = safe.1;
+                            return Err(safe);
+                        }
+                        *dst_ptr.add(*pos) = (v_esc as u8).wrapping_add(kf8);
+                        *pos += 1;
+                        off += 1;
+                        carry = false;
+                    } else {
+                        *pos = safe.1;
+                        return Err(safe);
+                    }
+                }
+            }
+            Ok((off, *pos))
+        }
+    }
 
     pub(super) fn count_sub_ge(src: &[u8], sub: u8, threshold: u8) -> usize {
         debug_assert!(threshold >= 1);
-        let vsub = vdupq_n_u8(sub);
-        let vt = vdupq_n_u8(threshold);
         let mut chunks = src.chunks_exact(16);
         let mut acc = 0u32;
         for c in &mut chunks {
-            // SAFETY: chunk length is exactly 16 bytes.
-            let v = unsafe { vld1q_u8(c.as_ptr()) };
-            let m = unsafe { vcgeq_u8(vsubq_u8(v, vsub), vt) };
-            acc += u32::from(unsafe { vaddvq_u8(vandq_u8(m, vdupq_n_u8(1))) });
+            // SAFETY: NEON is baseline on aarch64; chunk length is exactly
+            // 16 bytes and only data ops follow the load.
+            unsafe {
+                let vsub = vdupq_n_u8(sub);
+                let vt = vdupq_n_u8(threshold);
+                let v = vld1q_u8(c.as_ptr());
+                let m = vcgeq_u8(vsubq_u8(v, vsub), vt);
+                acc += u32::from(vaddvq_u8(vandq_u8(m, vdupq_n_u8(1))));
+            }
         }
         acc as usize + super::scalar::count_sub_ge(chunks.remainder(), sub, threshold)
     }
 
     pub(super) fn all_ge(src: &[u8], threshold: u8) -> bool {
         debug_assert!(threshold >= 1);
-        let vt = vdupq_n_u8(threshold);
+        let vt = unsafe { vdupq_n_u8(threshold) };
         let mut chunks = src.chunks_exact(16);
         let mut ok = true;
         for c in &mut chunks {
-            // SAFETY: chunk length is exactly 16 bytes.
+            // SAFETY: NEON is baseline on aarch64; chunk length is exactly
+            // 16 bytes.
             let v = unsafe { vld1q_u8(c.as_ptr()) };
             ok &= unsafe { vminvq_u8(vcgeq_u8(v, vt)) } == 0xff;
         }
@@ -496,9 +784,9 @@ pub(crate) fn all_ge(src: &[u8], threshold: u8) -> bool {
     selected::all_ge(src, threshold)
 }
 
-/// SIMD encode fast path (x86_64 with runtime SSSE3 detection only; other
-/// targets use the scalar loop). Returns the consumed source prefix
-/// (multiple of 16).
+/// SIMD encode fast path (x86_64 with runtime SSSE3 detection; aarch64 uses
+/// baseline NEON; other targets use the scalar loop). Returns the consumed
+/// source prefix (multiple of 16).
 pub(crate) fn encode_simd(dst_ptr: *mut u8, p: &mut usize, src: &[u8], kf8: u8) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
@@ -508,16 +796,21 @@ pub(crate) fn encode_simd(dst_ptr: *mut u8, p: &mut usize, src: &[u8], kf8: u8) 
         }
         0
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is baseline on aarch64 — no runtime detection needed.
+        arch::encode_simd(dst_ptr, p, src, kf8)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         let _ = (dst_ptr, p, src, kf8);
         0
     }
 }
 
-/// SIMD decode fast path (x86_64 with runtime SSSE3 detection only; other
-/// targets decode with the scalar reference loop). See the x86_64 backend
-/// for semantics.
+/// SIMD decode fast path (x86_64 with runtime SSSE3 detection; aarch64 uses
+/// baseline NEON; other targets decode with the scalar reference loop). See
+/// the x86_64 backend for semantics.
 pub(crate) fn decode_simd(
     dst_ptr: *mut u8,
     p: &mut usize,
@@ -532,7 +825,12 @@ pub(crate) fn decode_simd(
         }
         Ok((0, 0))
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is baseline on aarch64 — no runtime detection needed.
+        arch::decode_simd(dst_ptr, p, src, kf8)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         let _ = (dst_ptr, p, src, kf8);
         Ok((0, 0))

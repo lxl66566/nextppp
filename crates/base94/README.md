@@ -12,7 +12,8 @@ size. With `kf = 0` the mixing is the identity.
 
 - x86_64: SSSE3 kernels over 16-byte blocks (runtime-detected; SSE2 helpers
   for the validity scan and length computation).
-- aarch64: NEON helpers; the codec main loops use the portable scalar path.
+- aarch64: baseline NEON kernels over 16-byte blocks (`vqtbl1` shares the
+  compaction LUT with the pshufb backend; no runtime detection needed).
 - other targets: portable scalar path (the reference definition).
 
 All backends are bit-exact, pinned by fuzzing against the scalar reference.

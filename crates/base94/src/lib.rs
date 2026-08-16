@@ -9,8 +9,9 @@
 //! Performance notes (wire output unchanged):
 //! * encode/decode run SIMD fast paths over 16-byte blocks (see `simd`): the decoder solves the
 //!   leader/follower alternation and escape reconstruction in-register and compacts leaders via a
-//!   pshufb LUT (~3x over scalar); the encoder precomputes interleaved leader/follower pairs and
-//!   deletes non-escape followers through the same LUT (~2.5x).
+//!   byte-shuffle LUT (pshufb on x86_64, vqtbl1 on aarch64; ~3x over scalar); the encoder
+//!   precomputes interleaved leader/follower pairs and deletes non-escape followers through the
+//!   same LUT (~2.5x).
 //! * Invalid input and sub-block tails fall back to the scalar reference loop, so error semantics
 //!   stay bit-exact (pinned by fuzz + unit tests).
 

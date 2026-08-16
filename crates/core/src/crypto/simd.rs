@@ -134,12 +134,24 @@ mod arch {
 mod arch {
     use core::arch::aarch64::*;
 
+    // Lane-0 select mask, the NEON counterpart of the x86_64 LANE0.
+    const LANE0: [u8; 16] = [0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
     /// `[0]*k ++ v[0..16-k]` (lane i holds lane i-k), the NEON equivalent of
-    /// `_mm_slli_si128`.
-    #[inline]
-    unsafe fn shl_bytes(v: uint8x16_t, k: i32) -> uint8x16_t {
-        unsafe { vextq_u8(vdupq_n_u8(0), v, 16 - k) }
+    /// `_mm_slli_si128(v, k)`. vextq's lane index must be a compile-time
+    /// constant, hence one monomorphization per shift distance.
+    macro_rules! shl_bytes {
+        ($name:ident, $k:literal) => {
+            #[inline]
+            unsafe fn $name(v: uint8x16_t) -> uint8x16_t {
+                unsafe { vextq_u8(vdupq_n_u8(0), v, 16 - $k) }
+            }
+        };
     }
+    shl_bytes!(shl1, 1);
+    shl_bytes!(shl2, 2);
+    shl_bytes!(shl4, 4);
+    shl_bytes!(shl8, 8);
 
     pub(super) fn delta_encode(data: &mut [u8], kf8: u8) {
         if data.is_empty() {
@@ -155,7 +167,7 @@ mod arch {
         for c in &mut chunks {
             // SAFETY: chunk length is exactly 16 bytes.
             let v = unsafe { vld1q_u8(c.as_ptr()) };
-            let mut shifted = unsafe { shl_bytes(v, 1) };
+            let mut shifted = unsafe { shl1(v) };
             shifted = unsafe { vsetq_lane_u8(prev, shifted, 0) };
             unsafe { vst1q_u8(c.as_mut_ptr(), vsubq_u8(v, shifted)) };
             prev = unsafe { vgetq_lane_u8(v, 15) };
@@ -177,16 +189,22 @@ mod arch {
         if data.len() < 2 {
             return;
         }
+        // out[i] = kf + sum(in[0..=i]): byte-wise inclusive scan (Hillis-
+        // Steele, 4 shift-add steps per 16 lanes) with the cross-block
+        // carry *added* into lane 0 (replacing the lane would drop d[0]
+        // from every output lane — this backend never compiled before, so
+        // that bug had gone unnoticed).
+        let lane0 = unsafe { vld1q_u8(LANE0.as_ptr()) };
         let mut chunks = data[1..].chunks_exact_mut(16);
         let mut carry = d0;
         for c in &mut chunks {
             // SAFETY: chunk length is exactly 16 bytes.
             let mut v = unsafe { vld1q_u8(c.as_ptr()) };
-            v = unsafe { vsetq_lane_u8(carry, v, 0) };
-            v = unsafe { vaddq_u8(v, shl_bytes(v, 1)) };
-            v = unsafe { vaddq_u8(v, shl_bytes(v, 2)) };
-            v = unsafe { vaddq_u8(v, shl_bytes(v, 4)) };
-            v = unsafe { vaddq_u8(v, shl_bytes(v, 8)) };
+            v = unsafe { vaddq_u8(v, vandq_u8(vdupq_n_u8(carry), lane0)) };
+            v = unsafe { vaddq_u8(v, shl1(v)) };
+            v = unsafe { vaddq_u8(v, shl2(v)) };
+            v = unsafe { vaddq_u8(v, shl4(v)) };
+            v = unsafe { vaddq_u8(v, shl8(v)) };
             unsafe { vst1q_u8(c.as_mut_ptr(), v) };
             carry = unsafe { vgetq_lane_u8(v, 15) };
         }
