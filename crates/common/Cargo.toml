@@ -12,6 +12,7 @@ repository.workspace   = true
 license.workspace      = true
 
 [dependencies]
+anyhow       = { workspace = true }
 hotpath      = { workspace = true, optional = true }
 json5        = { workspace = true }
 nextppp-core = { workspace = true }

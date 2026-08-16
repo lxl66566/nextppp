@@ -13,12 +13,17 @@ use std::{
     io::{self, ErrorKind, Read, Write},
     net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use nextppp_core::{Error as CoreError, TransmissionRx, TransmissionTx};
+use spdlog::prelude::*;
 
-use crate::{FRAME_DATA, FRAME_EOF, addr::Host};
+use crate::{
+    FRAME_DATA, FRAME_EOF,
+    addr::Host,
+    fmt::{fmt_bytes, fmt_duration},
+};
 
 /// Read chunk size: small enough for interactive latency, large enough to
 /// amortize per-frame crypto/header overhead.
@@ -37,17 +42,68 @@ pub enum PumpEnd {
     Fault(String),
 }
 
+/// The `ErrorKind`s of routine transport teardown, mapped to their short
+/// log causes. `None` means the error is a fault worth a warning.
+fn routine_cause(kind: ErrorKind) -> Option<&'static str> {
+    match kind {
+        // Routine transport teardown seen on every proxied network.
+        ErrorKind::ConnectionReset => Some("connection reset"),
+        ErrorKind::ConnectionAborted => Some("connection aborted"),
+        ErrorKind::BrokenPipe => Some("broken pipe"),
+        ErrorKind::UnexpectedEof => Some("eof"),
+        ErrorKind::TimedOut | ErrorKind::WouldBlock => Some("timeout"),
+        ErrorKind::Interrupted => Some("interrupted"),
+        _ => None,
+    }
+}
+
+/// Whether an I/O error is routine connection teardown (peer reset,
+/// half-close, timeout) rather than a fault.
+#[must_use]
+pub fn is_routine_io(err: &io::Error) -> bool {
+    routine_cause(err.kind()).is_some()
+}
+
+/// Whether a tunnel error is a routine close: transport EOF, routine I/O
+/// teardown, or a handshake failure (probes and timeouts land there).
+/// Everything else is a protocol violation (tampering, desync, wrong keys).
+#[must_use]
+pub fn is_routine_core(err: &CoreError) -> bool {
+    match err {
+        e if e.is_eof() => true,
+        CoreError::Io(e) => is_routine_io(e),
+        CoreError::HandshakeFailed(_) => true,
+        _ => false,
+    }
+}
+
+/// Whether an error chain is a routine close: every recognized cause
+/// (`io::Error` / tunnel error) must be routine, and at least one
+/// recognized cause must be present — a bare anyhow failure is a fault.
+/// anyhow contexts and other wrappers are neutral. Use this to keep
+/// routine closes at `debug` while protocol faults stay at `warn`.
+#[must_use]
+pub fn is_clean_close(err: &anyhow::Error) -> bool {
+    let mut recognized = false;
+    let clean = err.chain().all(|cause| {
+        if let Some(e) = cause.downcast_ref::<io::Error>() {
+            recognized = true;
+            is_routine_io(e)
+        } else if let Some(e) = cause.downcast_ref::<CoreError>() {
+            recognized = true;
+            is_routine_core(e)
+        } else {
+            true
+        }
+    });
+    recognized && clean
+}
+
 /// Classifies a local (non-tunnel) I/O error.
 fn classify_io(err: &io::Error) -> PumpEnd {
-    match err.kind() {
-        // Routine transport teardown seen on every proxied network.
-        ErrorKind::ConnectionReset => PumpEnd::Closed("connection reset"),
-        ErrorKind::ConnectionAborted => PumpEnd::Closed("connection aborted"),
-        ErrorKind::BrokenPipe => PumpEnd::Closed("broken pipe"),
-        ErrorKind::UnexpectedEof => PumpEnd::Closed("eof"),
-        ErrorKind::TimedOut | ErrorKind::WouldBlock => PumpEnd::Closed("timeout"),
-        ErrorKind::Interrupted => PumpEnd::Closed("interrupted"),
-        _ => PumpEnd::Fault(err.to_string()),
+    match routine_cause(err.kind()) {
+        Some(cause) => PumpEnd::Closed(cause),
+        None => PumpEnd::Fault(err.to_string()),
     }
 }
 
@@ -247,6 +303,24 @@ impl KillSwitch {
     fn activate(&self) {
         let _ = self.tunnel.shutdown(Shutdown::Both);
         let _ = self.local.shutdown(Shutdown::Both);
+    }
+}
+
+/// Logs a pumped connection's teardown at `info`, escalating to `warn` when
+/// either direction ended in a fault. `subject` identifies the connection
+/// (e.g. `[1.2.3.4:5]` client-side, `session 0123.. (1.2.3.4:5)` server-side).
+pub fn log_close(subject: &str, target: &str, s: &PumpStats, started: Instant) {
+    let summary = format!(
+        "up {} down {} in {} ({})",
+        fmt_bytes(s.up),
+        fmt_bytes(s.down),
+        fmt_duration(started.elapsed()),
+        s.end_causes(),
+    );
+    if let Some(fault) = s.fault() {
+        warn!("{subject} {target} aborted: {summary}, fault: {fault}");
+    } else {
+        info!("{subject} {target} closed: {summary}");
     }
 }
 

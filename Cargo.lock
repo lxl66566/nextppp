@@ -910,6 +910,7 @@ dependencies = [
 name = "nextppp-common"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "hotpath",
  "json5",
  "nextppp-core",

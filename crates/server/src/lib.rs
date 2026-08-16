@@ -24,7 +24,6 @@ use std::{
 
 use anyhow::Context;
 use nextppp_common::{
-    PumpStats,
     addr::ProxyAddr,
     config::{ObfuscationConfig, ServerConfig},
     fmt::{fmt_bytes, fmt_duration},
@@ -200,7 +199,7 @@ fn handle_conn_inner(
     let req = match tx.read().context("read request") {
         Ok(req) => req,
         Err(e) => {
-            if is_clean_close(&e) {
+            if pump::is_clean_close(&e) {
                 debug!("session {sid:016x} ({peer}) closed before request");
             } else {
                 warn!("session {sid:016x} ({peer}) read request failed: {e:#}");
@@ -236,7 +235,7 @@ fn handle_conn_inner(
             let s = pump::pump_tunnel(txh, rxh, target_stream);
             stats.bytes_to_targets.fetch_add(s.up, Ordering::Relaxed);
             stats.bytes_to_clients.fetch_add(s.down, Ordering::Relaxed);
-            log_close(sid, peer, &target, &s, started);
+            pump::log_close(&format!("session {sid:016x} ({peer})"), &target, &s, started);
             Ok(())
         },
         Err(e) => {
@@ -246,46 +245,5 @@ fn handle_conn_inner(
             let _ = tx.write(&[proto::STATUS_REFUSED]);
             Ok(())
         },
-    }
-}
-
-/// Whether an anyhow error chain is a routine close (EOF/reset/timeout).
-fn is_clean_close(e: &anyhow::Error) -> bool {
-    for cause in e.chain() {
-        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
-            if !matches!(
-                io.kind(),
-                std::io::ErrorKind::UnexpectedEof
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::TimedOut
-                    | std::io::ErrorKind::WouldBlock
-            ) {
-                return false;
-            }
-        } else if let Some(core) = cause.downcast_ref::<nextppp_core::Error>() {
-            match core {
-                nextppp_core::Error::Io(_) | nextppp_core::Error::HandshakeFailed(_) => {},
-                _ => return false,
-            }
-        }
-    }
-    true
-}
-
-/// Logs the connection teardown: faults escalate to `warn`.
-fn log_close(sid: u128, peer: &str, target: &str, s: &PumpStats, started: Instant) {
-    let summary = format!(
-        "up {} down {} in {} ({})",
-        fmt_bytes(s.up),
-        fmt_bytes(s.down),
-        fmt_duration(started.elapsed()),
-        s.end_causes(),
-    );
-    if let Some(fault) = s.fault() {
-        warn!("session {sid:016x} ({peer}) {target} aborted: {summary}, fault: {fault}");
-    } else {
-        info!("session {sid:016x} ({peer}) {target} closed: {summary}");
     }
 }

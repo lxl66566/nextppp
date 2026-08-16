@@ -14,9 +14,7 @@ use std::{
 
 use anyhow::Context;
 use nextppp_common::{
-    PumpStats,
     addr::{Host, ProxyAddr},
-    fmt::{fmt_bytes, fmt_duration},
     pump,
 };
 use spdlog::prelude::*;
@@ -52,30 +50,12 @@ pub fn handle(stream: TcpStream, rt: &Arc<ClientRuntime>) {
     if let Err(e) = negotiate_and_forward(stream, rt, &peer) {
         // Local apps poking the inbound with non-socks5 traffic or vanishing
         // mid-negotiation are routine; anything else deserves a warning.
-        let clean = e.chain().all(|c| {
-            c.downcast_ref::<std::io::Error>()
-                .is_some_and(is_routine_io)
-        });
-        if clean {
+        if pump::is_clean_close(&e) {
             debug!("[{peer}] inbound session ended: {e:#}");
         } else {
             warn!("[{peer}] inbound session failed: {e:#}");
         }
     }
-}
-
-/// Whether an I/O error is a routine close rather than a fault.
-fn is_routine_io(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        ErrorKind::UnexpectedEof
-            | ErrorKind::ConnectionReset
-            | ErrorKind::ConnectionAborted
-            | ErrorKind::BrokenPipe
-            | ErrorKind::TimedOut
-            | ErrorKind::WouldBlock
-            | ErrorKind::Interrupted
-    )
 }
 
 /// Negotiation + CONNECT + tunnel forwarding. Failure points log at their
@@ -123,7 +103,7 @@ fn negotiate_and_forward(
             stream.set_write_timeout(None)?;
             let started = Instant::now();
             let s = pump::pump_tunnel(*tx, *rx, stream);
-            log_close(peer, &target, &s, started);
+            pump::log_close(&format!("[{peer}]"), &target, &s, started);
             Ok(())
         },
         Err(e) => {
@@ -131,22 +111,6 @@ fn negotiate_and_forward(
             let _ = reply(&mut stream, REP_GENERAL);
             Err(e.context("outbound connect"))
         },
-    }
-}
-
-/// Logs the teardown: faults escalate to `warn`.
-fn log_close(peer: &str, target: &str, s: &PumpStats, started: Instant) {
-    let summary = format!(
-        "up {} down {} in {} ({})",
-        fmt_bytes(s.up),
-        fmt_bytes(s.down),
-        fmt_duration(started.elapsed()),
-        s.end_causes(),
-    );
-    if let Some(fault) = s.fault() {
-        warn!("[{peer}] {target} aborted: {summary}, fault: {fault}");
-    } else {
-        info!("[{peer}] {target} closed: {summary}");
     }
 }
 
