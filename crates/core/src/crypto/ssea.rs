@@ -4,12 +4,27 @@
 //! Every primitive keeps the reference wrapping byte semantics so the
 //! anti-censorship behavior (printable output, length obfuscation, key
 //! mixing) stays identical to the battle-tested C++ implementation.
+//!
+//! Performance notes (wire output unchanged):
+//! * shuffle/unshuffle replace the hardware `%` (~20+ cycle `div` inside a
+//!   serial swap chain) with Lemire's two-multiply fastmod.
+//! * `lcg_next` computes the three LCG steps with a 2-multiply dependency
+//!   depth instead of 3 chained multiplies (next2/next3 both derive from
+//!   next1), which matters because masked-XOR is bound by the LCG chain.
+//! * base94 encode/decode are branchless: escape decisions become cmovs,
+//!   validation runs as one SIMD bulk pass plus cold error branches.
 
 // Intentional truncating/wrapping casts below mirror the C++ `Byte(int)`
 // conversions: the protocol relies on low-byte / modulo-256 semantics.
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+// Hot loops use raw-pointer swaps/stores to skip bounds checks that the
+// compiler cannot elide (`j` comes from a modulo).
+#![allow(unsafe_code)]
 
-use crate::error::{Error, Result};
+use crate::{
+    crypto::simd,
+    error::{Error, Result},
+};
 
 /// Number of printable symbols: 0x20..0x7E.
 pub const BASE94_SYMBOL_COUNT: u8 = 94;
@@ -18,19 +33,26 @@ const BASE93_RADIX: u8 = 93;
 /// Max digits of a u64 in base 94 (94^10 > 2^64 > 94^9).
 pub const BASE94_DECIMAL_MAX_LEN: usize = 10;
 
+/// LCG multiplier / increment (ssea.cpp constants).
+const LCG_A: u32 = 1_103_515_245;
+const LCG_C: u32 = 12_345;
+/// Two-step jump for the restructured `lcg_next`: next3 = next1*A^2 + C*(A+1).
+const LCG_A2: u32 = LCG_A.wrapping_mul(LCG_A);
+const LCG_C2: u32 = LCG_C.wrapping_mul(LCG_A.wrapping_add(1));
+
 /// Advances the 31-bit LCG seed and returns a 31-bit value
 /// (ssea.cpp `random_next`).
+///
+/// Algebraically identical to three chained `x*A+C` steps: steps 2 and 3 are
+/// both affine in next1, so they evaluate in parallel. This halves the
+/// multiply-chain depth (3 -> 2), the critical path of masked-XOR.
 #[must_use]
 pub fn lcg_next(seed: &mut u32) -> u32 {
-    let mut next = *seed;
-    next = next.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-    let mut result = (next / 65_536) % 2048;
-    next = next.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-    result = (result << 10) ^ ((next / 65_536) % 1024);
-    next = next.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-    result = (result << 10) ^ ((next / 65_536) % 1024);
-    *seed = next;
-    result
+    let next1 = seed.wrapping_mul(LCG_A).wrapping_add(LCG_C);
+    let next2 = next1.wrapping_mul(LCG_A).wrapping_add(LCG_C);
+    let next3 = next1.wrapping_mul(LCG_A2).wrapping_add(LCG_C2);
+    *seed = next3;
+    (((next1 >> 16) & 2047) << 20) | (((next2 >> 16) & 1023) << 10) | ((next3 >> 16) & 1023)
 }
 
 /// Closed-range LCG sample in `[min, max]` (ssea.cpp `random_next(seed,..)`).
@@ -38,6 +60,20 @@ pub fn lcg_next(seed: &mut u32) -> u32 {
 pub fn lcg_range(seed: &mut u32, min: u32, max: u32) -> u32 {
     debug_assert!(min <= max, "lcg_range requires min <= max");
     lcg_next(seed) % (max - min + 1) + min
+}
+
+/// Lemire fast-modulo magic for a fixed divisor `d >= 2` (all u32 dividends).
+fn fastmod_magic(d: u32) -> u64 {
+    // M = floor((2^64 - 1) / d) + 1 == ceil(2^64 / d) for every d >= 2.
+    u64::MAX / u64::from(d) + 1
+}
+
+/// `x % d` via two multiplies (Lemire, "Faster remainders when the divisor is
+/// a constant"); exact for all u32 `x` when built with [`fastmod_magic`].
+#[inline]
+fn fast_mod(x: u32, magic: u64, d: u32) -> u32 {
+    let lowbits = magic.wrapping_mul(u64::from(x));
+    ((u128::from(lowbits) * u128::from(d)) >> 64) as u32
 }
 
 /// Key-driven in-place permutation (ssea.cpp `shuffle_data`).
@@ -52,9 +88,12 @@ pub fn shuffle(data: &mut [u8], key: u32) {
         return;
     }
     let size32 = u32::try_from(size).expect("frames are far below 4 GiB");
+    let magic = fastmod_magic(size32);
+    let ptr = data.as_mut_ptr();
     for i in 0..size {
-        let j = ((i as u32 ^ key) % size32) as usize;
-        data.swap(i, j);
+        let j = fast_mod((i as u32) ^ key, magic, size32) as usize;
+        // SAFETY: i < len by the loop range and j < size32 <= len by fastmod.
+        unsafe { std::ptr::swap(ptr.add(i), ptr.add(j)) };
     }
 }
 
@@ -65,41 +104,26 @@ pub fn unshuffle(data: &mut [u8], key: u32) {
         return;
     }
     let size32 = u32::try_from(size).expect("frames are far below 4 GiB");
+    let magic = fastmod_magic(size32);
+    let ptr = data.as_mut_ptr();
     for i in (0..size).rev() {
-        let j = ((i as u32 ^ key) % size32) as usize;
-        data.swap(i, j);
+        let j = fast_mod((i as u32) ^ key, magic, size32) as usize;
+        // SAFETY: i < len by the loop range and j < size32 <= len by fastmod.
+        unsafe { std::ptr::swap(ptr.add(i), ptr.add(j)) };
     }
 }
 
 /// In-place delta encoding: `out[0] = in[0] - kf`, `out[i] = in[i] - in[i-1]`.
 ///
 /// Safe to run in place: the previous plaintext byte is kept in a local.
+/// SIMD-accelerated (`crypto::simd`); wire output identical.
 pub fn delta_encode(data: &mut [u8], kf: u32) {
-    let kf8 = kf as u8;
-    if data.is_empty() {
-        return;
-    }
-    let mut prev = data[0];
-    data[0] = prev.wrapping_sub(kf8);
-    for b in &mut data[1..] {
-        let cur = *b;
-        *b = cur.wrapping_sub(prev);
-        prev = cur;
-    }
+    simd::delta_encode(data, kf as u8);
 }
 
-/// In-place inverse of [`delta_encode`].
+/// In-place inverse of [`delta_encode`]. SIMD-accelerated (prefix-sum scan).
 pub fn delta_decode(data: &mut [u8], kf: u32) {
-    let kf8 = kf as u8;
-    if data.is_empty() {
-        return;
-    }
-    let mut prev = data[0].wrapping_add(kf8);
-    data[0] = prev;
-    for b in &mut data[1..] {
-        prev = prev.wrapping_add(*b);
-        *b = prev;
-    }
+    simd::delta_decode(data, kf as u8);
 }
 
 /// XOR mask that evolves the key with the LCG after each 4-byte word / 2-byte
@@ -131,78 +155,139 @@ pub fn masked_xor_random_next(data: &mut [u8], kf: u32) {
 ///
 /// Each byte `b` maps to `(b - kf) mod 256`; values >= 93 escape into two
 /// chars (0x7D/0x7E prefix + remainder) so output is at most 2x input.
+///
+/// Branchless: the leader char is always stored, the follower slot always
+/// written (garbage when unused, overwritten by the next leader), and the
+/// write cursor advances by `1 + escape` — no mispredicted branches on the
+/// ~50/50 escape mix.
 pub fn base94_encode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) {
+    // 8-wide unroll: the output offsets form a short serial prefix chain
+    // (7 adds amortized over 8 bytes) while the 16 leader/follower stores
+    // issue independently — a per-byte `p += 1 + esc` chain would otherwise
+    // cap the loop at the address-generation latency.
+    const UNROLL: usize = 8;
+
     let kf8 = kf as u8;
-    out.reserve(src.len());
-    for &b in src {
-        let v = b.wrapping_sub(kf8);
-        if v >= BASE93_RADIX {
-            out.push(0x20 + (v / BASE93_RADIX - 1 + BASE93_RADIX));
-            out.push(0x20 + v % BASE93_RADIX);
-        } else {
-            out.push(0x20 + v);
+    let total = src.len() + simd::count_sub_ge(src, kf8, BASE93_RADIX);
+    let start = out.len();
+    // +1 slack: the follower store may land one past the final length when
+    // the last byte is single-char; set_len below erases it.
+    out.reserve(total + 1);
+    let dst = out.as_mut_ptr();
+    let mut p = start;
+    let mut idx = 0usize;
+    while idx + UNROLL <= src.len() {        let chunk: [u8; UNROLL] = src[idx..idx + UNROLL].try_into().expect("fixed size");
+        let mut offs = [0usize; UNROLL];
+        let mut cursor = 0usize;
+        for (k, &b) in chunk.iter().enumerate() {
+            offs[k] = cursor;
+            cursor += 1 + usize::from(b.wrapping_sub(kf8) >= BASE93_RADIX);
         }
+        for (k, &b) in chunk.iter().enumerate() {
+            let v = b.wrapping_sub(kf8);
+            let esc = u8::from(v >= BASE93_RADIX);
+            // Escape: c1 = 0x7D + (v >= 186), c2 = 0x20 + v - 93 - 93*(v >= 186).
+            // Single: c1 = 0x20 + v (c2 unused, overwritten by a later leader).
+            let q2 = u8::from(v >= 2 * BASE93_RADIX);
+            let c1 = if esc != 0 { 0x7d + q2 } else { 0x20 + v };
+            let c2 = 0x20u8.wrapping_add(
+                v.wrapping_sub(BASE93_RADIX)
+                    .wrapping_sub(BASE93_RADIX.wrapping_mul(q2)),
+            );
+            // SAFETY: offsets stay within `total + 1` reserved capacity.
+            unsafe {
+                let q = dst.add(p + offs[k]);
+                *q = c1;
+                *q.add(1) = c2;
+            }
+        }
+        p += cursor;
+        idx += UNROLL;
     }
+    for &b in &src[idx..] {
+        let v = b.wrapping_sub(kf8);
+        let esc = u8::from(v >= BASE93_RADIX);
+        let q2 = u8::from(v >= 2 * BASE93_RADIX);
+        let c1 = if esc != 0 { 0x7d + q2 } else { 0x20 + v };
+        let c2 = 0x20u8.wrapping_add(
+            v.wrapping_sub(BASE93_RADIX)
+                .wrapping_sub(BASE93_RADIX.wrapping_mul(q2)),
+        );
+        // SAFETY: same invariants as the unrolled body.
+        unsafe {
+            *dst.add(p) = c1;
+            *dst.add(p + 1) = c2;
+        }
+        p += 1 + usize::from(esc);
+    }
+    // SAFETY: exactly `total` bytes were committed by leader stores.
+    unsafe { out.set_len(start + total) };
 }
 
 /// Number of chars [`base94_encode_into`] would emit for `src`.
 #[must_use]
 pub fn base94_encoded_len(src: &[u8], kf: u32) -> usize {
-    let kf8 = kf as u8;
-    let escapes = src
-        .iter()
-        .filter(|&&b| b.wrapping_sub(kf8) >= BASE93_RADIX)
-        .count();
-    src.len() + escapes
+    src.len() + simd::count_sub_ge(src, kf as u8, BASE93_RADIX)
 }
 
 /// Decodes base94 text (see [`base94_encode_into`]) and appends the bytes to
 /// `out`. On invalid input `out` is left unchanged and an error is returned.
+///
+/// A SIMD bulk pass proves `>= 0x20` for every char up front; the hot loop
+/// then only checks the (data-dependent but almost-never-taken) escape
+/// validation branch.
 pub fn base94_decode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) -> Result<()> {
+    if !simd::all_ge(src, 0x20) {
+        return Err(Error::InvalidBase94);
+    }
     let kf8 = kf as u8;
+    let kf16 = u16::from(kf8);
     let start = out.len();
     out.reserve(src.len());
-    let mut i = 0;
-    while i < src.len() {
-        let c = src[i];
-        if c < 0x20 {
-            out.truncate(start);
+    let dst = out.as_mut_ptr();
+    let mut i = 0usize;
+    let mut p = start;
+    let n = src.len();
+    // Main loop: every position still has a potential follower char. The
+    // escape validation folds into ONE branch on a value that is zero for
+    // all valid input — branching on `esc` itself would mispredict on the
+    // ~50/50 escape mix.
+    while i + 1 < n {
+        let b = u16::from(src[i]) - 0x20;
+        let b2 = u16::from(src[i + 1]) - 0x20;
+        let esc = u16::from(b >= u16::from(BASE93_RADIX));
+        // Escape reconstruction: v = (b - 92) * 93 + b2. Only meaningful when
+        // escaping; wrapped for the single-char arm (b < 93).
+        let v_esc = (b.wrapping_sub(92))
+            .wrapping_mul(u16::from(BASE93_RADIX))
+            .wrapping_add(b2);
+        // Invalid: leader > 0x7E, follower > 0x7C, or value overflow past
+        // 0xFF. All combined into a single (cold) taken-never branch.
+        let bad = esc
+            & (u16::from(b > 94)
+                | u16::from(b2 > u16::from(BASE93_RADIX))
+                | u16::from(v_esc > 0xFF));
+        if bad != 0 {
             return Err(Error::InvalidBase94);
         }
-        let b = c - 0x20;
-        if b < BASE93_RADIX {
-            out.push(b.wrapping_add(kf8));
-            i += 1;
-            continue;
-        }
-        // Escape sequence: leader must stay within the 94-symbol alphabet,
-        // and the follower must exist and stay in the sub-93 range.
-        if b > 94 {
-            out.truncate(start);
-            return Err(Error::InvalidBase94);
-        }
-        let Some(&c2) = src.get(i + 1) else {
-            out.truncate(start);
-            return Err(Error::InvalidBase94);
-        };
-        if c2 < 0x20 {
-            out.truncate(start);
-            return Err(Error::InvalidBase94);
-        }
-        let b2 = c2 - 0x20;
-        if b2 > BASE93_RADIX {
-            out.truncate(start);
-            return Err(Error::InvalidBase94);
-        }
-        // b is 93 or 94; only b == 94 can overflow a byte after reconstruction.
-        if b == 94 && b2 > 0xff - 2 * BASE93_RADIX {
-            out.truncate(start);
-            return Err(Error::InvalidBase94);
-        }
-        let v = u32::from(b - BASE93_RADIX + 1) * u32::from(BASE93_RADIX) + u32::from(b2);
-        out.push((v as u8).wrapping_add(kf8));
-        i += 2;
+        let val = if esc != 0 { v_esc } else { b };
+        // SAFETY: at most one output byte per input char, and `p` advanced
+        // only by committed bytes within the reserved capacity.
+        unsafe { *dst.add(p) = val.wrapping_add(kf16) as u8 };
+        p += 1;
+        i += 1 + esc as usize;
     }
+    if i < n {
+        // Trailing single char; an escape leader here is a truncated pair.
+        let b = src[i] - 0x20;
+        if b >= BASE93_RADIX {
+            return Err(Error::InvalidBase94);
+        }
+        unsafe { *dst.add(p) = b.wrapping_add(kf8) };
+        p += 1;
+    }
+    // SAFETY: p - start bytes were committed by the loop above.
+    unsafe { out.set_len(p) };
     Ok(())
 }
 
@@ -260,6 +345,59 @@ mod tests {
             assert_eq!(x & 0x8000_0000, 0, "31-bit output expected");
         }
         assert_ne!(a, 154_543_927, "seed must advance");
+    }
+
+    /// Three chained reference steps — the original ssea.cpp formulation the
+    /// restructured [`lcg_next`] must match bit-for-bit.
+    fn lcg_next_reference(seed: &mut u32) -> u32 {
+        let mut next = *seed;
+        next = next.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        let mut result = (next / 65_536) % 2048;
+        next = next.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        result = (result << 10) ^ ((next / 65_536) % 1024);
+        next = next.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        result = (result << 10) ^ ((next / 65_536) % 1024);
+        *seed = next;
+        result
+    }
+
+    #[test]
+    fn lcg_restructure_matches_reference() {
+        let mut a;
+        let mut b;
+        for seed in [0u32, 1, 42, 154_543_927, u32::MAX] {
+            a = seed;
+            b = seed;
+            for _ in 0..1000 {
+                assert_eq!(lcg_next(&mut a), lcg_next_reference(&mut b));
+                assert_eq!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn fast_mod_matches_hardware_division() {
+        let mut s = 0x1234_5678_9abc_def0u64;
+        let mut step = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let divisors: Vec<u32> = (2u32..3000)
+            .chain([4096, 65536, 65539, 830_584, u32::MAX / 2 + 1, 2u32.pow(31) - 1])
+            .collect();
+        for d in divisors {
+            let magic = fastmod_magic(d);
+            for _ in 0..64 {
+                let x = (step() >> 32) as u32;
+                assert_eq!(fast_mod(x, magic, d), x % d, "d={d} x={x}");
+            }
+            // Boundary values too.
+            for x in [0u32, 1, d - 1, d, d + 1, u32::MAX] {
+                assert_eq!(fast_mod(x, magic, d), x % d, "d={d} x={x}");
+            }
+        }
     }
 
     #[test]
@@ -346,6 +484,50 @@ mod tests {
     }
 
     #[test]
+    fn base94_roundtrip_large_and_edge_shapes() {
+        let mut s = 0x0bad_c0deu64;
+        let mut step = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 56) as u8
+        };
+        // Random data (~50% escapes), all-escape and no-escape shapes, plus
+        // lengths that hit the SIMD tails and the trailing-single-char path.
+        let all_escape: Vec<u8> = (0..2000).map(|i| 93u8.wrapping_add(i as u8 % 163)).collect();
+        let no_escape: Vec<u8> = vec![7u8; 2001];
+        for dataset in [all_escape, no_escape] {
+            for kf in [0u32, 0x5a5a_5a5a] {
+                let mut encoded = Vec::new();
+                base94_encode_into(&mut encoded, &dataset, kf);
+                assert_eq!(encoded.len(), base94_encoded_len(&dataset, kf));
+                let mut decoded = Vec::new();
+                base94_decode_into(&mut decoded, &encoded, kf).unwrap();
+                assert_eq!(decoded, dataset);
+            }
+        }
+        let mut random: Vec<u8> = (0..65_537).map(|_| step()).collect();
+        random[0] = 0x93; // force at least one boundary escape
+        let mut encoded = Vec::new();
+        base94_encode_into(&mut encoded, &random, 154_543_927);
+        let mut decoded = Vec::new();
+        base94_decode_into(&mut decoded, &encoded, 154_543_927).unwrap();
+        assert_eq!(decoded, random);
+    }
+
+    #[test]
+    fn base94_decode_uses_existing_out_prefix() {
+        // Appending must respect pre-existing content (protocol framing
+        // relies on encode-into semantics; decode mirrors it).
+        let original = vec![0xde, 0xad, 0xbe, 0xef];
+        let mut encoded = Vec::new();
+        base94_encode_into(&mut encoded, &original, 123);
+        let mut out = b"prefix".to_vec();
+        base94_decode_into(&mut out, &encoded, 123).unwrap();
+        assert_eq!(out, [b"prefix".as_slice(), original.as_slice()].concat());
+    }
+
+    #[test]
     fn base94_escape_boundaries() {
         // kf = 0: values 93/94 escape, values 0..92 stay single.
         let mut encoded = Vec::new();
@@ -363,7 +545,111 @@ mod tests {
         assert!(base94_decode_into(&mut out, &[0x7d], 0).is_err()); // truncated escape
         assert!(base94_decode_into(&mut out, &[0x7d, 0x7e], 0).is_err()); // v > 0xFF
         assert!(base94_decode_into(&mut out, &[0x7e, 0x7e], 0).is_err()); // follower is escape
+        // Non-0x20 leader of length 1 (0x7F => b=95) is an invalid escape.
+        assert!(base94_decode_into(&mut out, &[0x7f, 0x20], 0).is_err());
         assert!(out.is_empty(), "no partial output on failure");
+    }
+
+    /// The pre-optimization reference decoder: greedy scalar parse. The optimized
+    /// fast path must match it bit-for-bit, including on crafted
+    /// inputs (e.g. legal 0x7D 0x7D pairs) and error cases.
+    fn base94_decode_reference(out: &mut Vec<u8>, src: &[u8], kf: u32) -> Result<()> {
+        let kf8 = kf as u8;
+        let start = out.len();
+        let mut i = 0;
+        while i < src.len() {
+            let c = src[i];
+            if c < 0x20 {
+                out.truncate(start);
+                return Err(Error::InvalidBase94);
+            }
+            let b = c - 0x20;
+            if b < BASE93_RADIX {
+                out.push(b.wrapping_add(kf8));
+                i += 1;
+                continue;
+            }
+            if b > 94 {
+                out.truncate(start);
+                return Err(Error::InvalidBase94);
+            }
+            let Some(&c2) = src.get(i + 1) else {
+                out.truncate(start);
+                return Err(Error::InvalidBase94);
+            };
+            if c2 < 0x20 {
+                out.truncate(start);
+                return Err(Error::InvalidBase94);
+            }
+            let b2 = c2 - 0x20;
+            if b2 > BASE93_RADIX {
+                out.truncate(start);
+                return Err(Error::InvalidBase94);
+            }
+            if b == 94 && b2 > 0xff - 2 * BASE93_RADIX {
+                out.truncate(start);
+                return Err(Error::InvalidBase94);
+            }
+            let v = u32::from(b - BASE93_RADIX + 1) * u32::from(BASE93_RADIX) + u32::from(b2);
+            out.push((v as u8).wrapping_add(kf8));
+            i += 2;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn base94_decode_fuzz_matches_reference() {
+        let mut s = 0x00c0_ffee_d00d_feedu64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        // Bias the alphabet toward the tricky boundary range 0x7B..=0x7F so
+        // the adjacent-escape fallback and leader/follower boundaries get
+        // hammered; mix in ordinary printable chars and invalid bytes.
+        for len in 0..200usize {
+            for _ in 0..40 {
+                let input: Vec<u8> = (0..len)
+                    .map(|_| {
+                        let r = (next() >> 32) as u8;
+                        match r % 8 {
+                            0..=4 => 0x20 + (r % 93),
+                            5 => 0x7b,
+                            6 => 0x7d + (r % 2),
+                            _ => r, // sometimes < 0x20 or > 0x7E (invalid)
+                        }
+                    })
+                    .collect();
+                for kf in [0u32, 77, 0x5a5a_5a5a] {
+                    let mut got = Vec::new();
+                    let mut want = Vec::new();
+                    let a = base94_decode_into(&mut got, &input, kf);
+                    let b = base94_decode_reference(&mut want, &input, kf);
+                    assert_eq!(a.is_ok(), b.is_ok(), "len={len} kf={kf} ok-ness");
+                    if let (Ok(()), Ok(())) = (a, b) {
+                        assert_eq!(got, want, "len={len} kf={kf}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn base94_decode_legal_adjacent_escape_pair() {
+        // 0x7D 0x7D decodes to a single byte (v = 93 + 93 = 186), exercising
+        // the adjacent-escape boundary in the optimized path.
+        let mut big = vec![0x7du8; 64];
+        big.extend_from_slice(&[0x41; 8]);
+        for kf in [0u32, 200] {
+            let mut got = Vec::new();
+            base94_decode_into(&mut got, &big, kf).unwrap();
+            let mut want = Vec::new();
+            base94_decode_reference(&mut want, &big, kf).unwrap();
+            assert_eq!(got, want);
+            assert_eq!(got.len(), 32 + 8);
+        }
     }
 
     #[test]

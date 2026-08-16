@@ -198,6 +198,18 @@ impl Base94Framer {
     /// binary packet. Blocking; requires the whole frame to arrive. The
     /// first-frame flag advances only after the entire frame validates.
     pub fn read_frame<Rd: Read>(&mut self, r: &mut Rd) -> Result<Vec<u8>> {
+        let mut scratch = Vec::new();
+        self.read_frame_with(r, &mut scratch)
+    }
+
+    /// [`Self::read_frame`] with a caller-provided scratch buffer for the
+    /// encoded (still base94) bytes, avoiding a per-frame allocation on
+    /// steady-state streaming paths.
+    pub fn read_frame_with<Rd: Read>(
+        &mut self,
+        r: &mut Rd,
+        scratch: &mut Vec<u8>,
+    ) -> Result<Vec<u8>> {
         let first = self.rx_first;
         let len = if first {
             let mut header = [0u8; HEADER_EXTENDED];
@@ -213,10 +225,11 @@ impl Base94Framer {
             len
         };
 
-        let mut encoded = vec![0u8; len];
-        r.read_exact(&mut encoded).map_err(Error::Io)?;
+        scratch.clear();
+        scratch.resize(len, 0);
+        r.read_exact(scratch).map_err(Error::Io)?;
         let mut out = Vec::with_capacity(len);
-        base94_decode_into(&mut out, &encoded, self.kf)?;
+        base94_decode_into(&mut out, scratch, self.kf)?;
         self.rx_first = false;
         Ok(out)
     }

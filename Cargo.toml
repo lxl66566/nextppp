@@ -15,10 +15,12 @@ cfb-mode = "0.8"
 chacha20 = "0.10"
 ctr      = "0.9"
 hkdf     = "0.12"
-hmac     = "0.12"
 rand     = "0.9"
 sha2     = "0.10"
 thiserror = "2"
+
+# bench / test only
+criterion = "0.5"
 
 # app crates
 anyhow            = "1"

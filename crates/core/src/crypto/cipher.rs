@@ -13,10 +13,20 @@
 //! 3. **Backend**: OpenSSL EVP names map to RustCrypto primitives (AES-NI accelerated on x86_64);
 //!    the custom RC4-255 cipher family is dropped (cryptographically broken and no longer needed by
 //!    the new KDF).
+//! 4. **Key-schedule caching** (perf, wire-identical): the AES key expansion is computed once per
+//!    connection in [`Core`] instead of per `apply` call — the old `new_from_slices`-per-packet
+//!    pattern cost hundreds of cycles for the 2-byte protocol-header cipher on every frame. CFB/CTR
+//!    are hand-rolled on top of the cached schedule; byte-exact equivalence with the `cfb-mode` /
+//!    `ctr` crates is pinned by unit tests. CFB decryption and CTR encrypt ciphertext blocks in
+//!    batches of 8 (independent under AES-NI; CFB *encryption* stays serial by construction).
 //!
 //! Kept from the original: the "password + per-connection ivv string" key
 //! seasoning, so every connection derives independent working keys.
 
+use aes::cipher::{
+    BlockEncrypt, BlockSizeUser, KeyInit,
+    generic_array::{GenericArray, typenum::U16},
+};
 use hkdf::Hkdf;
 use sha2::Sha256;
 
@@ -105,12 +115,16 @@ impl Method {
     }
 }
 
-type Aes128CfbEnc = cfb_mode::Encryptor<aes::Aes128>;
-type Aes128CfbDec = cfb_mode::Decryptor<aes::Aes128>;
-type Aes256CfbEnc = cfb_mode::Encryptor<aes::Aes256>;
-type Aes256CfbDec = cfb_mode::Decryptor<aes::Aes256>;
-type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
-type Aes256Ctr = ctr::Ctr128BE<aes::Aes256>;
+type Block = GenericArray<u8, U16>;
+
+/// Precomputed AES key schedule (see design note 4). One boxed-free enum
+/// holding either schedule; the variant size gap is inherent and harmless
+/// (one instance per direction per connection).
+#[allow(clippy::large_enum_variant)]
+enum Core {
+    Aes128(aes::Aes128),
+    Aes256(aes::Aes256),
+}
 
 /// Max nonce width across methods (AES: 16 bytes).
 const NONCE_MAX: usize = 16;
@@ -122,6 +136,7 @@ const KEY_MAX: usize = 32;
 /// independent message streams; create one per direction instead.
 pub struct SessionCipher {
     method: Method,
+    core: Core,
     key: [u8; KEY_MAX],
     base_iv: [u8; NONCE_MAX],
     seq: u64,
@@ -168,8 +183,18 @@ impl SessionCipher {
         let mut base_iv = [0u8; NONCE_MAX];
         base_iv.copy_from_slice(&okm[KEY_MAX..]);
 
+        let core = match method {
+            Method::Aes128Cfb | Method::Aes128Ctr => {
+                Core::Aes128(aes::Aes128::new(GenericArray::from_slice(&key[..16])))
+            },
+            Method::Aes256Cfb | Method::Aes256Ctr | Method::ChaCha20 => {
+                Core::Aes256(aes::Aes256::new(GenericArray::from_slice(&key[..32])))
+            },
+        };
+
         Self {
             method,
+            core,
             key,
             base_iv,
             seq: 0,
@@ -187,55 +212,38 @@ impl SessionCipher {
 
     /// Encrypts (or decrypts, for a `for_decryption` instance) `data` in
     /// place, consuming one nonce. Length never changes.
-    ///
-    /// Trait imports are scoped per arm: cfb-mode/ctr resolve against
-    /// cipher 0.4 while chacha20 0.10 resolves against cipher 0.5, so the
-    /// identically-named traits must not be imported simultaneously.
     pub fn apply(&mut self, data: &mut [u8]) {
         let nonce = self.next_nonce();
-        match self.method {
-            Method::Aes128Cfb => {
-                use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
-                if self.encrypting {
-                    let c = Aes128CfbEnc::new_from_slices(&self.key[..16], &nonce[..16])
-                        .expect("key/iv lengths are fixed by Method");
-                    c.encrypt(data);
-                } else {
-                    let c = Aes128CfbDec::new_from_slices(&self.key[..16], &nonce[..16])
-                        .expect("key/iv lengths are fixed by Method");
-                    c.decrypt(data);
-                }
-            },
-            Method::Aes256Cfb => {
-                use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
-                if self.encrypting {
-                    let c = Aes256CfbEnc::new_from_slices(&self.key[..32], &nonce[..16])
-                        .expect("key/iv lengths are fixed by Method");
-                    c.encrypt(data);
-                } else {
-                    let c = Aes256CfbDec::new_from_slices(&self.key[..32], &nonce[..16])
-                        .expect("key/iv lengths are fixed by Method");
-                    c.decrypt(data);
-                }
-            },
-            Method::Aes128Ctr => {
-                use ctr::cipher::{KeyIvInit, StreamCipher};
-                let mut c = Aes128Ctr::new_from_slices(&self.key[..16], &nonce[..16])
-                    .expect("key/iv lengths are fixed by Method");
-                c.apply_keystream(data);
-            },
-            Method::Aes256Ctr => {
-                use ctr::cipher::{KeyIvInit, StreamCipher};
-                let mut c = Aes256Ctr::new_from_slices(&self.key[..32], &nonce[..16])
-                    .expect("key/iv lengths are fixed by Method");
-                c.apply_keystream(data);
-            },
-            Method::ChaCha20 => {
+        let Self {
+            core,
+            key,
+            method,
+            encrypting,
+            ..
+        } = self;
+        match (method, core) {
+            (Method::Aes128Cfb, Core::Aes128(c)) => cfb_apply(c, &nonce, data, *encrypting),
+            (Method::Aes256Cfb, Core::Aes256(c)) => cfb_apply(c, &nonce, data, *encrypting),
+            (Method::Aes128Ctr, Core::Aes128(c)) => ctr_apply(c, &nonce, data),
+            (Method::Aes256Ctr, Core::Aes256(c)) => ctr_apply(c, &nonce, data),
+            (Method::ChaCha20, Core::Aes128(_) | Core::Aes256(_)) => {
+                // State init is just word writes (rounds run lazily per
+                // block), so per-packet construction is cheap.
                 use chacha20::cipher::{KeyIvInit, StreamCipher};
-                let mut c = chacha20::ChaCha20::new_from_slices(&self.key[..32], &nonce[..12])
-                    .expect("key/iv lengths are fixed by Method");
+                let mut c = chacha20::ChaCha20::new_from_slices(&key[..32], &nonce[..12])
+                    .expect("key/nonce lengths are fixed by Method");
                 c.apply_keystream(data);
             },
+            // `Core` is derived from `method` at construction; these pairings
+            // cannot exist.
+            (
+                Method::Aes128Cfb | Method::Aes128Ctr,
+                Core::Aes256(_),
+            )
+            | (
+                Method::Aes256Cfb | Method::Aes256Ctr,
+                Core::Aes128(_),
+            ) => unreachable!("cipher core must match method"),
         }
     }
 
@@ -265,6 +273,122 @@ impl SessionCipher {
         // (2^64 packets x 64 KiB >> any conceivable session size).
         self.seq += 1;
         nonce
+    }
+}
+
+/// AES-CFB128 over `data` with the per-packet `iv`.
+fn cfb_apply<E>(cipher: &E, iv: &[u8; NONCE_MAX], data: &mut [u8], encrypting: bool)
+where
+    E: BlockEncrypt + BlockSizeUser<BlockSize = U16>,
+{
+    if encrypting {
+        cfb_encrypt(cipher, iv, data);
+    } else {
+        cfb_decrypt(cipher, iv, data);
+    }
+}
+
+/// CFB encryption is inherently serial: the keystream for block i depends on
+/// the ciphertext of block i-1. The feedback move/XOR are fused into u64
+/// halves to keep per-block overhead off the AES latency chain.
+fn cfb_encrypt<E>(cipher: &E, iv: &[u8; NONCE_MAX], data: &mut [u8])
+where
+    E: BlockEncrypt + BlockSizeUser<BlockSize = U16>,
+{
+    let mut fb: Block = (*iv).into();
+    let mut chunks = data.chunks_exact_mut(16);
+    for chunk in &mut chunks {
+        cipher.encrypt_block(&mut fb);
+        let ct = xor16_store(chunk, &fb);
+        fb.copy_from_slice(&ct);
+    }
+    xor_tail(cipher, &fb, chunks.into_remainder());
+}
+
+/// XORs `ks` into the 16-byte `chunk` in place and returns the result (the
+/// new ciphertext) as a fixed-size array.
+fn xor16_store(chunk: &mut [u8], ks: &Block) -> [u8; 16] {
+    debug_assert_eq!(chunk.len(), 16);
+    let ct = u128::from_le_bytes(chunk.try_into().expect("16-byte chunk"))
+        ^ u128::from_le_bytes(ks.as_slice().try_into().expect("16-byte block"));
+    let bytes = ct.to_le_bytes();
+    chunk.copy_from_slice(&bytes);
+    bytes
+}
+
+/// CFB decryption needs `E(ct[i-1])`: the ciphertext is known up front, so
+/// blocks are encrypted in batches of 8 at the cost of one ciphertext copy —
+/// AES-NI pipelines independent `encrypt_blocks` far better than the serial
+/// feedback chain.
+fn cfb_decrypt<E>(cipher: &E, iv: &[u8; NONCE_MAX], data: &mut [u8])
+where
+    E: BlockEncrypt + BlockSizeUser<BlockSize = U16>,
+{
+    const BATCH: usize = 8;
+    let nb = data.len() / 16;
+    // ks[k] holds ct[i+k-1] before encryption (ks[0] = previous ciphertext)
+    // and the keystream E(ct[i+k-1]) for data block i+k afterwards.
+    let mut ks: [Block; BATCH] = core::array::from_fn(|_| Block::from([0u8; 16]));
+    let mut prev: Block = (*iv).into();
+    let mut i = 0;
+    while i < nb {
+        let n = (nb - i).min(BATCH);
+        // Save the batch's last ciphertext before the batch loop overwrites
+        // `data` in place; it seeds the next batch's feedback.
+        let mut last_ct = Block::from([0u8; 16]);
+        last_ct.copy_from_slice(&data[(i + n - 1) * 16..(i + n) * 16]);
+        ks[0].copy_from_slice(&prev);
+        for k in 1..n {
+            ks[k].copy_from_slice(&data[(i + k - 1) * 16..(i + k) * 16]);
+        }
+        cipher.encrypt_blocks(&mut ks[..n]);
+        for k in 0..n {
+            xor16_store(&mut data[(i + k) * 16..(i + k + 1) * 16], &ks[k]);
+        }
+        prev = last_ct;
+        i += n;
+    }
+    xor_tail(cipher, &prev, &mut data[nb * 16..]);
+}
+
+/// Keystream prefix XOR for the sub-block tail (identical for both CFB
+/// directions).
+fn xor_tail<E>(cipher: &E, feedback: &Block, rem: &mut [u8])
+where
+    E: BlockEncrypt + BlockSizeUser<BlockSize = U16>,
+{
+    if rem.is_empty() {
+        return;
+    }
+    let mut keystream = *feedback;
+    cipher.encrypt_block(&mut keystream);
+    for (b, k) in rem.iter_mut().zip(keystream.iter()) {
+        *b ^= k;
+    }
+}
+
+/// AES-CTR: fully parallel — 8 counter blocks encrypted and XORed per batch.
+fn ctr_apply<E>(cipher: &E, iv: &[u8; NONCE_MAX], data: &mut [u8])
+where
+    E: BlockEncrypt + BlockSizeUser<BlockSize = U16>,
+{
+    const BATCH: usize = 8;
+    let mut ks: [Block; BATCH] = core::array::from_fn(|_| Block::from([0u8; 16]));
+    let mut counter = u128::from_be_bytes(*iv);
+    let mut pos = 0;
+    while pos < data.len() {
+        let take = (data.len() - pos).min(BATCH * 16);
+        let n = take.div_ceil(16);
+        for (k, blk) in ks[..n].iter_mut().enumerate() {
+            *blk = Block::from((counter + k as u128).to_be_bytes());
+        }
+        cipher.encrypt_blocks(&mut ks[..n]);
+        let chunk = &mut data[pos..pos + take];
+        for (b, k) in chunk.iter_mut().zip(ks[..n].iter().flatten()) {
+            *b ^= k;
+        }
+        counter += n as u128;
+        pos += take;
     }
 }
 
@@ -375,7 +499,8 @@ mod tests {
         // desync two parties running mirrored instances.
         for m in all_methods() {
             let mut enc = SessionCipher::new(m, CipherRole::Transport, "pw");
-            let mut dec = SessionCipher::new(m, CipherRole::Transport, "pw").for_decryption();
+            let mut dec =
+                SessionCipher::new(m, CipherRole::Transport, "pw").for_decryption();
             for n in [1usize, 2, 3, 17, 100] {
                 let original: Vec<u8> = (0..n).map(|i| (i * 37) as u8).collect();
                 let mut wire = original.clone();
@@ -420,4 +545,109 @@ mod tests {
         assert_eq!(len, expected.len());
         assert_eq!(&buf[..len], &expected[..]);
     }
+
+    // ------------------------------------------------------------------
+    // Byte-exact equivalence of the hand-rolled CFB/CTR against the
+    // reference crates (kept as dev-dependencies for this purpose).
+    // ------------------------------------------------------------------
+
+    impl SessionCipher {
+        /// Test-only view for driving the reference implementations with the
+        /// exact nonce material `apply` will use next.
+        fn material(&self) -> (&[u8; KEY_MAX], &[u8; NONCE_MAX], u64) {
+            (&self.key, &self.base_iv, self.seq)
+        }
+    }
+
+    /// Mirrors `next_nonce` for the reference drivers.
+    fn ref_nonce(method: Method, base_iv: &[u8; NONCE_MAX], seq: u64) -> [u8; NONCE_MAX] {
+        let mut nonce = *base_iv;
+        let xor_width = if method == Method::ChaCha20 { 4 } else { 8 };
+        let start = method.iv_len() - xor_width;
+        let seq = seq.to_be_bytes();
+        for i in 0..xor_width {
+            nonce[start + i] ^= seq[8 - xor_width + i];
+        }
+        nonce
+    }
+
+    #[allow(clippy::cast_possible_truncation)] // test data generation only
+    fn sample(n: usize) -> Vec<u8> {
+        let mut v = vec![0u8; n];
+        let mut s = 0x0bad_c0de_dead_beefu64;
+        for b in &mut v {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *b = (s >> 32) as u8;
+        }
+        v
+    }
+
+    #[test]
+    fn manual_cfb_ctr_match_reference_crates() {
+        use aes::Aes128 as RefAes128;
+        use aes::Aes256 as RefAes256;
+
+        for method in [Method::Aes128Cfb, Method::Aes256Cfb, Method::Aes128Ctr, Method::Aes256Ctr]
+        {
+            for encrypting in [true, false] {
+                let base = SessionCipher::new(method, CipherRole::Transport, "cross-check");
+                let mut mine = if encrypting { base } else { base.for_decryption() };
+                // Lengths hit: partial tails, single blocks, multi-batch
+                // (> 8*16 = CFB decrypt / CTR batch boundary) and full frames.
+                for len in [0usize, 1, 2, 15, 16, 17, 31, 128, 129, 1000, 65536] {
+                    let data = sample(len);
+                    let (key, base_iv, seq) = mine.material();
+                    let nonce = ref_nonce(method, base_iv, seq);
+
+                    let mut expected = data.clone();
+                    match (method, encrypting) {
+                        (Method::Aes128Cfb, true) => {
+                            use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
+                            cfb_mode::Encryptor::<RefAes128>::new_from_slices(&key[..16], &nonce)
+                                .expect("static lengths")
+                                .encrypt(&mut expected);
+                        },
+                        (Method::Aes128Cfb, false) => {
+                            use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
+                            cfb_mode::Decryptor::<RefAes128>::new_from_slices(&key[..16], &nonce)
+                                .expect("static lengths")
+                                .decrypt(&mut expected);
+                        },
+                        (Method::Aes256Cfb, true) => {
+                            use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
+                            cfb_mode::Encryptor::<RefAes256>::new_from_slices(&key[..32], &nonce)
+                                .expect("static lengths")
+                                .encrypt(&mut expected);
+                        },
+                        (Method::Aes256Cfb, false) => {
+                            use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
+                            cfb_mode::Decryptor::<RefAes256>::new_from_slices(&key[..32], &nonce)
+                                .expect("static lengths")
+                                .decrypt(&mut expected);
+                        },
+                        (Method::Aes128Ctr, _) => {
+                            use ctr::cipher::{KeyIvInit, StreamCipher};
+                            ctr::Ctr128BE::<RefAes128>::new_from_slices(&key[..16], &nonce)
+                                .expect("static lengths")
+                                .apply_keystream(&mut expected);
+                        },
+                        (Method::Aes256Ctr, _) => {
+                            use ctr::cipher::{KeyIvInit, StreamCipher};
+                            ctr::Ctr128BE::<RefAes256>::new_from_slices(&key[..32], &nonce)
+                                .expect("static lengths")
+                                .apply_keystream(&mut expected);
+                        },
+                        (Method::ChaCha20, _) => unreachable!("covered by other tests"),
+                    }
+
+                    let mut got = data;
+                    mine.apply(&mut got);
+                    assert_eq!(got, expected, "{method:?} encrypting={encrypting} len={len}");
+                }
+            }
+        }
+    }
 }
+

@@ -2,3 +2,5 @@
 
 pub mod cipher;
 pub mod ssea;
+
+mod simd;

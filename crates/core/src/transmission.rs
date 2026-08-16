@@ -64,9 +64,13 @@ pub struct Transmission<T, R = StdRng> {
     transport_rx: SessionCipher,
     handshaked: bool,
     session_id: SessionId,
-    /// Scratch buffers reused across packets to avoid per-write allocation.
+    /// Scratch buffers reused across packets to avoid per-write allocation:
+    /// `a` holds the wire output of `write`, `b` the intermediate binary
+    /// packet on base94 paths, `read` the encoded frame bytes on streaming
+    /// reads.
     scratch_a: Vec<u8>,
     scratch_b: Vec<u8>,
+    scratch_read: Vec<u8>,
 }
 
 impl<T> Transmission<T, StdRng> {
@@ -104,6 +108,7 @@ impl<T, R: Rng> Transmission<T, R> {
             session_id: 0,
             scratch_a: Vec::new(),
             scratch_b: Vec::new(),
+            scratch_read: Vec::new(),
         }
     }
 
@@ -154,20 +159,28 @@ impl<T, R: Rng> Transmission<T, R> {
             plaintext.len(),
         )?;
 
-        // Assemble the binary packet in scratch: header || transformed body.
-        let bin = &mut self.scratch_b;
-        bin.clear();
-        bin.reserve(HEADER_SIZE + plaintext.len());
-        bin.extend_from_slice(&header);
-        bin.extend_from_slice(plaintext);
-        let body = &mut bin[HEADER_SIZE..];
-        self.transport_tx.apply(body);
-        payload_obfuscate(body, &flags, header_kf, self.key.kf);
-
         if !self.handshaked || self.key.plaintext {
+            // base94 envelope: the binary packet must exist as a contiguous
+            // input buffer, so it is assembled in scratch first.
+            let bin = &mut self.scratch_b;
+            bin.clear();
+            bin.reserve(HEADER_SIZE + plaintext.len());
+            bin.extend_from_slice(&header);
+            bin.extend_from_slice(plaintext);
+            let body = &mut bin[HEADER_SIZE..];
+            self.transport_tx.apply(body);
+            payload_obfuscate(body, &flags, header_kf, self.key.kf);
             self.b94.encode_frame(&mut self.rng, out, bin)
         } else {
-            out.extend_from_slice(bin);
+            // Binary framing builds the packet directly in `out`: one full
+            // packet copy saved vs assembling in scratch first.
+            let start = out.len();
+            out.reserve(HEADER_SIZE + plaintext.len());
+            out.extend_from_slice(&header);
+            out.extend_from_slice(plaintext);
+            let body = &mut out[start + HEADER_SIZE..];
+            self.transport_tx.apply(body);
+            payload_obfuscate(body, &flags, header_kf, self.key.kf);
             Ok(())
         }
     }
@@ -268,8 +281,13 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
     pub fn read(&mut self) -> Result<Vec<u8>> {
         if !self.handshaked || self.key.plaintext {
             let binary = {
-                let Self { b94, io, .. } = self;
-                b94.read_frame(io)?
+                let Self {
+                    b94,
+                    io,
+                    scratch_read,
+                    ..
+                } = self;
+                b94.read_frame_with(io, scratch_read)?
             };
             self.decrypt_packet(&binary)
         } else {
@@ -497,6 +515,8 @@ pub struct TransmissionRx<T> {
     protocol_rx: SessionCipher,
     transport_rx: SessionCipher,
     handshaked: bool,
+    /// Reused buffer for encoded (pre-decode) frame bytes.
+    scratch: Vec<u8>,
 }
 
 impl<T> TransmissionRx<T> {
@@ -524,8 +544,12 @@ impl<T: Read> TransmissionRx<T> {
     pub fn read(&mut self) -> Result<Vec<u8>> {
         if !self.handshaked || self.key.plaintext {
             let binary = {
-                let Self { b94, io, .. } = self;
-                b94.read_frame(io)?
+                let Self {
+                    b94,
+                    io,
+                    scratch, ..
+                } = self;
+                b94.read_frame_with(io, scratch)?
             };
             self.decrypt_packet(&binary)
         } else {
@@ -603,6 +627,7 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
             session_id: _,
             scratch_a,
             scratch_b: _,
+            scratch_read,
         } = self;
         let tx = TransmissionTx {
             io,
@@ -621,6 +646,7 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
             protocol_rx,
             transport_rx,
             handshaked,
+            scratch: scratch_read,
         };
         (tx, rx)
     }
