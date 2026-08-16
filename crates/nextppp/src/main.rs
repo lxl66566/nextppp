@@ -90,6 +90,17 @@ fn bind_listen(spec: &str) -> anyhow::Result<TcpListener> {
 }
 
 fn write_example(path: &Path, example: &str) -> anyhow::Result<()> {
+    // The default PATH coincides with the default config path: blindly
+    // overwriting could destroy a real deployment's configuration.
+    match path.try_exists() {
+        Ok(true) => anyhow::bail!(
+            "{} already exists; refusing to overwrite (remove it first or pass an explicit \
+             --init PATH)",
+            path.display()
+        ),
+        Ok(false) => {},
+        Err(e) => return Err(e).with_context(|| format!("check {}", path.display())),
+    }
     fs::write(path, example).with_context(|| format!("write {}", path.display()))?;
     println!("wrote example configuration to {}", path.display());
     Ok(())
