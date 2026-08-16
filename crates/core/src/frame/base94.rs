@@ -82,6 +82,12 @@ impl Base94Framer {
         out: &mut Vec<u8>,
         binary: &[u8],
     ) -> Result<()> {
+        // Zero-length payloads cannot be framed: the decoder rejects
+        // `length < 1`, so reject them here for encode/decode symmetry
+        // (found by cargo-fuzz framer_roundtrip).
+        if binary.is_empty() {
+            return Err(Error::ZeroLength);
+        }
         let encoded_len = base94_encoded_len(binary, self.kf);
         if encoded_len > BASE94_MAX_FRAME {
             return Err(Error::FrameTooLarge { len: encoded_len });
@@ -389,6 +395,20 @@ mod tests {
         // Different kf yields a different kf_mod/mod -> checksum mismatch or
         // garbage length; either way decoding must fail.
         assert!(rx.read_frame(&mut stream).is_err());
+    }
+
+    #[test]
+    fn zero_length_payload_rejected() {
+        // Encode/decode symmetry: the decoder rejects `length < 1`, so the
+        // encoder must reject empty payloads too (found by cargo-fuzz).
+        let (mut tx, _) = pair(154_543_927);
+        let mut rng = rng();
+        let mut wire = Vec::new();
+        assert!(matches!(
+            tx.encode_frame(&mut rng, &mut wire, &[]),
+            Err(Error::ZeroLength)
+        ));
+        assert!(wire.is_empty());
     }
 
     #[test]

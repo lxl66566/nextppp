@@ -12,37 +12,37 @@ repository.workspace   = true
 license.workspace      = true
 
 [dependencies]
-anyhow          = { workspace = true }
-hotpath         = { workspace = true, optional = true }
+anyhow         = { workspace = true }
+hotpath        = { workspace = true, optional = true }
 nextppp-common = { workspace = true }
 nextppp-core   = { workspace = true }
-spdlog-rs       = { workspace = true }
+spdlog-rs      = { workspace = true }
 
 [dev-dependencies]
-hotpath         = { workspace = true }
+hotpath        = { workspace = true }
+libc           = { workspace = true }
 nextppp-server = { workspace = true }
-libc            = { workspace = true }
 
 [features]
 # Profiling instrumentation; see nextppp-core's feature docs. The dev-dep
 # passthrough keeps the in-process e2e/throughput tests profiled end to end.
-hotpath = [
-    "dep:hotpath",
-    "hotpath/hotpath",
-    "nextppp-common/hotpath",
-    "nextppp-server/hotpath",
+hotpath       = [
+  "dep:hotpath",
+  "hotpath/hotpath",
+  "nextppp-common/hotpath",
+  "nextppp-server/hotpath",
 ]
 hotpath-alloc = [
-    "hotpath",
-    "hotpath/hotpath-alloc",
-    "nextppp-common/hotpath-alloc",
-    "nextppp-server/hotpath-alloc",
+  "hotpath",
+  "hotpath/hotpath-alloc",
+  "nextppp-common/hotpath-alloc",
+  "nextppp-server/hotpath-alloc",
 ]
-hotpath-cpu = [
-    "hotpath",
-    "hotpath/hotpath-cpu",
-    "nextppp-common/hotpath-cpu",
-    "nextppp-server/hotpath-cpu",
+hotpath-cpu   = [
+  "hotpath",
+  "hotpath/hotpath-cpu",
+  "nextppp-common/hotpath-cpu",
+  "nextppp-server/hotpath-cpu",
 ]
 
 [lints]

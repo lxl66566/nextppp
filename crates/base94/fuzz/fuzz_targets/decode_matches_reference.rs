@@ -57,14 +57,16 @@ fn decode_reference(out: &mut Vec<u8>, src: &[u8], kf: u32) -> Result<(), ()> {
 fuzz_target!(|data: &[u8]| {
     let (&kf, input) = data.split_first().unwrap_or((&0, &[]));
     let kf = u32::from(kf);
-    let mut got = Vec::new();
-    let mut want = Vec::new();
+    // Pre-seeded output: decode must append, keeping the existing prefix
+    // (and leave it untouched on error).
+    let mut got = b"prefix".to_vec();
+    let mut want = b"prefix".to_vec();
     let a = base94_simd::decode_into(&mut got, input, kf);
     let b = decode_reference(&mut want, input, kf);
     assert_eq!(a.is_ok(), b.is_ok(), "ok-ness diverged on {input:?} kf={kf}");
     if a.is_ok() {
         assert_eq!(got, want, "output diverged on {input:?} kf={kf}");
     } else {
-        assert!(got.is_empty(), "output must be unchanged on error");
+        assert_eq!(got, b"prefix", "output must be unchanged on error");
     }
 });

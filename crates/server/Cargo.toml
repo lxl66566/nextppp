@@ -12,12 +12,12 @@ repository.workspace   = true
 license.workspace      = true
 
 [dependencies]
-anyhow          = { workspace = true }
-hotpath         = { workspace = true, optional = true }
+anyhow         = { workspace = true }
+hotpath        = { workspace = true, optional = true }
 nextppp-common = { workspace = true }
 nextppp-core   = { workspace = true }
-rand            = { workspace = true }
-spdlog-rs       = { workspace = true }
+rand           = { workspace = true }
+spdlog-rs      = { workspace = true }
 
 [features]
 # Profiling instrumentation; see nextppp-core's feature docs.

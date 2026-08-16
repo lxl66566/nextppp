@@ -1,15 +1,15 @@
 [package]
-name          = "base94-simd"
-description   = "SIMD-accelerated base94 codec"
-readme        = "README.md"
-keywords      = ["base94", "simd", "encoding", "ascii", "printable"]
-categories    = ["encoding"]
-exclude       = ["fuzz"]
-version       = "0.1.0"
-edition       = "2024"
-rust-version  = "1.85"
-repository    = "https://github.com/lxl66566/nextppp"
-license       = "MIT OR Apache-2.0"
+name         = "base94-simd"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.85"
+description  = "SIMD-accelerated base94 codec"
+readme       = "README.md"
+repository   = "https://github.com/lxl66566/nextppp"
+license      = "MIT OR Apache-2.0"
+keywords     = ["ascii", "base94", "encoding", "printable", "simd"]
+categories   = ["encoding"]
+exclude      = ["fuzz"]
 
 [lints.clippy]
 all                     = { level = "warn", priority = -1 }
