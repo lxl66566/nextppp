@@ -1,0 +1,23 @@
+[package]
+name         = "openppp3"
+description  = "openppp3 anti-censorship proxy (unified server/client binary)"
+readme       = "../../README.md"
+keywords     = ["proxy", "anti-censorship", "network", "openppp2"]
+categories   = ["network-programming"]
+
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[dependencies]
+openppp3-client     = { workspace = true }
+openppp3-common     = { workspace = true }
+openppp3-server     = { workspace = true }
+anyhow              = { workspace = true }
+clap                = { workspace = true }
+tracing-subscriber  = { workspace = true }
+
+[lints]
+workspace = true

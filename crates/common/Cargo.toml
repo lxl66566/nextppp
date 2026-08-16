@@ -13,7 +13,6 @@ repository.workspace   = true
 
 [dependencies]
 openppp3-core = { workspace = true }
-ipnet         = { workspace = true }
 serde         = { workspace = true }
 json5         = { workspace = true }
 thiserror     = { workspace = true }

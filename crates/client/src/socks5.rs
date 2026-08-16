@@ -1,4 +1,5 @@
-//! SOCKS5 inbound: no-auth negotiation + CONNECT, then a routed pump.
+//! SOCKS5 inbound: no-auth negotiation + CONNECT, always forwarded through
+//! the openppp3 tunnel (routing is the front-end proxy's job).
 
 use std::{
     io::{ErrorKind, Read, Write},
@@ -7,14 +8,17 @@ use std::{
 };
 
 use anyhow::Context;
-use openppp3_common::{addr::Host, addr::ProxyAddr, pump, Policy};
+use openppp3_common::{
+    addr::{Host, ProxyAddr},
+    pump,
+};
 use tracing::debug;
 
-use crate::{outbound, ClientRuntime};
+use crate::{ClientRuntime, outbound};
 
 const VER: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
-const METHOD_NONE_ACCEPTABLE: u8 = 0xFF;
+const METHOD_NONE_ACCEPTABLE: u8 = 0xff;
 const CMD_CONNECT: u8 = 0x01;
 
 const ATYP_IPV4: u8 = 0x01;
@@ -24,7 +28,6 @@ const ATYP_IPV6: u8 = 0x04;
 // Reply codes (RFC 1928).
 const REP_SUCCEEDED: u8 = 0x00;
 const REP_GENERAL: u8 = 0x01;
-const REP_NOT_ALLOWED: u8 = 0x02;
 const REP_CMD_UNSUPPORTED: u8 = 0x07;
 const REP_ATYP_UNSUPPORTED: u8 = 0x08;
 
@@ -55,42 +58,25 @@ pub fn handle(mut stream: TcpStream, rt: &Arc<ClientRuntime>) -> anyhow::Result<
             };
             let _ = reply(&mut stream, rep);
             return Err(e).context("read request address");
-        }
+        },
     };
 
-    let policy = rt.rules.decide(&addr.host);
-    debug!("socks5 {} -> {policy:?}", addr.host.to_display());
-    if policy == Policy::Block {
-        let _ = reply(&mut stream, REP_NOT_ALLOWED);
-        return Ok(());
-    }
+    debug!("socks5 connect {}", addr.host.to_display());
 
-    match outbound::connect(policy, &addr, rt) {
-        Ok(out) => {
+    match outbound::tunnel_connect(&addr, rt) {
+        Ok((tx, rx)) => {
             reply(&mut stream, REP_SUCCEEDED).context("reply succeeded")?;
             // The inbound handshake timeout must not apply to the data plane.
             stream.set_read_timeout(None)?;
             stream.set_write_timeout(None)?;
-            pump_stream(stream, out);
+            let (up, down) = pump::pump_tunnel(*tx, *rx, stream);
+            debug!("socks5 tunnel closed (up {up}, down {down})");
             Ok(())
-        }
+        },
         Err(e) => {
             let _ = reply(&mut stream, REP_GENERAL);
             Err(e.context("outbound connect"))
-        }
-    }
-}
-
-fn pump_stream(stream: TcpStream, out: outbound::Outbound) {
-    match out {
-        outbound::Outbound::Direct(target) => {
-            let (up, down) = pump::pump_tcp(stream, target);
-            debug!("socks5 direct closed (up {up}, down {down})");
-        }
-        outbound::Outbound::Tunnel(tx, rx) => {
-            let (up, down) = pump::pump_tunnel(*tx, *rx, stream);
-            debug!("socks5 tunnel closed (up {up}, down {down})");
-        }
+        },
     }
 }
 
@@ -123,26 +109,22 @@ fn read_addr(stream: &mut TcpStream, atyp: u8) -> std::io::Result<ProxyAddr> {
             let mut octets = [0u8; 4];
             stream.read_exact(&mut octets)?;
             Host::Ip(octets.into())
-        }
+        },
         ATYP_IPV6 => {
             let mut octets = [0u8; 16];
             stream.read_exact(&mut octets)?;
             Host::Ip(octets.into())
-        }
+        },
         ATYP_DOMAIN => {
             let mut len = [0u8; 1];
             stream.read_exact(&mut len)?;
             if len[0] == 0 {
-                return Err(std::io::Error::new(
-                    ErrorKind::InvalidData,
-                    "empty domain",
-                ));
+                return Err(std::io::Error::new(ErrorKind::InvalidData, "empty domain"));
             }
             let mut name = vec![0u8; len[0] as usize];
             stream.read_exact(&mut name)?;
-            let name = String::from_utf8(name).map_err(|_| {
-                std::io::Error::new(ErrorKind::InvalidData, "domain is not utf-8")
-            })?;
+            let name = String::from_utf8(name)
+                .map_err(|_| std::io::Error::new(ErrorKind::InvalidData, "domain is not utf-8"))?;
             if name.bytes().any(|b| !(0x21..=0x7e).contains(&b)) {
                 return Err(std::io::Error::new(
                     ErrorKind::InvalidData,
@@ -150,13 +132,13 @@ fn read_addr(stream: &mut TcpStream, atyp: u8) -> std::io::Result<ProxyAddr> {
                 ));
             }
             Host::Domain(name.to_ascii_lowercase())
-        }
+        },
         _ => {
             return Err(std::io::Error::new(
                 ErrorKind::InvalidData,
                 format!("unsupported ATYP {atyp:#04x}"),
             ));
-        }
+        },
     };
     let mut port = [0u8; 2];
     stream.read_exact(&mut port)?;

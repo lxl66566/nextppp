@@ -60,15 +60,15 @@ impl ProxyAddr {
                 out.push(ATYP_DOMAIN);
                 out.push(u8::try_from(len).expect("capped at u8::MAX"));
                 out.extend_from_slice(&d.as_bytes()[..len]);
-            }
+            },
             Host::Ip(IpAddr::V4(v4)) => {
                 out.push(ATYP_IPV4);
                 out.extend_from_slice(&v4.octets());
-            }
+            },
             Host::Ip(IpAddr::V6(v6)) => {
                 out.push(ATYP_IPV6);
                 out.extend_from_slice(&v6.octets());
-            }
+            },
         }
         out.extend_from_slice(&self.port.to_be_bytes());
     }
@@ -91,12 +91,12 @@ impl ProxyAddr {
                 let octets: [u8; 4] = rest.first_chunk().ok_or(AddrError::Malformed)?.to_owned();
                 let ip = IpAddr::from(octets);
                 (Host::Ip(ip), &rest[4..])
-            }
+            },
             ATYP_IPV6 => {
                 let octets: [u8; 16] = rest.first_chunk().ok_or(AddrError::Malformed)?.to_owned();
                 let ip = IpAddr::from(octets);
                 (Host::Ip(ip), &rest[16..])
-            }
+            },
             ATYP_DOMAIN => {
                 let (&len, rest) = rest.split_first().ok_or(AddrError::Malformed)?;
                 let len = len as usize;
@@ -108,7 +108,7 @@ impl ProxyAddr {
                     return Err(AddrError::Malformed);
                 }
                 (Host::Domain(name.to_owned()), &rest[len..])
-            }
+            },
             _ => return Err(AddrError::Malformed),
         };
         let port = after.first_chunk::<2>().ok_or(AddrError::Malformed)?;

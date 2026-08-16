@@ -1,6 +1,6 @@
 [package]
 name         = "openppp3-client"
-description  = "openppp3 anti-censorship proxy client (mixed SOCKS5/HTTP inbound)"
+description  = "openppp3 anti-censorship proxy client (socks5 -> tunnel forwarder)"
 readme       = "../../README.md"
 keywords     = ["proxy", "anti-censorship", "network", "openppp2"]
 categories   = ["network-programming"]
@@ -11,20 +11,11 @@ rust-version.workspace = true
 license.workspace      = true
 repository.workspace   = true
 
-[features]
-default = ["system-proxy"]
-# Desktop system-proxy integration (Windows registry / macOS / Linux DE).
-system-proxy = ["dep:sysproxy", "dep:ctrlc"]
-
 [dependencies]
-openppp3-core   = { workspace = true }
-openppp3-common = { workspace = true }
-anyhow          = { workspace = true }
-clap            = { workspace = true }
-tracing         = { workspace = true }
-tracing-subscriber = { workspace = true }
-sysproxy        = { workspace = true, optional = true }
-ctrlc           = { workspace = true, optional = true }
+openppp3-core      = { workspace = true }
+openppp3-common    = { workspace = true }
+anyhow             = { workspace = true }
+tracing            = { workspace = true }
 
 [dev-dependencies]
 openppp3-server = { workspace = true }

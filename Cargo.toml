@@ -23,14 +23,12 @@ thiserror = "2"
 # app crates
 anyhow            = "1"
 clap              = { version = "4", features = ["derive"] }
-ctrlc             = "3"
-ipnet             = "2"
 json5             = "0.4"
 openppp3-core     = { path = "crates/core" }
 openppp3-common   = { path = "crates/common" }
 openppp3-server   = { path = "crates/server" }
+openppp3-client   = { path = "crates/client" }
 serde             = { version = "1", features = ["derive"] }
-sysproxy          = "0.3"
 tracing           = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

@@ -13,7 +13,7 @@ use std::{
 };
 
 use anyhow::Context;
-use openppp3_common::{addr::ProxyAddr, config::ServerConfig, pump, proto};
+use openppp3_common::{addr::ProxyAddr, config::ServerConfig, proto, pump};
 use openppp3_core::{ObfuscationKey, Transmission};
 use rand::RngCore;
 use tracing::{debug, info, warn};
@@ -66,7 +66,8 @@ pub fn serve(listener: TcpListener, rt: ServerRuntime) -> anyhow::Result<()> {
         match stream {
             Ok(stream) => {
                 let rt = rt.clone();
-                let mut sid = base.wrapping_add(u128::from(counter.fetch_add(1, Ordering::Relaxed)));
+                let mut sid =
+                    base.wrapping_add(u128::from(counter.fetch_add(1, Ordering::Relaxed)));
                 if sid == 0 {
                     sid = 1;
                 }
@@ -80,7 +81,7 @@ pub fn serve(listener: TcpListener, rt: ServerRuntime) -> anyhow::Result<()> {
                 if let Err(e) = spawned {
                     warn!("spawn failed: {e}");
                 }
-            }
+            },
             Err(e) => warn!("accept failed: {e}"),
         }
     }
@@ -95,8 +96,7 @@ fn handle_conn(stream: TcpStream, rt: ServerRuntime, sid: u128) -> anyhow::Resul
     let rx_io = stream.try_clone().context("clone stream")?;
 
     let mut tx = Transmission::new(stream, rt.key);
-    tx.handshake_server(sid, false)
-        .context("handshake")?;
+    tx.handshake_server(sid, false).context("handshake")?;
 
     let req = tx.read().context("read request")?;
     let addr = ProxyAddr::decode(&req).context("decode request")?;
@@ -116,11 +116,14 @@ fn handle_conn(stream: TcpStream, rt: ServerRuntime, sid: u128) -> anyhow::Resul
             let (up, down) = pump::pump_tunnel(txh, rxh, target);
             debug!("session {sid:016x} closed (up {up}, down {down})");
             Ok(())
-        }
+        },
         Err(e) => {
-            info!("session {sid:016x} connect to {} failed: {e}", addr.host.to_display());
+            info!(
+                "session {sid:016x} connect to {} failed: {e}",
+                addr.host.to_display()
+            );
             let _ = tx.write(&[proto::STATUS_REFUSED]);
             Ok(())
-        }
+        },
     }
 }

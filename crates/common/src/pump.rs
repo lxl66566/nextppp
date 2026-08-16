@@ -1,11 +1,8 @@
 //! Bidirectional connection pumps for the synchronous two-thread model.
 //!
-//! Two shapes exist:
-//!
-//! * [`pump_tcp`]: two plain TCP streams (direct connections);
-//! * [`pump_tunnel`]: a local TCP peer against a split openppp3 tunnel,
-//!   wrapping data in `FRAME_DATA` frames and propagating half-closes as
-//!   `FRAME_EOF` (the openppp3 framing itself has no in-band EOF).
+//! The single shape: a local TCP peer against a split openppp3 tunnel,
+//! wrapping data in `FRAME_DATA` frames and propagating half-closes as
+//! `FRAME_EOF` (the openppp3 framing itself has no in-band EOF).
 
 use std::{
     io::{self, ErrorKind, Read, Write},
@@ -16,7 +13,7 @@ use std::{
 
 use openppp3_core::{TransmissionRx, TransmissionTx};
 
-use crate::{addr::Host, FRAME_DATA, FRAME_EOF};
+use crate::{FRAME_DATA, FRAME_EOF, addr::Host};
 
 /// Read chunk size: small enough for interactive latency, large enough to
 /// amortize per-frame crypto/header overhead.
@@ -46,43 +43,8 @@ pub fn tcp_connect(host: &Host, port: u16, timeout: Duration) -> io::Result<TcpS
                 }
             }
             Err(last)
-        }
+        },
     }
-}
-
-/// Copies one direction until EOF or error, then shuts down the destination
-/// write side so the half-close propagates.
-fn copy_tcp<R: Read>(mut r: R, mut w: TcpStream) -> u64 {
-    let mut buf = vec![0u8; CHUNK];
-    let mut total = 0u64;
-    loop {
-        match r.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                if w.write_all(&buf[..n]).is_err() {
-                    break;
-                }
-                total += n as u64;
-            }
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(_) => break,
-        }
-    }
-    let _ = w.shutdown(Shutdown::Write);
-    total
-}
-
-/// Pumps two plain TCP streams in both directions. Returns `(a→b, b→a)`
-/// byte counts. Both directions are shut down once they finish.
-#[must_use = "byte counts feed connection logs"]
-pub fn pump_tcp(a: TcpStream, b: TcpStream) -> (u64, u64) {
-    let a_w = a.try_clone().expect("tcp stream clone");
-    let b_w = b.try_clone().expect("tcp stream clone");
-    thread::scope(|s| {
-        let up = s.spawn(move || copy_tcp(a, b_w));
-        let down = s.spawn(move || copy_tcp(b, a_w));
-        (up.join().unwrap_or(0), down.join().unwrap_or(0))
-    })
 }
 
 /// Local -> tunnel direction: wraps chunks in `FRAME_DATA`, emits `FRAME_EOF`
@@ -96,7 +58,7 @@ fn tunnel_up(mut tx: TransmissionTx<TcpStream>, mut local: TcpStream) -> u64 {
             Ok(0) => {
                 let _ = tx.write(&[FRAME_EOF]);
                 break;
-            }
+            },
             Ok(n) => {
                 frame.clear();
                 frame.push(FRAME_DATA);
@@ -105,8 +67,8 @@ fn tunnel_up(mut tx: TransmissionTx<TcpStream>, mut local: TcpStream) -> u64 {
                     break;
                 }
                 total += n as u64;
-            }
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            },
+            Err(e) if e.kind() == ErrorKind::Interrupted => {},
             Err(_) => break,
         }
     }
@@ -129,14 +91,14 @@ fn tunnel_down(mut rx: TransmissionRx<TcpStream>, mut local: TcpStream) -> u64 {
                             break;
                         }
                         total += payload.len() as u64;
-                    }
+                    },
                     FRAME_EOF => {
                         let _ = local.shutdown(Shutdown::Write);
                         break;
-                    }
+                    },
                     _ => break, // unknown frame kind: protocol violation
                 }
-            }
+            },
             Err(e) if e.is_eof() => break,
             Err(_) => break,
         }

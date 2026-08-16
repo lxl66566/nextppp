@@ -10,8 +10,6 @@ use openppp3_core::{Method, ObfuscationKey};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::rule::Policy;
-
 /// Errors while loading or validating a configuration file.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -105,8 +103,12 @@ impl Default for ObfuscationConfig {
 
 impl ObfuscationConfig {
     fn method(name: &str) -> Result<Method, String> {
-        Method::from_name(name)
-            .ok_or_else(|| format!("unknown cipher method {name:?} (supported: aes-128-cfb, aes-256-cfb, aes-128-ctr, aes-256-ctr, chacha20-ietf)"))
+        Method::from_name(name).ok_or_else(|| {
+            format!(
+                "unknown cipher method {name:?} (supported: aes-128-cfb, aes-256-cfb, \
+                 aes-128-ctr, aes-256-ctr, chacha20-ietf)"
+            )
+        })
     }
 
     /// Validates and converts into the core [`ObfuscationKey`].
@@ -150,22 +152,17 @@ pub struct ServerConfig {
 }
 
 /// Client configuration (`openppp3-client.jsonc`).
+///
+/// Intentionally minimal: the client is a plain SOCKS5-to-tunnel forwarder;
+/// all routing (direct/block/geosite/...) belongs to the front-end proxy
+/// (e.g. sing-box) that points its socks outbound at `listen`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
-    /// Local mixed-protocol (SOCKS5 + HTTP) inbound listen address.
+    /// Local SOCKS5 inbound listen address.
     pub listen: String,
     /// Remote server section.
     pub server: ServerSection,
-    /// Ordered routing rules, first match wins.
-    #[serde(default)]
-    pub rules: Vec<String>,
-    /// Fallback policy when no rule matches (default `proxy`).
-    #[serde(default = "default_final_policy")]
-    pub r#final: Policy,
-    /// System proxy integration.
-    #[serde(default)]
-    pub system_proxy: SystemProxyConfig,
 }
 
 /// Remote server section of the client configuration.
@@ -182,28 +179,12 @@ pub struct ServerSection {
     pub obfuscation: ObfuscationConfig,
 }
 
-/// System-proxy integration section.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SystemProxyConfig {
-    /// Install the system proxy while the client runs.
-    #[serde(default)]
-    pub enable: bool,
-    /// Proxy bypass list. Empty means a sane built-in default.
-    #[serde(default)]
-    pub bypass: Vec<String>,
-}
-
 fn default_connect_timeout() -> u64 {
     10
 }
 
 fn default_handshake_timeout() -> u64 {
     15
-}
-
-fn default_final_policy() -> Policy {
-    Policy::Proxy
 }
 
 /// Loads and validates a jsonc configuration file.
@@ -295,17 +276,14 @@ mod tests {
     #[test]
     fn client_config_parses_with_comments_and_defaults() {
         let text = r#"{
-            // local mixed inbound
+            // local socks5 inbound
             "listen": "127.0.0.1:1080",
             "server": { "address": "example.com:6666" },
-            "rules": ["domain-suffix:cn,direct"],
         }"#;
         let cfg: ClientConfig = json5::from_str(text).unwrap();
         assert_eq!(cfg.listen, "127.0.0.1:1080");
         assert_eq!(cfg.server.address, "example.com:6666");
         assert_eq!(cfg.server.connect_timeout, 10);
-        assert_eq!(cfg.r#final, Policy::Proxy);
-        assert!(!cfg.system_proxy.enable);
     }
 
     #[test]

@@ -562,10 +562,9 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
     /// the classic two-thread bidirectional pump model:
     ///
     /// * `TransmissionTx` keeps `self.io` as its **write** side;
-    /// * `TransmissionRx` uses `rx_io` as its **read** side — the caller must
-    ///   pass a handle aliasing the *same* connection (e.g.
-    ///   `TcpStream::try_clone`), which must happen **before** the split
-    ///   while the original stream is still owned by the caller.
+    /// * `TransmissionRx` uses `rx_io` as its **read** side — the caller must pass a handle
+    ///   aliasing the *same* connection (e.g. `TcpStream::try_clone`), which must happen **before**
+    ///   the split while the original stream is still owned by the caller.
     ///
     /// Per-direction cipher nonces and base94 first-frame states are already
     /// tracked independently inside `Transmission`, so the halves stay

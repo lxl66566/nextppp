@@ -24,9 +24,8 @@ temperature: 0
 1. openppp2 使用自研协议，且该协议 bypass GFW 能力已经过广泛验证。你实现的协议**不需要与原版兼容**，但是为了 bypass GFW 而进行的特殊设计需要保留。目前已经实现完成，详见 `crates/core/README.md`。
 2. 原版 openppp2 是工作在虚拟网卡上的 VPN，而本次重写目标是做一个代理工具而非 VPN，不涉及网卡等底层内容。
 3. 命令行等用户交互层的内容，完全重写，不需要考虑 openppp2 原版的实现。
-4. 对于 client 用户交互，使用 jsonc 配置文件，并且允许配置 direct/proxy/blocking 规则（可以暂时先不支持 geosite/geoip 等 source），Windows 上支持设置系统代理，且支持设置系统代理排除。
-   - 低优先级：支持从 sing-box 配置生成 openppp3-rs 配置。
-   - 低优先级：使用 https://github.com/jkshfanfbun/geosite-rs 以支持 geosite 格式规则
+4. client 定位为纯粹的"本地 SOCKS5 -> openppp3 隧道"转发器：不内置规则引擎、HTTP 入站、direct/block、系统代理设置（已删）。分流（规则 / geosite / geoip / 系统代理）交给 sing-box 等成熟前端，把 openppp3 的 socks5 入站作为其 outbound 使用。
+5. server 与 client 构建为同一个 binary（`openppp3`，clap 子命令区分角色）：协议核心本就共享，单 artifact 便于分发且两端版本不会漂移。角色逻辑保留在 `crates/{server,client}` lib crate 中（e2e 测试依赖），`crates/openppp3` 只是 CLI 胶水层。
 
 其他规范：
 
