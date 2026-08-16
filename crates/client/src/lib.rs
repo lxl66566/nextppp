@@ -55,7 +55,7 @@ impl ClientRuntime {
 ///
 /// # Errors
 ///
-/// Missing port / non-numeric port.
+/// Missing port / non-numeric port / malformed or unbracketed IPv6.
 pub fn parse_host_port(s: &str) -> anyhow::Result<(Host, u16)> {
     if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
         return Ok((Host::Ip(sa.ip()), sa.port()));
@@ -64,7 +64,19 @@ pub fn parse_host_port(s: &str) -> anyhow::Result<(Host, u16)> {
         .rsplit_once(':')
         .with_context(|| format!("missing port in {s:?}"))?;
     let port: u16 = port.parse().with_context(|| format!("bad port {port:?}"))?;
-    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let host = if let Some(inner) = host.strip_prefix('[') {
+        inner
+            .strip_suffix(']')
+            .with_context(|| format!("unmatched '[' in {s:?}"))?
+    } else {
+        // An unbracketed remainder that still contains ':' is a bare IPv6
+        // address; parsing it as a domain would only fail later at DNS time
+        // with an opaque error.
+        if host.contains(':') {
+            anyhow::bail!("bare IPv6 address {s:?} must use the [addr]:port form");
+        }
+        host
+    };
     if host.is_empty() {
         anyhow::bail!("empty host in {s:?}");
     }
@@ -102,4 +114,36 @@ pub fn serve(listener: TcpListener, rt: Arc<ClientRuntime>) -> anyhow::Result<()
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_host_port_forms() {
+        let (Host::Ip(ip), 80) = parse_host_port("1.2.3.4:80").unwrap() else {
+            panic!("v4 literal")
+        };
+        assert_eq!(ip.to_string(), "1.2.3.4");
+        let (Host::Ip(ip), 443) = parse_host_port("[2001:db8::1]:443").unwrap() else {
+            panic!("bracketed v6")
+        };
+        assert_eq!(ip.to_string(), "2001:db8::1");
+        let (Host::Domain(d), 8080) = parse_host_port("Example.COM:8080").unwrap() else {
+            panic!("domain")
+        };
+        assert_eq!(d, "example.com");
+    }
+
+    #[test]
+    fn parse_host_port_rejects_bad_forms() {
+        // Bare IPv6 used to parse as the garbage domain "2001:db8:" + port 1.
+        assert!(parse_host_port("2001:db8::1").is_err());
+        assert!(parse_host_port("2001:db8::1:8080").is_err());
+        assert!(parse_host_port("[2001:db8::1").is_err());
+        assert!(parse_host_port("example.com").is_err());
+        assert!(parse_host_port("example.com:http").is_err());
+        assert!(parse_host_port(":80").is_err());
+    }
 }
