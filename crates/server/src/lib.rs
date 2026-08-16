@@ -174,6 +174,7 @@ fn handle_conn(stream: TcpStream, rt: &ServerRuntime, sid: u128, stats: &ServerS
 }
 
 /// Connection body; every failure point logs at its proper level already.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn handle_conn_inner(
     stream: TcpStream,
     rt: &ServerRuntime,

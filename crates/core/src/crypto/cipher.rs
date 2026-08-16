@@ -209,6 +209,7 @@ impl SessionCipher {
 
     /// Encrypts (or decrypts, for a `for_decryption` instance) `data` in
     /// place, consuming one nonce. Length never changes.
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "SessionCipher"))]
     pub fn apply(&mut self, data: &mut [u8]) {
         let nonce = self.next_nonce();
         let Self {

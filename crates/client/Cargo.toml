@@ -13,13 +13,37 @@ license.workspace      = true
 
 [dependencies]
 anyhow          = { workspace = true }
+hotpath         = { workspace = true, optional = true }
 openppp3-common = { workspace = true }
 openppp3-core   = { workspace = true }
 spdlog-rs       = { workspace = true }
 
 [dev-dependencies]
+hotpath         = { workspace = true }
 openppp3-server = { workspace = true }
 libc            = { workspace = true }
+
+[features]
+# Profiling instrumentation; see openppp3-core's feature docs. The dev-dep
+# passthrough keeps the in-process e2e/throughput tests profiled end to end.
+hotpath = [
+    "dep:hotpath",
+    "hotpath/hotpath",
+    "openppp3-common/hotpath",
+    "openppp3-server/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "openppp3-common/hotpath-alloc",
+    "openppp3-server/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "openppp3-common/hotpath-cpu",
+    "openppp3-server/hotpath-cpu",
+]
 
 [lints]
 workspace = true

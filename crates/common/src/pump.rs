@@ -90,6 +90,10 @@ pub fn tcp_connect(host: &Host, port: u16, timeout: Duration) -> io::Result<TcpS
 
 /// Local -> tunnel direction: wraps chunks in `FRAME_DATA`, emits `FRAME_EOF`
 /// on local half-close. Dropping `tx` afterwards sends the TCP FIN.
+// Function-level measurement spans the whole connection lifetime (mostly
+// local-read wait); subtracting the nested `tx.write` time yields the local
+// I/O share.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn tunnel_up(mut tx: TransmissionTx<TcpStream>, mut local: TcpStream) -> (u64, PumpEnd) {
     let mut buf = vec![0u8; CHUNK];
     let mut frame = Vec::with_capacity(CHUNK + 1);
@@ -117,10 +121,11 @@ fn tunnel_up(mut tx: TransmissionTx<TcpStream>, mut local: TcpStream) -> (u64, P
 
 /// Tunnel -> local direction: unwraps `FRAME_DATA`, forwards `FRAME_EOF` as
 /// a local write-side shutdown.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn tunnel_down(mut rx: TransmissionRx<TcpStream>, mut local: TcpStream) -> (u64, PumpEnd) {
     let mut total = 0u64;
     loop {
-        match rx.read() {
+        match rx.read_buf() {
             Ok(msg) => {
                 let Some((&tag, payload)) = msg.split_first() else {
                     continue; // zero-payload data frame: harmless no-op

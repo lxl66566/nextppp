@@ -14,10 +14,23 @@ license.workspace      = true
 [dependencies]
 anyhow          = { workspace = true }
 clap            = { workspace = true }
+hotpath         = { workspace = true, optional = true }
 openppp3-client = { workspace = true }
 openppp3-common = { workspace = true }
 openppp3-server = { workspace = true }
 spdlog-rs       = { workspace = true }
+
+[features]
+# Profiling instrumentation; see openppp3-core's feature docs. With the
+# feature on, a localhost metrics server (port 6770) also comes up for the
+# hotpath TUI while the process runs.
+hotpath       = ["dep:hotpath", "hotpath/hotpath", "openppp3-client/hotpath"]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "openppp3-client/hotpath-alloc",
+]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "openppp3-client/hotpath-cpu"]
 
 [lints]
 workspace = true

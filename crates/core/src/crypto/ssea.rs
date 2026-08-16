@@ -8,11 +8,15 @@
 //! Performance notes (wire output unchanged):
 //! * shuffle/unshuffle replace the hardware `%` (~20+ cycle `div` inside a serial swap chain) with
 //!   Lemire's two-multiply fastmod.
-//! * `lcg_next` computes the three LCG steps with a 2-multiply dependency depth instead of 3
-//!   chained multiplies (next2/next3 both derive from next1), which matters because masked-XOR is
-//!   bound by the LCG chain.
-//! * base94 encode/decode are branchless: escape decisions become cmovs, validation runs as one
-//!   SIMD bulk pass plus cold error branches.
+//! * `lcg_next` computes the three LCG steps as three independent affine maps of the seed (chain
+//!   depth 1), which matters because masked-XOR feeds each 31-bit mix output back as the next seed
+//!   — that nonlinear feedback also rules out any closed-form jump-ahead (leapfrog).
+//! * base94 encode/decode run SIMD fast paths over 16-byte blocks (see `crypto::simd`): the decoder
+//!   solves the leader/follower alternation and escape reconstruction in-register and compacts
+//!   leaders via a pshufb LUT (~3x over scalar); the encoder precomputes interleaved
+//!   leader/follower pairs and deletes non-escape followers through the same LUT (~2.5x). Invalid
+//!   input and sub-block tails fall back to the scalar reference loop, so error semantics stay
+//!   bit-exact (pinned by fuzz + golden vectors).
 
 // Intentional truncating/wrapping casts below mirror the C++ `Byte(int)`
 // conversions: the protocol relies on low-byte / modulo-256 semantics.
@@ -39,18 +43,25 @@ const LCG_C: u32 = 12_345;
 /// Two-step jump for the restructured `lcg_next`: next3 = next1*A^2 + C*(A+1).
 const LCG_A2: u32 = LCG_A.wrapping_mul(LCG_A);
 const LCG_C2: u32 = LCG_C.wrapping_mul(LCG_A.wrapping_add(1));
+/// Three-step affine map, all in one multiply from the seed: next3 = seed*A^3 + C3.
+const LCG_A3: u32 = LCG_A2.wrapping_mul(LCG_A);
+const LCG_C3: u32 = LCG_C
+    .wrapping_mul(LCG_A2)
+    .wrapping_add(LCG_C.wrapping_mul(LCG_A))
+    .wrapping_add(LCG_C);
 
 /// Advances the 31-bit LCG seed and returns a 31-bit value
 /// (ssea.cpp `random_next`).
 ///
-/// Algebraically identical to three chained `x*A+C` steps: steps 2 and 3 are
-/// both affine in next1, so they evaluate in parallel. This halves the
-/// multiply-chain depth (3 -> 2), the critical path of masked-XOR.
+/// Algebraically identical to three chained `x*A+C` steps; each step is an
+/// affine map of the seed, so all three evaluate as independent multiplies
+/// (chain depth 1). This shortens the critical path of masked-XOR, which
+/// feeds each output back as the next seed (strictly serial).
 #[must_use]
 pub fn lcg_next(seed: &mut u32) -> u32 {
     let next1 = seed.wrapping_mul(LCG_A).wrapping_add(LCG_C);
-    let next2 = next1.wrapping_mul(LCG_A).wrapping_add(LCG_C);
-    let next3 = next1.wrapping_mul(LCG_A2).wrapping_add(LCG_C2);
+    let next2 = seed.wrapping_mul(LCG_A2).wrapping_add(LCG_C2);
+    let next3 = seed.wrapping_mul(LCG_A3).wrapping_add(LCG_C3);
     *seed = next3;
     (((next1 >> 16) & 2047) << 20) | (((next2 >> 16) & 1023) << 10) | ((next3 >> 16) & 1023)
 }
@@ -82,6 +93,7 @@ fn fast_mod(x: u32, magic: u64, d: u32) -> u32 {
 /// not a cryptographic permutation but effective against naive DPI pattern
 /// matching at negligible cost. (Note: for size <= 2 the chain degenerates to
 /// the identity permutation, exactly like the C++ original.)
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn shuffle(data: &mut [u8], key: u32) {
     let size = data.len();
     if size < 2 {
@@ -98,6 +110,7 @@ pub fn shuffle(data: &mut [u8], key: u32) {
 }
 
 /// Exact inverse of [`shuffle`], running the swap chain backwards.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn unshuffle(data: &mut [u8], key: u32) {
     let size = data.len();
     if size < 2 {
@@ -131,6 +144,14 @@ pub fn delta_decode(data: &mut [u8], kf: u32) {
 ///
 /// Self-inverse for a fixed initial key. Chunks are processed little-endian;
 /// the final odd byte is masked with the low byte of the current key.
+///
+/// Perf note: the chain runs on the 31-bit *return values* (`kf = lcg_next(kf)`),
+/// not on the internal LCG states — the nonlinear mix output is the next seed,
+/// so the recurrence admits no closed-form jump-ahead (a stride-4 leapfrog
+/// attempt changes the keystream and breaks the golden vectors). Each word's
+/// multiplies are independent (see [`lcg_next`]); the serial mix+mul chain
+/// bounds this primitive.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn masked_xor_random_next(data: &mut [u8], kf: u32) {
     let mut kf = lcg_next(&mut { kf });
     let mut chunks = data.chunks_exact_mut(4);
@@ -160,6 +181,7 @@ pub fn masked_xor_random_next(data: &mut [u8], kf: u32) {
 /// written (garbage when unused, overwritten by the next leader), and the
 /// write cursor advances by `1 + escape` — no mispredicted branches on the
 /// ~50/50 escape mix.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn base94_encode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) {
     // 8-wide unroll: the output offsets form a short serial prefix chain
     // (7 adds amortized over 8 bytes) while the 16 leader/follower stores
@@ -170,12 +192,16 @@ pub fn base94_encode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) {
     let kf8 = kf as u8;
     let total = src.len() + simd::count_sub_ge(src, kf8, BASE93_RADIX);
     let start = out.len();
-    // +1 slack: the follower store may land one past the final length when
-    // the last byte is single-char; set_len below erases it.
-    out.reserve(total + 1);
+    // +16 slack: the SIMD kernel's per-quarter compaction stores are
+    // 8-byte writes whose padding past the count is only overwritten by
+    // *later* quarters/blocks; the final store may overrun the logical
+    // length by up to 8 bytes. set_len below erases the padding.
+    out.reserve(total + 16);
     let dst = out.as_mut_ptr();
     let mut p = start;
-    let mut idx = 0usize;
+    // SIMD fast path over whole 16-byte blocks first.
+    let simd_consumed = simd::base94_encode_simd(dst, &mut p, src, kf8);
+    let mut idx = simd_consumed;
     while idx + UNROLL <= src.len() {
         let chunk: [u8; UNROLL] = src[idx..idx + UNROLL].try_into().expect("fixed size");
         let mut offs = [0usize; UNROLL];
@@ -242,9 +268,11 @@ pub fn base94_encoded_len(src: &[u8], kf: u32) -> usize {
 /// Decodes base94 text (see [`base94_encode_into`]) and appends the bytes to
 /// `out`. On invalid input `out` is left unchanged and an error is returned.
 ///
-/// A SIMD bulk pass proves `>= 0x20` for every char up front; the hot loop
-/// then only checks the (data-dependent but almost-never-taken) escape
-/// validation branch.
+/// A SIMD bulk pass proves `>= 0x20` for every char up front and a vectorized
+/// kernel decodes whole 16-char blocks (leader/follower pairing, escape
+/// reconstruction and leader compaction in-register). Invalid constructs fall
+/// back to the scalar reference loop, which reports the exact wire-legal
+/// error; both paths are bit-exact (pinned by the fuzz test below).
 pub fn base94_decode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) -> Result<()> {
     if !simd::all_ge(src, 0x20) {
         return Err(Error::InvalidBase94);
@@ -252,11 +280,19 @@ pub fn base94_decode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) -> Result<()> 
     let kf8 = kf as u8;
     let kf16 = u16::from(kf8);
     let start = out.len();
-    out.reserve(src.len());
+    // +16 slack for the SIMD kernel's fixed 8-byte compact stores (see
+    // base94_encode_into); the final set_len erases the padding.
+    out.reserve(src.len() + 16);
     let dst = out.as_mut_ptr();
-    let mut i = 0usize;
+    let mut i;
     let mut p = start;
     let n = src.len();
+    // SIMD fast path over whole 16-char blocks. `Ok` leaves the sub-block
+    // tail; `Err` hands back the last valid prefix. Either way the scalar
+    // reference loop resumes exactly where the kernel stopped.
+    match simd::base94_decode_simd(dst, &mut p, src, kf8) {
+        Ok((consumed, _)) | Err((consumed, _)) => i = consumed,
+    }
     // Main loop: every position still has a potential follower char. The
     // escape validation folds into ONE branch on a value that is zero for
     // all valid input — branching on `esc` itself would mispredict on the
@@ -483,7 +519,7 @@ mod tests {
             let original: Vec<u8> = (0..len).map(|i| (i * 91 % 253) as u8).collect();
             let mut data = original.clone();
             masked_xor_random_next(&mut data, key);
-            assert_ne!(data, original, "len {len}");
+            assert_ne!(&data, &original, "len {len}");
             masked_xor_random_next(&mut data, key);
             assert_eq!(data, original, "len {len}");
         }
@@ -631,7 +667,9 @@ mod tests {
         // Bias the alphabet toward the tricky boundary range 0x7B..=0x7F so
         // the adjacent-escape fallback and leader/follower boundaries get
         // hammered; mix in ordinary printable chars and invalid bytes.
-        for len in 0..200usize {
+        for len in [
+            0usize, 1, 15, 16, 17, 31, 33, 64, 100, 199, 200, 201, 255, 256, 257, 513,
+        ] {
             for _ in 0..40 {
                 let input: Vec<u8> = (0..len)
                     .map(|_| {

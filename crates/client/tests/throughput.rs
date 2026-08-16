@@ -13,6 +13,10 @@
 //! ```
 //!
 //! Override the transfer size with `OPENPPP3_THROUGHPUT_BYTES`.
+//!
+//! With `--features hotpath` the whole in-process stack (server + client +
+//! pumps) is hotpath-instrumented and the report prints on exit; combine
+//! with `hotpath-alloc` for allocation stats.
 
 #![cfg(target_os = "linux")]
 #![allow(unsafe_code)] // sched_setaffinity(2) FFI is the whole point here
@@ -230,6 +234,11 @@ fn total_bytes() -> usize {
 #[test]
 #[ignore = "slow 256 MiB single-core benchmark; run manually in release mode"]
 fn single_core_throughput() {
+    // Test harness has no main we control: build the profiler guard
+    // programmatically (noop without the hotpath feature).
+    #[cfg(feature = "hotpath")]
+    let _hotpath = hotpath::HotpathGuardBuilder::new("throughput").build();
+
     let cores = allowed_cores();
     if cores.len() < 2 {
         eprintln!("throughput test skipped: fewer than 2 CPUs available");

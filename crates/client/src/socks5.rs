@@ -80,6 +80,7 @@ fn is_routine_io(e: &std::io::Error) -> bool {
 
 /// Negotiation + CONNECT + tunnel forwarding. Failure points log at their
 /// proper levels before returning the error for the routine/fault split.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn negotiate_and_forward(
     mut stream: TcpStream,
     rt: &Arc<ClientRuntime>,

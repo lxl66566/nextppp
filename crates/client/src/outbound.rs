@@ -22,6 +22,7 @@ pub type Tunnel = (
 /// # Errors
 ///
 /// Connect / handshake / remote-refused failure.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn tunnel_connect(addr: &ProxyAddr, rt: &ClientRuntime) -> anyhow::Result<Tunnel> {
     let started = std::time::Instant::now();
     let (host, port) = crate::parse_host_port(&rt.server_address)?;

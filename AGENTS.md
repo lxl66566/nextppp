@@ -30,8 +30,9 @@ temperature: 0
 其他规范：
 
 1. 性能优先，关键路径需要 simd。
-2. Rust 实现也必须跨 Windows/Linux/Macos 多平台。
+2. 代理实现必须跨 Windows/Linux/Macos 多平台。
 
 crate 偏好：
 
 - 使用 spdlog-rs 打日志
+- 使用 hotpath 库进行可观测的插桩性能测试，一次编写永久受益。关键路径植入 `#[cfg_attr(feature = "hotpath", hotpath::measure)]`（同步/异步函数均可用）。打印结果为人类可读的表格。

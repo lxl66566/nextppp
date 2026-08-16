@@ -662,7 +662,10 @@ split_with(rx_io) -> (TransmissionTx, TransmissionRx)
 - **传输无关**：`Transmission<T>` 泛型化，流式与内存双路径共用同一套编解码状态机。
 - **`split_with`**：拆成 `TransmissionTx` / `TransmissionRx` 两个半双工，支持经典双线程泵模型；
   每方向 nonce 与 base94 首帧状态独立，与未拆分对端线上兼容。
-- **零分配热路径**：复用 scratch 缓冲区，避免每包分配。
+- **零分配热路径**：复用 scratch 缓冲区，避免每包分配（`read_buf`/`read_frame_into` 借用式 API）。
+- **SIMD base94**：编解码 16 字节块走 SIMD 快路径（leader/follower 交替求解 + pshufb LUT 压缩），
+  非法输入与尾部回退标量参考路径，错误语义逐位一致（fuzz + golden vectors 锚定）；x86_64 约 3×/2.6×。
+- **可观测性**：`hotpath` feature（默认关闭、Windows 构建零开销）对关键路径打点输出计时报告。
 
 ### 10.4 保留的抗封锁设计（未改动）
 

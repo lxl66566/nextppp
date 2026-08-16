@@ -23,9 +23,19 @@ name    = "pipeline"
 aes       = { workspace = true }
 chacha20  = { workspace = true }
 hkdf      = { workspace = true }
+hotpath   = { workspace = true, optional = true }
 rand      = { workspace = true }
 sha2      = { workspace = true }
 thiserror = { workspace = true }
+
+[features]
+# Profiling instrumentation (linux dev tooling; noop and zero-cost when off,
+# so Windows/default builds never pull the profiler in).
+hotpath       = ["dep:hotpath", "hotpath/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+# Sampling CPU attribution via samply (linux/macos only; needs a debug-info
+# profile and the external samply/hotpath-samply binaries at runtime).
+hotpath-cpu   = ["hotpath", "hotpath/hotpath-cpu"]
 
 [dev-dependencies]
 cfb-mode  = { workspace = true }

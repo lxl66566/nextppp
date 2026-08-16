@@ -13,10 +13,17 @@ license.workspace      = true
 
 [dependencies]
 anyhow          = { workspace = true }
+hotpath         = { workspace = true, optional = true }
 openppp3-common = { workspace = true }
 openppp3-core   = { workspace = true }
 rand            = { workspace = true }
 spdlog-rs       = { workspace = true }
+
+[features]
+# Profiling instrumentation; see openppp3-core's feature docs.
+hotpath       = ["dep:hotpath", "hotpath/hotpath", "openppp3-common/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "openppp3-common/hotpath-alloc"]
+hotpath-cpu   = ["hotpath", "hotpath/hotpath-cpu", "openppp3-common/hotpath-cpu"]
 
 [lints]
 workspace = true

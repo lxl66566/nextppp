@@ -12,11 +12,18 @@ repository.workspace   = true
 license.workspace      = true
 
 [dependencies]
+hotpath       = { workspace = true, optional = true }
 json5         = { workspace = true }
 openppp3-core = { workspace = true }
 serde         = { workspace = true }
 spdlog-rs     = { workspace = true }
 thiserror     = { workspace = true }
+
+[features]
+# Profiling instrumentation; see openppp3-core's feature docs.
+hotpath       = ["dep:hotpath", "hotpath/hotpath", "openppp3-core/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "openppp3-core/hotpath-alloc"]
+hotpath-cpu   = ["hotpath", "hotpath/hotpath-cpu", "openppp3-core/hotpath-cpu"]
 
 [lints]
 workspace = true

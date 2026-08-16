@@ -46,6 +46,19 @@ use crate::{
     },
 };
 
+/// Data-plane flags; pre-handshake everything is forced on ("safest").
+fn effective_flags(key: &ObfuscationKey, handshaked: bool) -> PayloadFlags {
+    if handshaked {
+        PayloadFlags {
+            masked: key.masked,
+            shuffle: key.shuffle_data,
+            delta: key.delta_encode,
+        }
+    } else {
+        PayloadFlags::SAFEST
+    }
+}
+
 /// A framed, encrypted, optionally base94-wrapped connection over any
 /// duplex byte transport.
 ///
@@ -66,11 +79,12 @@ pub struct Transmission<T, R = StdRng> {
     session_id: SessionId,
     /// Scratch buffers reused across packets to avoid per-write allocation:
     /// `a` holds the wire output of `write`, `b` the intermediate binary
-    /// packet on base94 paths, `read` the encoded frame bytes on streaming
-    /// reads.
+    /// packet on base94 paths, `read` the encoded frame bytes and `body` the
+    /// decoded plaintext on streaming reads.
     scratch_a: Vec<u8>,
     scratch_b: Vec<u8>,
     scratch_read: Vec<u8>,
+    scratch_body: Vec<u8>,
 }
 
 impl<T> Transmission<T, StdRng> {
@@ -113,6 +127,7 @@ impl<T, R: Rng> Transmission<T, R> {
             scratch_a: Vec::new(),
             scratch_b: Vec::new(),
             scratch_read: Vec::new(),
+            scratch_body: Vec::new(),
         }
     }
 
@@ -145,6 +160,7 @@ impl<T, R: Rng> Transmission<T, R> {
 
     /// Encrypts `plaintext` into a complete wire packet appended to `out`
     /// (in-memory path, e.g. for datagram/mux transports).
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "Transmission"))]
     pub fn encrypt_into(&mut self, out: &mut Vec<u8>, plaintext: &[u8]) -> Result<()> {
         if plaintext.is_empty() {
             return Err(Error::ZeroLength);
@@ -218,6 +234,7 @@ impl<T, R: Rng> Transmission<T, R> {
         Ok(body)
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "Transmission"))]
     fn decrypt_body(&mut self, header_kf: u32, body: &mut [u8]) {
         let flags = self.effective_flags();
         payload_deobfuscate(body, &flags, header_kf, self.key.kf);
@@ -226,15 +243,7 @@ impl<T, R: Rng> Transmission<T, R> {
 
     /// Data-plane flags; pre-handshake everything is forced on ("safest").
     fn effective_flags(&self) -> PayloadFlags {
-        if self.handshaked {
-            PayloadFlags {
-                masked: self.key.masked,
-                shuffle: self.key.shuffle_data,
-                delta: self.key.delta_encode,
-            }
-        } else {
-            PayloadFlags::SAFEST
-        }
+        effective_flags(&self.key, self.handshaked)
     }
 
     /// Rebuilds all four cipher instances with per-connection key material.
@@ -271,6 +280,7 @@ impl<T, R: Rng> Transmission<T, R> {
 /// Streaming data plane and handshake: requires a duplex byte transport.
 impl<T: Read + Write, R: Rng> Transmission<T, R> {
     /// Writes one encrypted message.
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "Transmission"))]
     pub fn write(&mut self, plaintext: &[u8]) -> Result<()> {
         let mut out = mem::take(&mut self.scratch_a);
         out.clear();
@@ -282,31 +292,74 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
     }
 
     /// Reads and decrypts one message, blocking until a full frame arrives.
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "Transmission"))]
     pub fn read(&mut self) -> Result<Vec<u8>> {
-        if !self.handshaked || self.key.plaintext {
-            let binary = {
+        self.read_buf().map(Vec::from)
+    }
+
+    /// [`Self::read`] without copying: the message borrows an internal
+    /// scratch buffer that is overwritten by the next call.
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "Transmission"))]
+    pub fn read_buf(&mut self) -> Result<&[u8]> {
+        let handshaked = self.handshaked;
+        let (header_kf, offset) = if !handshaked || self.key.plaintext {
+            {
                 let Self {
                     b94,
                     io,
                     scratch_read,
+                    scratch_body,
                     ..
                 } = self;
-                b94.read_frame_with(io, scratch_read)?
-            };
-            self.decrypt_packet(&binary)
-        } else {
-            let mut header = [0u8; HEADER_SIZE];
-            self.io.read_exact(&mut header).map_err(Error::Io)?;
-            let (len, header_kf) =
-                header_decrypt(self.key.kf, Some(&mut self.protocol_rx), &header)?;
+                b94.read_frame_into(io, scratch_read, scratch_body)?;
+            }
+            let Self {
+                key,
+                protocol_rx,
+                scratch_body,
+                ..
+            } = self;
+            if scratch_body.len() <= HEADER_SIZE {
+                return Err(Error::InvalidFrame);
+            }
+            let header: [u8; HEADER_SIZE] = scratch_body[..HEADER_SIZE]
+                .try_into()
+                .expect("length checked");
+            let (len, header_kf) = header_decrypt(key.kf, Some(protocol_rx), &header)?;
             if !(1..=PPP_BUFFER_SIZE).contains(&len) {
                 return Err(Error::FrameTooLarge { len });
             }
-            let mut body = vec![0u8; len];
-            self.io.read_exact(&mut body).map_err(Error::Io)?;
-            self.decrypt_body(header_kf, &mut body);
-            Ok(body)
-        }
+            // Truncation/splicing guard: length must match the buffer exactly.
+            if len + HEADER_SIZE != scratch_body.len() {
+                return Err(Error::InvalidFrame);
+            }
+            // The decoded packet still carries its 3-byte binary header.
+            (header_kf, HEADER_SIZE)
+        } else {
+            let Self {
+                io,
+                key,
+                protocol_rx,
+                scratch_body,
+                ..
+            } = self;
+            let mut header = [0u8; HEADER_SIZE];
+            io.read_exact(&mut header).map_err(Error::Io)?;
+            let (len, header_kf) = header_decrypt(key.kf, Some(protocol_rx), &header)?;
+            if !(1..=PPP_BUFFER_SIZE).contains(&len) {
+                return Err(Error::FrameTooLarge { len });
+            }
+            // No binary header here: the wire header was consumed above.
+            scratch_body.clear();
+            scratch_body.resize(len, 0);
+            io.read_exact(scratch_body).map_err(Error::Io)?;
+            (header_kf, 0)
+        };
+        let flags = effective_flags(&self.key, handshaked);
+        let body = &mut self.scratch_body[offset..];
+        payload_deobfuscate(body, &flags, header_kf, self.key.kf);
+        self.transport_rx.apply(body);
+        Ok(body)
     }
 
     // ------------------------------------------------------------------
@@ -315,6 +368,7 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
 
     /// Runs the client-side handshake. Returns `(server_session_id, mux)`;
     /// `mux` reflects the server's multiplexing decision (parity of `nmux`).
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "Transmission"))]
     pub fn handshake_client(&mut self) -> Result<(SessionId, bool)> {
         self.handshake_prelude()?;
 
@@ -355,6 +409,7 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
     /// Runs the server-side handshake for an upper-layer assigned non-zero
     /// `session_id`. `mux` is the multiplexing request encoded into `nmux`'s
     /// parity for the client.
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "Transmission"))]
     pub fn handshake_server(&mut self, session_id: SessionId, mux: bool) -> Result<()> {
         if session_id == 0 {
             return Err(Error::InvalidSessionId);
@@ -428,6 +483,8 @@ pub struct TransmissionTx<T, R = StdRng> {
     transport_tx: SessionCipher,
     handshaked: bool,
     scratch: Vec<u8>,
+    /// Reused buffer for the intermediate binary packet on base94 paths.
+    scratch_bin: Vec<u8>,
 }
 
 impl<T, R: Rng> TransmissionTx<T, R> {
@@ -450,6 +507,7 @@ impl<T, R: Rng> TransmissionTx<T, R> {
 
     /// Encrypts `plaintext` into a complete wire packet appended to `out`
     /// (in-memory path; see [`Transmission::encrypt_into`]).
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "TransmissionTx"))]
     pub fn encrypt_into(&mut self, out: &mut Vec<u8>, plaintext: &[u8]) -> Result<()> {
         if plaintext.is_empty() {
             return Err(Error::ZeroLength);
@@ -460,15 +518,7 @@ impl<T, R: Rng> TransmissionTx<T, R> {
             });
         }
 
-        let flags = if self.handshaked {
-            PayloadFlags {
-                masked: self.key.masked,
-                shuffle: self.key.shuffle_data,
-                delta: self.key.delta_encode,
-            }
-        } else {
-            PayloadFlags::SAFEST
-        };
+        let flags = effective_flags(&self.key, self.handshaked);
         let (header, header_kf) = header_encrypt(
             &mut self.rng,
             self.key.kf,
@@ -476,21 +526,28 @@ impl<T, R: Rng> TransmissionTx<T, R> {
             plaintext.len(),
         )?;
 
-        // Assemble the binary packet (header || transformed body) into `out`.
-        let body_start = out.len();
-        out.reserve(HEADER_SIZE + plaintext.len());
-        out.extend_from_slice(&header);
-        out.extend_from_slice(plaintext);
-        let body = &mut out[body_start + HEADER_SIZE..];
-        self.transport_tx.apply(body);
-        payload_obfuscate(body, &flags, header_kf, self.key.kf);
-
         if !self.handshaked || self.key.plaintext {
-            // `out` currently holds the assembled binary packet; re-envelope
-            // it into a fresh region of `out`.
-            let wire = mem::take(out);
-            self.b94.encode_frame(&mut self.rng, out, &wire)
+            // base94 envelope: assemble the binary packet in the reusable
+            // intermediate buffer, then encode it into `out`.
+            let bin = &mut self.scratch_bin;
+            bin.clear();
+            bin.reserve(HEADER_SIZE + plaintext.len());
+            bin.extend_from_slice(&header);
+            bin.extend_from_slice(plaintext);
+            let body = &mut bin[HEADER_SIZE..];
+            self.transport_tx.apply(body);
+            payload_obfuscate(body, &flags, header_kf, self.key.kf);
+            self.b94.encode_frame(&mut self.rng, out, bin)
         } else {
+            // Binary framing builds the packet directly in `out`: one full
+            // packet copy saved vs assembling in scratch first.
+            let start = out.len();
+            out.reserve(HEADER_SIZE + plaintext.len());
+            out.extend_from_slice(&header);
+            out.extend_from_slice(plaintext);
+            let body = &mut out[start + HEADER_SIZE..];
+            self.transport_tx.apply(body);
+            payload_obfuscate(body, &flags, header_kf, self.key.kf);
             Ok(())
         }
     }
@@ -498,6 +555,7 @@ impl<T, R: Rng> TransmissionTx<T, R> {
 
 impl<T: Write, R: Rng> TransmissionTx<T, R> {
     /// Writes one encrypted message to the transport (streaming).
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "TransmissionTx"))]
     pub fn write(&mut self, plaintext: &[u8]) -> Result<()> {
         let mut out = mem::take(&mut self.scratch);
         out.clear();
@@ -521,6 +579,8 @@ pub struct TransmissionRx<T> {
     handshaked: bool,
     /// Reused buffer for encoded (pre-decode) frame bytes.
     scratch: Vec<u8>,
+    /// Reused buffer for the decoded (post-decrypt) message.
+    body: Vec<u8>,
 }
 
 impl<T> TransmissionRx<T> {
@@ -545,60 +605,72 @@ impl<T> TransmissionRx<T> {
 impl<T: Read> TransmissionRx<T> {
     /// Reads and decrypts one message, blocking until a full frame arrives
     /// (see [`Transmission::read`]).
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "TransmissionRx"))]
     pub fn read(&mut self) -> Result<Vec<u8>> {
-        if !self.handshaked || self.key.plaintext {
-            let binary = {
+        self.read_buf().map(Vec::from)
+    }
+
+    /// [`Self::read`] without copying: the message borrows an internal
+    /// scratch buffer that is overwritten by the next call.
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "TransmissionRx"))]
+    pub fn read_buf(&mut self) -> Result<&[u8]> {
+        let handshaked = self.handshaked;
+        let (header_kf, offset) = if !handshaked || self.key.plaintext {
+            {
                 let Self {
-                    b94, io, scratch, ..
+                    b94,
+                    io,
+                    scratch,
+                    body,
+                    ..
                 } = self;
-                b94.read_frame_with(io, scratch)?
-            };
-            self.decrypt_packet(&binary)
-        } else {
-            let mut header = [0u8; HEADER_SIZE];
-            self.io.read_exact(&mut header).map_err(Error::Io)?;
-            let (len, header_kf) =
-                header_decrypt(self.key.kf, Some(&mut self.protocol_rx), &header)?;
+                b94.read_frame_into(io, scratch, body)?;
+            }
+            let Self {
+                key,
+                protocol_rx,
+                body,
+                ..
+            } = self;
+            if body.len() <= HEADER_SIZE {
+                return Err(Error::InvalidFrame);
+            }
+            let header: [u8; HEADER_SIZE] = body[..HEADER_SIZE].try_into().expect("length checked");
+            let (len, header_kf) = header_decrypt(key.kf, Some(protocol_rx), &header)?;
             if !(1..=PPP_BUFFER_SIZE).contains(&len) {
                 return Err(Error::FrameTooLarge { len });
             }
-            let mut body = vec![0u8; len];
-            self.io.read_exact(&mut body).map_err(Error::Io)?;
-            self.decrypt_body(header_kf, &mut body);
-            Ok(body)
-        }
-    }
-
-    fn decrypt_packet(&mut self, binary: &[u8]) -> Result<Vec<u8>> {
-        if binary.len() <= HEADER_SIZE {
-            return Err(Error::InvalidFrame);
-        }
-        let header: [u8; HEADER_SIZE] = binary[..HEADER_SIZE].try_into().expect("length checked");
-        let (len, header_kf) = header_decrypt(self.key.kf, Some(&mut self.protocol_rx), &header)?;
-        if !(1..=PPP_BUFFER_SIZE).contains(&len) {
-            return Err(Error::FrameTooLarge { len });
-        }
-        // Truncation/splicing guard: length must match the buffer exactly.
-        if len + HEADER_SIZE != binary.len() {
-            return Err(Error::InvalidFrame);
-        }
-        let mut body = binary[HEADER_SIZE..].to_vec();
-        self.decrypt_body(header_kf, &mut body);
-        Ok(body)
-    }
-
-    fn decrypt_body(&mut self, header_kf: u32, body: &mut [u8]) {
-        let flags = if self.handshaked {
-            PayloadFlags {
-                masked: self.key.masked,
-                shuffle: self.key.shuffle_data,
-                delta: self.key.delta_encode,
+            // Truncation/splicing guard: length must match the buffer exactly.
+            if len + HEADER_SIZE != body.len() {
+                return Err(Error::InvalidFrame);
             }
+            // The decoded packet still carries its 3-byte binary header.
+            (header_kf, HEADER_SIZE)
         } else {
-            PayloadFlags::SAFEST
+            let Self {
+                io,
+                key,
+                protocol_rx,
+                body,
+                ..
+            } = self;
+            let mut header = [0u8; HEADER_SIZE];
+            io.read_exact(&mut header).map_err(Error::Io)?;
+            let (len, header_kf) = header_decrypt(key.kf, Some(protocol_rx), &header)?;
+            if !(1..=PPP_BUFFER_SIZE).contains(&len) {
+                return Err(Error::FrameTooLarge { len });
+            }
+            // No binary header here: the wire header was consumed above.
+            body.clear();
+            body.resize(len, 0);
+            io.read_exact(body).map_err(Error::Io)?;
+            (header_kf, 0)
         };
+        let flags = effective_flags(&self.key, handshaked);
+        let body = &mut self.body[offset..];
         payload_deobfuscate(body, &flags, header_kf, self.key.kf);
         self.transport_rx.apply(body);
+        Ok(body)
     }
 }
 
@@ -628,8 +700,9 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
             handshaked,
             session_id: _,
             scratch_a,
-            scratch_b: _,
+            scratch_b,
             scratch_read,
+            scratch_body,
         } = self;
         let tx = TransmissionTx {
             io,
@@ -640,6 +713,7 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
             transport_tx,
             handshaked,
             scratch: scratch_a,
+            scratch_bin: scratch_b,
         };
         let rx = TransmissionRx {
             io: rx_io,
@@ -649,6 +723,7 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
             transport_rx,
             handshaked,
             scratch: scratch_read,
+            body: scratch_body,
         };
         (tx, rx)
     }

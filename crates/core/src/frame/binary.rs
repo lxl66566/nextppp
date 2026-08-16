@@ -119,6 +119,7 @@ pub fn header_decrypt(
 
 /// Applies the payload transform chain in place (order matters:
 /// mask -> shuffle -> delta).
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn payload_obfuscate(data: &mut [u8], flags: &PayloadFlags, header_kf: u32, kf: u32) {
     if flags.masked {
         masked_xor_random_next(data, header_kf);
@@ -132,6 +133,7 @@ pub fn payload_obfuscate(data: &mut [u8], flags: &PayloadFlags, header_kf: u32, 
 }
 
 /// Reverses [`payload_obfuscate`] in place.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn payload_deobfuscate(data: &mut [u8], flags: &PayloadFlags, header_kf: u32, kf: u32) {
     if flags.delta {
         delta_decode(data, kf);

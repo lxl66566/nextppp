@@ -73,6 +73,7 @@ impl Base94Framer {
 
     /// Encodes one framed packet (header + base94 payload) and appends it to
     /// `out`. `binary` is the encrypted binary-frame packet.
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "Base94Framer"))]
     pub fn encode_frame<R: Rng>(
         &mut self,
         rng: &mut R,
@@ -199,17 +200,23 @@ impl Base94Framer {
     /// first-frame flag advances only after the entire frame validates.
     pub fn read_frame<Rd: Read>(&mut self, r: &mut Rd) -> Result<Vec<u8>> {
         let mut scratch = Vec::new();
-        self.read_frame_with(r, &mut scratch)
+        let mut out = Vec::new();
+        self.read_frame_into(r, &mut scratch, &mut out)?;
+        Ok(out)
     }
 
-    /// [`Self::read_frame`] with a caller-provided scratch buffer for the
-    /// encoded (still base94) bytes, avoiding a per-frame allocation on
-    /// steady-state streaming paths.
-    pub fn read_frame_with<Rd: Read>(
+    /// [`Self::read_frame`] with caller-provided scratch buffers for the
+    /// encoded (still base94) bytes and the decoded binary packet, avoiding
+    /// per-frame allocations on steady-state streaming paths. `out` is
+    /// cleared and refilled with the full binary packet (3-byte binary
+    /// header included).
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "Base94Framer"))]
+    pub fn read_frame_into<Rd: Read>(
         &mut self,
         r: &mut Rd,
         scratch: &mut Vec<u8>,
-    ) -> Result<Vec<u8>> {
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         let first = self.rx_first;
         let len = if first {
             let mut header = [0u8; HEADER_EXTENDED];
@@ -228,9 +235,22 @@ impl Base94Framer {
         scratch.clear();
         scratch.resize(len, 0);
         r.read_exact(scratch).map_err(Error::Io)?;
-        let mut out = Vec::with_capacity(len);
-        base94_decode_into(&mut out, scratch, self.kf)?;
+        out.clear();
+        out.reserve(len);
+        base94_decode_into(out, scratch, self.kf)?;
         self.rx_first = false;
+        Ok(())
+    }
+
+    /// Compatibility wrapper kept for external callers; steady-state paths
+    /// should prefer [`Self::read_frame_into`].
+    pub fn read_frame_with<Rd: Read>(
+        &mut self,
+        r: &mut Rd,
+        scratch: &mut Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.read_frame_into(r, scratch, &mut out)?;
         Ok(out)
     }
 

@@ -51,6 +51,7 @@ enum Role {
     },
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::main)]
 fn main() -> anyhow::Result<()> {
     // Runtime level control via SPDLOG_RS_LEVEL (e.g. `debug`, `trace`,
     // `off`); info+ by default.
