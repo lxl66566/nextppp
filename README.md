@@ -2,12 +2,15 @@
 
 Rust 写的代理，bypass GFW。协议魔改自 [openppp2](https://github.com/liulilittle/openppp2)。
 
-- 抗封锁传输协议：base94、随机化帧头、NOP 噪声前奏、每连接独立密钥，握手前流量无加密特征。
-- 不差的性能，详见[端到端吞吐量](#端到端吞吐量)。
+- 性能详见[端到端吞吐量](#端到端吞吐量)。
 
 ## 安装
 
-从 [Release](https://github.com/lxl66566/nextppp/releases) 下载 prebuilt binary。
+以下任选其一：
+
+- 从 [Releases](https://github.com/lxl66566/nextppp/releases) 下载 prebuilt binary。
+- 使用 [bpm](https://github.com/lxl66566/bpm-rs) 安装：`bpm i https://github.com/lxl66566/nextppp`
+- NixOS 用户：从我的 [NUR](https://github.com/lxl66566/NUR) 安装 + 使用 module 配置
 
 ## 快速开始
 
@@ -59,7 +62,7 @@ nextppp client -c nextppp-client.jsonc
 ### 端到端吞吐量
 
 集成测试 `crates/client/tests/throughput.rs` 走完整链路（socks5 入站 -> client ->
-nextppp 隧道 -> server -> 本地 echo），测单向字节速率，server 与 client 均为单核：
+nextppp 隧道 -> server -> 本地 echo），测单向字节速率。AMD 7945HX 上 server 与 client 均为单核的吞吐量：
 
 ```sh
 cargo test -p nextppp-client --release --test throughput -- --ignored --nocapture
