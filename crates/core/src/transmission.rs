@@ -50,6 +50,28 @@ use crate::{
     },
 };
 
+/// Parses a binary frame header and validates the declared body length
+/// against `PPP_BUFFER_SIZE`. `declared_total` is the full packet's byte
+/// length on in-memory paths, where it guards against truncation/splicing;
+/// stream callers pass `None` because they read exactly `len` bytes.
+fn parse_binary_header(
+    kf: u32,
+    cipher: &mut SessionCipher,
+    header: [u8; HEADER_SIZE],
+    declared_total: Option<usize>,
+) -> Result<(usize, u32)> {
+    let (len, header_kf) = header_decrypt(kf, Some(cipher), &header)?;
+    if !(1..=PPP_BUFFER_SIZE).contains(&len) {
+        return Err(Error::FrameTooLarge { len });
+    }
+    if let Some(total) = declared_total {
+        if len + HEADER_SIZE != total {
+            return Err(Error::InvalidFrame);
+        }
+    }
+    Ok((len, header_kf))
+}
+
 /// Data-plane flags; pre-handshake everything is forced on ("safest").
 fn effective_flags(key: &ObfuscationKey, handshaked: bool) -> PayloadFlags {
     if handshaked {
@@ -219,14 +241,12 @@ impl RxCore {
             return Err(Error::InvalidFrame);
         }
         let header: [u8; HEADER_SIZE] = binary[..HEADER_SIZE].try_into().expect("length checked");
-        let (len, header_kf) = header_decrypt(self.key.kf, Some(&mut self.protocol_rx), &header)?;
-        if !(1..=PPP_BUFFER_SIZE).contains(&len) {
-            return Err(Error::FrameTooLarge { len });
-        }
-        // Truncation/splicing guard: length must match the buffer exactly.
-        if len + HEADER_SIZE != binary.len() {
-            return Err(Error::InvalidFrame);
-        }
+        let (_, header_kf) = parse_binary_header(
+            self.key.kf,
+            &mut self.protocol_rx,
+            header,
+            Some(binary.len()),
+        )?;
         // Decrypt in place, then drop the header: one allocation total.
         binary.drain(..HEADER_SIZE);
         self.decrypt_body(header_kf, &mut binary);
@@ -266,14 +286,8 @@ impl RxCore {
             let header: [u8; HEADER_SIZE] = scratch_body[..HEADER_SIZE]
                 .try_into()
                 .expect("length checked");
-            let (len, header_kf) = header_decrypt(key.kf, Some(protocol_rx), &header)?;
-            if !(1..=PPP_BUFFER_SIZE).contains(&len) {
-                return Err(Error::FrameTooLarge { len });
-            }
-            // Truncation/splicing guard: length must match the buffer exactly.
-            if len + HEADER_SIZE != scratch_body.len() {
-                return Err(Error::InvalidFrame);
-            }
+            let (_, header_kf) =
+                parse_binary_header(key.kf, protocol_rx, header, Some(scratch_body.len()))?;
             // The decoded packet still carries its 3-byte binary header.
             (header_kf, HEADER_SIZE)
         } else {
@@ -285,10 +299,9 @@ impl RxCore {
             } = self;
             let mut header = [0u8; HEADER_SIZE];
             io.read_exact(&mut header).map_err(Error::Io)?;
-            let (len, header_kf) = header_decrypt(key.kf, Some(protocol_rx), &header)?;
-            if !(1..=PPP_BUFFER_SIZE).contains(&len) {
-                return Err(Error::FrameTooLarge { len });
-            }
+            // No length-consistency check: the body below is read to exactly
+            // `len` bytes off the stream, so it matches by construction.
+            let (len, header_kf) = parse_binary_header(key.kf, protocol_rx, header, None)?;
             // No binary header here: the wire header was consumed above.
             // take+read_to_end writes into spare capacity directly, skipping
             // the zeroing that resize+read_exact would do first.
