@@ -133,7 +133,7 @@ masked_xor_random_next(data, kf):
 
 对固定初始密钥自逆（加密与解密是同一函数）。
 
-### 4.5 base94 字节编解码（`ssea.rs:134-207`）
+### 4.5 base94 字节编解码（`crates/base94/src/lib.rs`，SIMD 实现 `crates/base94/src/simd.rs`）
 
 **编码**：每个输入字节 `b` 映射为 1~2 个可打印字符（0x20..0x7E）：
 
@@ -148,7 +148,7 @@ else:
 
 输出长度最坏为输入的 2 倍（`base94_encoded_len` 可预计算）。
 
-**解码**（`ssea.rs:161-207`）：
+**解码**（`crates/base94/src/lib.rs` 的 `decode_into`）：
 
 ```
 对每个字符 c:
@@ -166,7 +166,7 @@ else:
 
 **失败时不留部分输出**：解码中途出错即回滚到起始位置（`out.truncate(start)`），杜绝半解析状态。
 
-### 4.6 base94 整数编解码（`ssea.rs:211-247`）
+### 4.6 base94 整数编解码（`crates/base94/src/lib.rs`）
 
 u64 与 base94 数字串（字符 0x20..0x7D）互转，**最少位数、无前导零**：
 
@@ -242,6 +242,9 @@ base_iv = okm[32..48]
 结论：应用层配置提供统一的 `password` 选项（`protocol_key`/`transport_key`
 留空时回退到它）是安全的默认。
 
+> **口令熵即安全边界**：HKDF 无口令拉伸（单轮 SHA-256），salt/info 是公开常量。
+> 被动观察者可以离线枚举弱口令，并用首帧校验和作为验证 oracle。请使用长随机口令。
+
 ### 5.3 nonce 管理（`cipher.rs:222-241`）
 
 TLS-1.3 风格：`nonce = base_iv XOR be64(seq)`，每方向单调递增的 64 位计数器：
@@ -257,7 +260,13 @@ seq += 1
   所有包复用同一 keystream（`C1^C2 = P1^P2`）；本实现每包 nonce 唯一。
 - 一个 `SessionCipher` 实例只能服务一条消息流；每方向各建一个实例
   （tx 用加密实例，rx 用 `for_decryption()` 实例；CFB 加解密不对称，CTR/ChaCha20 对称）。
-- 64 位计数器在单连接内实际不可能回绕（2^64 包 × 64KiB 远超任何会话规模）。
+- 64 位计数器在单连接内实际不可能回绕（2^64 包 × 64KiB 远超任何会话规模）；
+  ChaCha20 的 32 位 XOR 宽度同样安全（重复一个 nonce 需单方向 2^32 包 ≈ 256 TiB）。
+
+> **部署提示（吞吐）**：CFB 的加密方向是串行反馈链（≈3 c/B），解密已批量化但
+> server 的下行（大流量方向）走的是加密。高吞吐场景建议把 `transport` 配置为
+> `aes-256-ctr` 或 `chacha20-ietf`（两者全并行，wire 语义与 CFB 互不兼容，
+> 两端需一致）。
 
 ## 6. 帧格式
 

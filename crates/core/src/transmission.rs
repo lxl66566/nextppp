@@ -21,6 +21,18 @@
 //! bidirectional pump model. In-memory entry points
 //! (`encrypt_into`/`decrypt`) do not touch the transport, so they are
 //! usable for datagram/mux style callers and are available for any `T`.
+//!
+//! Copy budget per packet (documented tradeoff; the base94 envelope needs
+//! its input contiguous): binary framing copies the plaintext once (into
+//! `out`), plaintext framing twice (scratch assembly + encode). The read
+//! side is zero-copy on binary framing (header parsed in place, message is
+//! a slice) and one-copy on base94 (decode writes into a scratch).
+//!
+//! Syscall budget per frame on the streaming read path: two (`read_exact`
+//! on the 3/4/7-byte header, then the body read). A 4 KiB lookahead
+//! buffer could collapse most headers into the body read, but it would
+//! add a copy for every large frame; interactive proxy traffic favors the
+//! current shape. Revisit only with syscall-heavy profiles in hand.
 
 // `(nmux >> 64) as u64` and similar narrowing casts are structurally safe.
 #![allow(clippy::cast_possible_truncation)]

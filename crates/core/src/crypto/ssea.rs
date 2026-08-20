@@ -79,6 +79,14 @@ fn fast_mod(x: u32, magic: u64, d: u32) -> u32 {
 /// not a cryptographic permutation but effective against naive DPI pattern
 /// matching at negligible cost. (Note: for size <= 2 the chain degenerates to
 /// the identity permutation, exactly like the C++ original.)
+///
+/// Why this stays scalar (analyzed; do not re-explore blindly): the i-th
+/// swap reads memory the (i-1)-th swap may have written, so swaps cannot be
+/// reordered or vectorized without recomputing the whole dependency chain.
+/// `j` itself depends only on `i ^ key`, so a j-array could be precomputed
+/// in SIMD and applied with scalar swaps — but the stores stay serial and
+/// cache-miss bound past L1D, so only the cheap index math vectorizes;
+/// bench first if ever attempted, the ceiling is low.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn shuffle(data: &mut [u8], key: u32) {
     let size = data.len();
