@@ -53,14 +53,29 @@ impl std::error::Error for DecodeError {}
 /// leader), and the write cursor advances by `1 + escape` — no mispredicted
 /// branches on the ~50/50 escape mix.
 pub fn encode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) {
+    encode_into_with_len(out, src, kf, encoded_len(src, kf));
+}
+
+/// [`encode_into`] with a caller-computed output length, skipping the
+/// escape-count scan (`encoded_len`) when the caller already ran it for
+/// bounds checking. Frame builders need the length up front, so this halves
+/// the source scans on their hot path.
+///
+/// # Contract
+///
+/// `len` must be exactly `encoded_len(src, kf)`. A wrong value corrupts or
+/// overruns the output buffer (the writes trust `len` for capacity);
+/// `debug_assert` catches misuse in debug builds.
+pub fn encode_into_with_len(out: &mut Vec<u8>, src: &[u8], kf: u32, len: usize) {
     // 8-wide unroll: the output offsets form a short serial prefix chain
     // (7 adds amortized over 8 bytes) while the 16 leader/follower stores
     // issue independently — a per-byte `p += 1 + esc` chain would otherwise
     // cap the loop at the address-generation latency.
     const UNROLL: usize = 8;
 
+    debug_assert_eq!(len, encoded_len(src, kf), "stale/wrong encode length");
     let kf8 = kf as u8;
-    let total = src.len() + simd::count_sub_ge(src, kf8, ESCAPE_RADIX);
+    let total = len;
     let start = out.len();
     // +16 slack: the SIMD kernel's per-quarter compaction stores are
     // 8-byte writes whose padding past the count is only overwritten by
