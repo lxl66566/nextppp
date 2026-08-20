@@ -116,14 +116,17 @@ type Block = Array<u8, U16>;
 
 /// Precomputed AES key schedule (see design note 4). One boxed-free enum
 /// holding either schedule; the variant size gap is inherent and harmless
-/// (one instance per direction per connection). ChaCha20 needs no schedule:
-/// its state init is just word writes (rounds run lazily per block), so
-/// per-packet construction in `apply` is cheap.
+/// (one instance per direction per connection). ChaCha20 needs no
+/// schedule — its state init is just word writes (rounds run lazily per
+/// block), so per-packet construction in `apply` is cheap — but it does
+/// carry its 32-byte key in the variant, which also keeps the raw `key`
+/// field out of `SessionCipher` for AES methods (no reason to retain key
+/// material the schedule already bakes in).
 #[allow(clippy::large_enum_variant)]
 enum Core {
     Aes128(aes::Aes128),
     Aes256(aes::Aes256),
-    ChaCha,
+    ChaCha([u8; KEY_MAX]),
 }
 
 /// Max nonce width across methods (AES: 16 bytes).
@@ -131,13 +134,49 @@ const NONCE_MAX: usize = 16;
 /// Max derived-key width across methods.
 const KEY_MAX: usize = 32;
 
+/// HKDF derivation shared by `SessionCipher::derive` (kept as one function
+/// so the byte-exact reference tests drive the exact same key material).
+fn derive_material(
+    role: CipherRole,
+    method: Method,
+    password: &str,
+    ivv: Option<u128>,
+) -> ([u8; KEY_MAX], [u8; NONCE_MAX]) {
+    let mut ikm = Vec::with_capacity(password.len() + 40);
+    ikm.extend_from_slice(password.as_bytes());
+    if let Some(ivv) = ivv {
+        if ivv > 0 {
+            ikm.push(b'+');
+        }
+        // ceil(128 bits / log2(32)) = 26 digits.
+        let mut buf = [0u8; 26];
+        let len = encode_base32(ivv, &mut buf);
+        ikm.extend_from_slice(&buf[..len]);
+    }
+
+    // The salt mixes role + method, giving every (layer, cipher) pair an
+    // independent key domain; sharing one password across layers is then
+    // safe by construction.
+    let salt = format!("nextppp/{}/{}", role.name(), method.name());
+    let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), &ikm);
+    let mut okm = [0u8; KEY_MAX + NONCE_MAX];
+    // Length is fixed and well below the HKDF limit; cannot fail.
+    hk.expand(b"nextppp-session-key", &mut okm)
+        .expect("static HKDF output length");
+
+    let mut key = [0u8; KEY_MAX];
+    key.copy_from_slice(&okm[..KEY_MAX]);
+    let mut base_iv = [0u8; NONCE_MAX];
+    base_iv.copy_from_slice(&okm[KEY_MAX..]);
+    (key, base_iv)
+}
+
 /// One-directional session cipher with a monotonically advancing nonce
 /// counter. A [`SessionCipher`] instance must never be reused for two
 /// independent message streams; create one per direction instead.
 pub struct SessionCipher {
     method: Method,
     core: Core,
-    key: [u8; KEY_MAX],
     base_iv: [u8; NONCE_MAX],
     seq: u64,
     encrypting: bool,
@@ -156,32 +195,7 @@ impl SessionCipher {
     /// format: `"+" + base32(ivv)`.
     #[must_use]
     pub fn derive(method: Method, role: CipherRole, password: &str, ivv: Option<u128>) -> Self {
-        let mut ikm = Vec::with_capacity(password.len() + 40);
-        ikm.extend_from_slice(password.as_bytes());
-        if let Some(ivv) = ivv {
-            if ivv > 0 {
-                ikm.push(b'+');
-            }
-            // ceil(128 bits / log2(32)) = 26 digits.
-            let mut buf = [0u8; 26];
-            let len = encode_base32(ivv, &mut buf);
-            ikm.extend_from_slice(&buf[..len]);
-        }
-
-        // The salt mixes role + method, giving every (layer, cipher) pair an
-        // independent key domain; sharing one password across layers is then
-        // safe by construction.
-        let salt = format!("nextppp/{}/{}", role.name(), method.name());
-        let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), &ikm);
-        let mut okm = [0u8; KEY_MAX + NONCE_MAX];
-        // Length is fixed and well below the HKDF limit; cannot fail.
-        hk.expand(b"nextppp-session-key", &mut okm)
-            .expect("static HKDF output length");
-
-        let mut key = [0u8; KEY_MAX];
-        key.copy_from_slice(&okm[..KEY_MAX]);
-        let mut base_iv = [0u8; NONCE_MAX];
-        base_iv.copy_from_slice(&okm[KEY_MAX..]);
+        let (key, base_iv) = derive_material(role, method, password, ivv);
 
         let core = match method {
             Method::Aes128Cfb | Method::Aes128Ctr => {
@@ -190,13 +204,12 @@ impl SessionCipher {
             Method::Aes256Cfb | Method::Aes256Ctr => {
                 Core::Aes256(aes::Aes256::new_from_slice(&key[..32]).expect("fixed key length"))
             },
-            Method::ChaCha20 => Core::ChaCha,
+            Method::ChaCha20 => Core::ChaCha(key),
         };
 
         Self {
             method,
             core,
-            key,
             base_iv,
             seq: 0,
             encrypting: true,
@@ -218,7 +231,6 @@ impl SessionCipher {
         let nonce = self.next_nonce();
         let Self {
             core,
-            key,
             method,
             encrypting,
             ..
@@ -228,7 +240,7 @@ impl SessionCipher {
             (Method::Aes256Cfb, Core::Aes256(c)) => cfb_apply(c, &nonce, data, *encrypting),
             (Method::Aes128Ctr, Core::Aes128(c)) => ctr_apply(c, &nonce, data),
             (Method::Aes256Ctr, Core::Aes256(c)) => ctr_apply(c, &nonce, data),
-            (Method::ChaCha20, Core::ChaCha) => {
+            (Method::ChaCha20, Core::ChaCha(key)) => {
                 use chacha20::cipher::{KeyIvInit, StreamCipher};
                 let mut c = chacha20::ChaCha20::new_from_slices(&key[..32], &nonce[..12])
                     .expect("key/nonce lengths are fixed by Method");
@@ -236,8 +248,8 @@ impl SessionCipher {
             },
             // `Core` is derived from `method` at construction; these pairings
             // cannot exist.
-            (Method::Aes128Cfb | Method::Aes128Ctr, Core::Aes256(_) | Core::ChaCha)
-            | (Method::Aes256Cfb | Method::Aes256Ctr, Core::Aes128(_) | Core::ChaCha)
+            (Method::Aes128Cfb | Method::Aes128Ctr, Core::Aes256(_) | Core::ChaCha(_))
+            | (Method::Aes256Cfb | Method::Aes256Ctr, Core::Aes128(_) | Core::ChaCha(_))
             | (Method::ChaCha20, Core::Aes128(_) | Core::Aes256(_)) => {
                 unreachable!("cipher core must match method")
             },
@@ -266,8 +278,12 @@ impl SessionCipher {
         for i in 0..xor_width {
             nonce[start + i] ^= seq[8 - xor_width + i];
         }
-        // A u64 counter practically cannot wrap within one connection
-        // (2^64 packets x 64 KiB >> any conceivable session size).
+        // Wrap analysis: the u64 sequence practically cannot wrap (2^64
+        // packets x 64 KiB >> any conceivable session size); ChaCha20's
+        // 32-bit xor width only spreads the low sequence bits differently
+        // — the counter itself is still the u64, and repeating a nonce
+        // needs 2^32 packets in ONE direction of one connection, i.e.
+        // 2^32 x 64 KiB ~ 256 TiB tunneled one way.
         self.seq += 1;
         nonce
     }
@@ -548,10 +564,16 @@ mod tests {
     // ------------------------------------------------------------------
 
     impl SessionCipher {
-        /// Test-only view for driving the reference implementations with the
-        /// exact nonce material `apply` will use next.
-        fn material(&self) -> (&[u8; KEY_MAX], &[u8; NONCE_MAX], u64) {
-            (&self.key, &self.base_iv, self.seq)
+        /// Test-only: re-derives the raw key material the reference
+        /// implementations need (the cipher itself only keeps the AES
+        /// schedule, not the raw key).
+        fn material(
+            &self,
+            role: CipherRole,
+            password: &str,
+        ) -> ([u8; KEY_MAX], [u8; NONCE_MAX], u64) {
+            let (key, base_iv) = derive_material(role, self.method, password, None);
+            (key, base_iv, self.seq)
         }
     }
 
@@ -605,8 +627,8 @@ mod tests {
                 // (> 8*16 = CFB decrypt / CTR batch boundary) and full frames.
                 for len in [0usize, 1, 2, 15, 16, 17, 31, 128, 129, 1000, 65536] {
                     let data = sample(len);
-                    let (key, base_iv, seq) = mine.material();
-                    let nonce = ref_nonce(method, base_iv, seq);
+                    let (key, base_iv, seq) = mine.material(CipherRole::Transport, "cross-check");
+                    let nonce = ref_nonce(method, &base_iv, seq);
 
                     let mut expected = data.clone();
                     match (method, encrypting) {
