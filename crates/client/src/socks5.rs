@@ -74,17 +74,14 @@ fn negotiate_and_forward(
     let mut head = [0u8; 4];
     stream.read_exact(&mut head).context("read request head")?;
     if head[0] != VER {
-        warn!("[{peer}] bad SOCKS version {:#04x}", head[0]);
         anyhow::bail!("bad SOCKS version {:#04x}", head[0]);
     }
     if head[1] != CMD_CONNECT {
-        warn!("[{peer}] unsupported command {:#04x}", head[1]);
         let _ = reply(&mut stream, REP_CMD_UNSUPPORTED);
         anyhow::bail!("unsupported command {:#04x}", head[1]);
     }
     // RFC 1928: RSV is reserved and must be zero.
     if head[2] != 0 {
-        warn!("[{peer}] non-zero reserved byte {:#04x}", head[2]);
         let _ = reply(&mut stream, REP_GENERAL);
         anyhow::bail!("non-zero reserved byte {:#04x}", head[2]);
     }
@@ -106,9 +103,11 @@ fn negotiate_and_forward(
         Ok((tx, rx)) => {
             stats.tunnels.fetch_add(1, Ordering::Relaxed);
             reply(&mut stream, REP_SUCCEEDED).context("reply succeeded")?;
-            // The inbound negotiation timeout must not apply to the data plane.
-            stream.set_read_timeout(None)?;
-            stream.set_write_timeout(None)?;
+            // The inbound negotiation timeout must not apply to the data
+            // plane. Best-effort: failing here would misreport an otherwise
+            // successful connection.
+            let _ = stream.set_read_timeout(None);
+            let _ = stream.set_write_timeout(None);
             let started = Instant::now();
             let s = pump::pump_tunnel(*tx, *rx, stream);
             // `local` is the inbound app stream: up = app -> tunnel.
@@ -119,9 +118,10 @@ fn negotiate_and_forward(
         },
         Err(e) => {
             stats.tunnel_failures.fetch_add(1, Ordering::Relaxed);
-            warn!("[{peer}] tunnel connect to {target} failed: {e:#}");
             let _ = reply(&mut stream, REP_GENERAL);
-            Err(e.context("outbound connect"))
+            // No inner log line: the failure (with target) rides the error
+            // chain into the single warn in `handle`.
+            Err(e.context(format!("tunnel connect to {target}")))
         },
     }
 }
