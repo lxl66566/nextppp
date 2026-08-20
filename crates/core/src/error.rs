@@ -45,6 +45,11 @@ pub enum Error {
     /// Zero-length payloads cannot be framed (see openppp2 ITransmission).
     #[error("zero-length payload rejected")]
     ZeroLength,
+
+    /// An [`crate::config::ObfuscationKey`] field is out of range or
+    /// otherwise unusable; the static string names the problem.
+    #[error("invalid obfuscation config: {0}")]
+    InvalidConfig(&'static str),
 }
 
 /// Convenience alias used across the crate.
@@ -74,6 +79,7 @@ impl PartialEq for Error {
             | (Self::FlagsMismatch, Self::FlagsMismatch)
             | (Self::ZeroLength, Self::ZeroLength) => true,
             (Self::HandshakeFailed(a), Self::HandshakeFailed(b)) => a == b,
+            (Self::InvalidConfig(a), Self::InvalidConfig(b)) => a == b,
             (Self::FrameTooLarge { len: a }, Self::FrameTooLarge { len: b }) => a == b,
             _ => false,
         }

@@ -374,6 +374,10 @@ impl<T, R: Rng> Transmission<T, R> {
     #[allow(clippy::needless_pass_by_value)]
     #[must_use]
     pub fn with_rng(io: T, key: ObfuscationKey, rng: R) -> Self {
+        // Config validation is the upper layer's job (see
+        // `ObfuscationKey::validate`); this only guards against misuse in
+        // debug builds, e.g. hand-constructed keys in tests.
+        debug_assert!(key.validate().is_ok());
         Self {
             io,
             tx: TxCore::new(&key, rng),

@@ -1,7 +1,14 @@
 //! Protocol configuration (the `key` section of openppp2's AppConfiguration).
 
-use crate::crypto::cipher::Method;
+use crate::{
+    crypto::cipher::Method,
+    error::{Error, Result},
+};
 
+/// Highest NOP exponent accepted by [`ObfuscationKey::validate`]. `kl`/`kh`
+/// feed `1 << exp`, so values >= 32 overflow, and anything above 20 stalls
+/// the handshake under thousands of noise packets (2^20 / 1400 is ~750).
+pub const MAX_NOP_EXPONENT: u8 = 20;
 /// Obfuscation and cipher parameters shared by both endpoints. All fields
 /// except the passwords feed the flag canary, so a mismatched pair fails the
 /// handshake with [`crate::Error::FlagsMismatch`] instead of hanging.
@@ -56,5 +63,24 @@ impl Default for ObfuscationKey {
             delta_encode: true,
             shuffle_data: true,
         }
+    }
+}
+
+impl ObfuscationKey {
+    /// Checks the invariants the protocol stack relies on. The upper config
+    /// layer must run this on every loaded key; the core only
+    /// `debug_assert`s it (misuse is a programming error, not a wire error).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidConfig`] naming the offending field.
+    pub fn validate(&self) -> Result<()> {
+        if self.kl > MAX_NOP_EXPONENT || self.kh > MAX_NOP_EXPONENT {
+            return Err(Error::InvalidConfig("kl/kh exceed MAX_NOP_EXPONENT"));
+        }
+        if self.protocol_key.is_empty() || self.transport_key.is_empty() {
+            return Err(Error::InvalidConfig("cipher password is empty"));
+        }
+        Ok(())
     }
 }
