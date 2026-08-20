@@ -510,16 +510,12 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
 
         let low: u64 = self.tx.rng.random();
         let mut nmux = (u128::from(flag_canary(&self.tx.key)) << 64) | u128::from(low);
-        // Parity carries the mux decision; increments stay inside the low
-        // word, so the canary high word is preserved.
+        // Parity carries the mux decision. Bit ops instead of `+1` loops: an
+        // increment at u64::MAX would carry into the canary word.
         if mux {
-            while nmux & 1 == 0 {
-                nmux += 1;
-            }
+            nmux |= 1;
         } else {
-            while nmux & 1 != 0 {
-                nmux += 1;
-            }
+            nmux &= !1;
         }
         self.send_session_id(nmux)?;
 
