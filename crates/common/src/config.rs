@@ -197,6 +197,10 @@ pub struct ServerConfig {
     /// Handshake timeout in seconds (anti slow-loris).
     #[serde(default = "default_handshake_timeout")]
     pub handshake_timeout: u64,
+    /// Maximum concurrently active sessions; connections beyond it are
+    /// dropped at accept time. `null` (the default) means unlimited.
+    #[serde(default)]
+    pub max_connections: Option<u64>,
     /// Obfuscation parameters, shared with clients.
     #[serde(default)]
     pub obfuscation: ObfuscationConfig,
@@ -216,6 +220,10 @@ pub struct ClientConfig {
     /// Must match the server.
     #[serde(default)]
     pub password: Option<String>,
+    /// Maximum concurrently active inbound connections; beyond it new ones
+    /// are dropped. `null` (the default) means unlimited.
+    #[serde(default)]
+    pub max_connections: Option<u64>,
     /// Remote server section.
     pub server: ServerSection,
 }

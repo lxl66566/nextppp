@@ -6,7 +6,15 @@
 //! counts and duration), `warn` for tunnel setup failures and protocol
 //! faults, `debug` for negotiation detail.
 
-use std::{net::TcpListener, sync::Arc, thread, time::Duration};
+use std::{
+    net::TcpListener,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
+    time::Duration,
+};
 
 use anyhow::Context;
 use nextppp_common::{addr::Host, config::ClientConfig, pump};
@@ -30,6 +38,8 @@ pub struct ClientRuntime {
     pub server_key: Arc<ObfuscationKey>,
     /// Connect + handshake timeout toward the server.
     pub connect_timeout: Duration,
+    /// Maximum concurrently active inbound connections (`None` = unlimited).
+    pub max_connections: Option<u64>,
 }
 
 impl ClientRuntime {
@@ -53,6 +63,7 @@ impl ClientRuntime {
             server_port,
             server_key: Arc::new(key),
             connect_timeout: Duration::from_secs(cfg.server.connect_timeout),
+            max_connections: cfg.max_connections,
         })
     }
 }
@@ -105,9 +116,20 @@ pub fn serve(listener: TcpListener, rt: Arc<ClientRuntime>) -> anyhow::Result<()
         "nextppp client socks5 inbound on {}",
         listener.local_addr()?.to_string()
     );
+    let active = Arc::new(AtomicU64::new(0));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                // Best-effort gate against local apps wedging the process
+                // with half-open socks sessions (load/increment not atomic).
+                if let Some(max) = rt.max_connections {
+                    if active.load(Ordering::Relaxed) >= max {
+                        debug!("inbound rejected: connection limit {max} reached");
+                        continue; // dropping `stream` closes it
+                    }
+                }
+                let active = Arc::clone(&active);
+                active.fetch_add(1, Ordering::Relaxed);
                 // Name threads per peer so stacks of stuck inbound sessions
                 // are distinguishable in logs/debuggers.
                 let name = stream.peer_addr().map_or_else(
@@ -120,7 +142,10 @@ pub fn serve(listener: TcpListener, rt: Arc<ClientRuntime>) -> anyhow::Result<()
                     // Shallow call chain (negotiation, tunnel, pump loop;
                     // large buffers are heap-owned); see also the server.
                     .stack_size(SESSION_STACK)
-                    .spawn(move || socks5::handle(stream, &rt));
+                    .spawn(move || {
+                        let _guard = ActiveGuard(&active);
+                        socks5::handle(stream, &rt);
+                    });
                 if let Err(e) = spawned {
                     error!("inbound spawn failed: {e}");
                 }
@@ -132,6 +157,15 @@ pub fn serve(listener: TcpListener, rt: Arc<ClientRuntime>) -> anyhow::Result<()
         }
     }
     Ok(())
+}
+
+/// Decrements the active-inbound counter when a connection ends.
+struct ActiveGuard<'a>(&'a AtomicU64);
+
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]

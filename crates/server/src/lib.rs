@@ -48,6 +48,8 @@ pub struct ServerRuntime {
     pub connect_timeout: Duration,
     /// Handshake timeout (anti slow-loris).
     pub handshake_timeout: Duration,
+    /// Maximum concurrently active sessions (`None` = unlimited).
+    pub max_connections: Option<u64>,
 }
 
 impl ServerRuntime {
@@ -67,6 +69,7 @@ impl ServerRuntime {
             key: Arc::new(key),
             connect_timeout: Duration::from_secs(cfg.connect_timeout),
             handshake_timeout: Duration::from_secs(cfg.handshake_timeout),
+            max_connections: cfg.max_connections,
         })
     }
 }
@@ -80,6 +83,9 @@ struct ServerStats {
     sessions: AtomicU64,
     /// Handshake failures: active probing, wrong secrets, timeouts.
     handshake_failures: AtomicU64,
+    /// Connections dropped at accept time because `max_connections` was
+    /// reached (the per-rejection log stays at `debug` to survive floods).
+    rejected_overload: AtomicU64,
     /// Bytes tunneled from clients towards targets.
     bytes_to_targets: AtomicU64,
     /// Bytes tunneled from targets back to clients.
@@ -115,6 +121,16 @@ pub fn serve(listener: TcpListener, rt: ServerRuntime) -> anyhow::Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                // Best-effort session gate: the load/increment below is not
+                // atomic, so a burst can overshoot by a few; good enough
+                // against slowloris-style thread/fd exhaustion.
+                if let Some(max) = rt.max_connections {
+                    if stats.active.load(Ordering::Relaxed) >= max {
+                        stats.rejected_overload.fetch_add(1, Ordering::Relaxed);
+                        debug!("session rejected: connection limit {max} reached");
+                        continue; // dropping `stream` closes it
+                    }
+                }
                 let rt = rt.clone();
                 let stats = Arc::clone(&stats);
                 let mut sid =
@@ -151,12 +167,13 @@ fn spawn_heartbeat(stats: Arc<ServerStats>) {
             loop {
                 thread::sleep(HEARTBEAT_INTERVAL);
                 info!(
-                    "heartbeat: uptime {} active {} sessions {} failed_handshakes {} to-targets \
-                     {} to-clients {}",
+                    "heartbeat: uptime {} active {} sessions {} failed_handshakes {} overloaded \
+                     {} to-targets {} to-clients {}",
                     fmt_duration(started.elapsed()),
                     stats.active.load(Ordering::Relaxed),
                     stats.sessions.load(Ordering::Relaxed),
                     stats.handshake_failures.load(Ordering::Relaxed),
+                    stats.rejected_overload.load(Ordering::Relaxed),
                     fmt_bytes(stats.bytes_to_targets.load(Ordering::Relaxed)),
                     fmt_bytes(stats.bytes_to_clients.load(Ordering::Relaxed)),
                 );

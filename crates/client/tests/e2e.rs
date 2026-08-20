@@ -58,6 +58,7 @@ fn start_server() -> SocketAddr {
         password: None,
         connect_timeout: 5,
         handshake_timeout: 10,
+        max_connections: None,
         obfuscation: ObfuscationConfig::default(),
     };
     let rt = ServerRuntime::from_config(&cfg).unwrap();
@@ -73,6 +74,7 @@ fn start_client(server: SocketAddr) -> SocketAddr {
     let cfg = ClientConfig {
         listen: addr.to_string(),
         password: None,
+        max_connections: None,
         server: ServerSection {
             address: server.to_string(),
             connect_timeout: 5,
