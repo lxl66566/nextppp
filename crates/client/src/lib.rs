@@ -99,7 +99,9 @@ pub fn parse_host_port(s: &str) -> anyhow::Result<(Host, u16)> {
     }
     let h = match host.parse::<std::net::IpAddr>() {
         Ok(ip) => Host::Ip(ip),
-        Err(_) => Host::Domain(host.to_ascii_lowercase()),
+        // Original case preserved: DNS lookups are case-insensitive, and
+        // mutating the configured address would surprise log diffs.
+        Err(_) => Host::Domain(host.to_owned()),
     };
     Ok((h, port))
 }
@@ -245,7 +247,8 @@ mod tests {
         let (Host::Domain(d), 8080) = parse_host_port("Example.COM:8080").unwrap() else {
             panic!("domain")
         };
-        assert_eq!(d, "example.com");
+        // Case is preserved end to end (DNS is case-insensitive).
+        assert_eq!(d, "Example.COM");
     }
 
     #[test]

@@ -177,7 +177,9 @@ fn read_addr(stream: &mut TcpStream, atyp: u8) -> std::io::Result<ProxyAddr> {
                     "invalid domain characters",
                 ));
             }
-            Host::Domain(name.to_ascii_lowercase())
+            // Original case preserved: DNS is case-insensitive but the
+            // domain must be forwarded verbatim per RFC 1928.
+            Host::Domain(name)
         },
         _ => {
             return Err(std::io::Error::new(
