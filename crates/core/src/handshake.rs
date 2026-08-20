@@ -70,6 +70,15 @@ pub fn nop_rounds<R: Rng>(rng: &mut R, key: &ObfuscationKey) -> u32 {
     rounds.div_ceil(175 << 3)
 }
 
+/// Upper bound on NOP packets a compliant sender may emit (`nop_rounds` is
+/// already divided by 1400, so `2^max(kl,kh)` is a generous bound).
+/// Receivers use it to cap dummy-packet skipping against hostile peers that
+/// would otherwise keep the connection in the handshake phase forever.
+#[must_use]
+pub fn max_nop_packets(key: &ObfuscationKey) -> u32 {
+    1u32 << key.kl.max(key.kh)
+}
+
 /// Packs a session-id packet. `id == 0` produces a dummy (noise) packet.
 #[must_use]
 pub fn pack_session_id<R: Rng>(rng: &mut R, key: &ObfuscationKey, id: SessionId) -> Vec<u8> {

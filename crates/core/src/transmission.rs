@@ -45,8 +45,8 @@ use crate::{
         },
     },
     handshake::{
-        CANARY_MAGIC, CANARY_MAGIC_MASK, SessionPacket, flag_canary, nop_rounds, pack_session_id,
-        unpack_session_id,
+        CANARY_MAGIC, CANARY_MAGIC_MASK, SessionPacket, flag_canary, max_nop_packets, nop_rounds,
+        pack_session_id, unpack_session_id,
     },
 };
 
@@ -546,13 +546,19 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
         self.write(&packet)
     }
 
-    /// Reads real session-id packets, skipping dummy noise.
+    /// Reads real session-id packets, skipping dummy noise. The skip budget
+    /// is bounded by [`max_nop_packets`] so a hostile peer cannot pin the
+    /// connection in the handshake phase with an endless dummy stream.
     fn read_session_id(&mut self) -> Result<SessionId> {
+        let mut budget = max_nop_packets(&self.tx.key);
         loop {
             let packet = self.read()?;
             if let SessionPacket::Session(id) = unpack_session_id(&self.rx.key, &packet)? {
                 return Ok(id);
             }
+            budget = budget
+                .checked_sub(1)
+                .ok_or(Error::HandshakeFailed("too many dummy packets"))?;
         }
     }
 }
