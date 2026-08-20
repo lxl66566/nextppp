@@ -81,6 +81,12 @@ fn negotiate_and_forward(
         let _ = reply(&mut stream, REP_CMD_UNSUPPORTED);
         anyhow::bail!("unsupported command {:#04x}", head[1]);
     }
+    // RFC 1928: RSV is reserved and must be zero.
+    if head[2] != 0 {
+        warn!("[{peer}] non-zero reserved byte {:#04x}", head[2]);
+        let _ = reply(&mut stream, REP_GENERAL);
+        anyhow::bail!("non-zero reserved byte {:#04x}", head[2]);
+    }
     let addr = match read_addr(&mut stream, head[3]) {
         Ok(addr) => addr,
         Err(e) => {
