@@ -8,7 +8,7 @@
 use std::{
     io::{ErrorKind, Read, Write},
     net::TcpStream,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
 
@@ -19,7 +19,7 @@ use nextppp_common::{
 };
 use spdlog::prelude::*;
 
-use crate::{ClientRuntime, outbound};
+use crate::{ClientRuntime, ClientStats, outbound};
 
 const VER: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
@@ -41,13 +41,13 @@ const REP_ATYP_UNSUPPORTED: u8 = 0x08;
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Handles one SOCKS5 connection end to end, logging its full lifecycle.
-pub fn handle(stream: TcpStream, rt: &Arc<ClientRuntime>) {
+pub fn handle(stream: TcpStream, rt: &Arc<ClientRuntime>, stats: &ClientStats) {
     pump::nodelay(&stream);
     let peer = stream
         .peer_addr()
         .map_or_else(|_| String::from("?"), |a| a.to_string());
 
-    if let Err(e) = negotiate_and_forward(stream, rt, &peer) {
+    if let Err(e) = negotiate_and_forward(stream, rt, &peer, stats) {
         // Local apps poking the inbound with non-socks5 traffic or vanishing
         // mid-negotiation are routine; anything else deserves a warning.
         if pump::is_clean_close(&e) {
@@ -65,6 +65,7 @@ fn negotiate_and_forward(
     mut stream: TcpStream,
     rt: &Arc<ClientRuntime>,
     peer: &str,
+    stats: &ClientStats,
 ) -> anyhow::Result<()> {
     let _ = stream.set_read_timeout(Some(NEGOTIATION_TIMEOUT));
     let _ = stream.set_write_timeout(Some(NEGOTIATION_TIMEOUT));
@@ -103,16 +104,21 @@ fn negotiate_and_forward(
 
     match outbound::tunnel_connect(&addr, rt) {
         Ok((tx, rx)) => {
+            stats.tunnels.fetch_add(1, Ordering::Relaxed);
             reply(&mut stream, REP_SUCCEEDED).context("reply succeeded")?;
             // The inbound negotiation timeout must not apply to the data plane.
             stream.set_read_timeout(None)?;
             stream.set_write_timeout(None)?;
             let started = Instant::now();
             let s = pump::pump_tunnel(*tx, *rx, stream);
+            // `local` is the inbound app stream: up = app -> tunnel.
+            stats.bytes_up.fetch_add(s.up, Ordering::Relaxed);
+            stats.bytes_down.fetch_add(s.down, Ordering::Relaxed);
             pump::log_close(&format!("[{peer}]"), &target, &s, started);
             Ok(())
         },
         Err(e) => {
+            stats.tunnel_failures.fetch_add(1, Ordering::Relaxed);
             warn!("[{peer}] tunnel connect to {target} failed: {e:#}");
             let _ = reply(&mut stream, REP_GENERAL);
             Err(e.context("outbound connect"))

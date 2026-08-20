@@ -13,7 +13,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -104,6 +104,53 @@ pub fn parse_host_port(s: &str) -> anyhow::Result<(Host, u16)> {
     Ok((h, port))
 }
 
+/// Lifetime counters backing the heartbeat log (the client-side mirror
+/// of the server's stats).
+#[derive(Default)]
+pub struct ClientStats {
+    /// Currently open inbound sessions.
+    active: AtomicU64,
+    /// Total accepted inbound connections.
+    connections: AtomicU64,
+    /// Tunnels established (handshake + server OK).
+    tunnels: AtomicU64,
+    /// Tunnel setup failures (connect, handshake, refused).
+    tunnel_failures: AtomicU64,
+    /// Bytes pumped from local apps into tunnels.
+    bytes_up: AtomicU64,
+    /// Bytes pumped from tunnels back to local apps.
+    bytes_down: AtomicU64,
+}
+
+/// Heartbeat interval for the health/stats log line.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Periodically logs client health (see [`ClientStats`]).
+fn spawn_heartbeat(stats: Arc<ClientStats>) {
+    let spawned = thread::Builder::new()
+        .name("nextppp-heartbeat".to_owned())
+        .spawn(move || {
+            let started = Instant::now();
+            loop {
+                thread::sleep(HEARTBEAT_INTERVAL);
+                info!(
+                    "heartbeat: uptime {} active {} connections {} tunnels {} failed_tunnels {} \
+                     up {} down {}",
+                    nextppp_common::fmt_duration(started.elapsed()),
+                    stats.active.load(Ordering::Relaxed),
+                    stats.connections.load(Ordering::Relaxed),
+                    stats.tunnels.load(Ordering::Relaxed),
+                    stats.tunnel_failures.load(Ordering::Relaxed),
+                    nextppp_common::fmt_bytes(stats.bytes_up.load(Ordering::Relaxed)),
+                    nextppp_common::fmt_bytes(stats.bytes_down.load(Ordering::Relaxed)),
+                );
+            }
+        });
+    if let Err(e) = spawned {
+        warn!("heartbeat thread spawn failed: {e}");
+    }
+}
+
 /// Accept loop; blocks the calling thread forever.
 ///
 /// # Errors
@@ -116,20 +163,21 @@ pub fn serve(listener: TcpListener, rt: Arc<ClientRuntime>) -> anyhow::Result<()
         "nextppp client socks5 inbound on {}",
         listener.local_addr()?.to_string()
     );
-    let active = Arc::new(AtomicU64::new(0));
+    let stats: Arc<ClientStats> = Arc::new(ClientStats::default());
+    spawn_heartbeat(Arc::clone(&stats));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 // Best-effort gate against local apps wedging the process
                 // with half-open socks sessions (load/increment not atomic).
                 if let Some(max) = rt.max_connections {
-                    if active.load(Ordering::Relaxed) >= max {
+                    if stats.active.load(Ordering::Relaxed) >= max {
                         debug!("inbound rejected: connection limit {max} reached");
                         continue; // dropping `stream` closes it
                     }
                 }
-                let active = Arc::clone(&active);
-                active.fetch_add(1, Ordering::Relaxed);
+                stats.connections.fetch_add(1, Ordering::Relaxed);
+                stats.active.fetch_add(1, Ordering::Relaxed);
                 // Name threads per peer so stacks of stuck inbound sessions
                 // are distinguishable in logs/debuggers.
                 let name = stream.peer_addr().map_or_else(
@@ -137,14 +185,15 @@ pub fn serve(listener: TcpListener, rt: Arc<ClientRuntime>) -> anyhow::Result<()
                     |a| format!("nextppp-in-{a}"),
                 );
                 let rt = rt.clone();
+                let stats = Arc::clone(&stats);
                 let spawned = thread::Builder::new()
                     .name(name)
                     // Shallow call chain (negotiation, tunnel, pump loop;
                     // large buffers are heap-owned); see also the server.
                     .stack_size(SESSION_STACK)
                     .spawn(move || {
-                        let _guard = ActiveGuard(&active);
-                        socks5::handle(stream, &rt);
+                        let _guard = ActiveGuard(&stats.active);
+                        socks5::handle(stream, &rt, &stats);
                     });
                 if let Err(e) = spawned {
                     error!("inbound spawn failed: {e}");
