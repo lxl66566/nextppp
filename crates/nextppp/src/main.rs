@@ -83,9 +83,12 @@ fn run_client(config: &Path, init: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 fn bind_listen(spec: &str) -> anyhow::Result<TcpListener> {
-    let listen: SocketAddr = spec
-        .parse()
-        .with_context(|| format!("invalid listen address {spec:?}"))?;
+    let listen: SocketAddr = spec.parse().with_context(|| {
+        format!(
+            "invalid listen address {spec:?} (must be a literal ip:port, e.g. \"0.0.0.0:1080\"; \
+             hostnames are not resolved)"
+        )
+    })?;
     TcpListener::bind(listen).with_context(|| format!("bind {listen}"))
 }
 

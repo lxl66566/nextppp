@@ -1,5 +1,5 @@
 {
-  // Listen address for openppp3 client connections.
+  // Listen address for nextppp client connections.
   "listen": "0.0.0.0:6666",
 
   // Shared tunnel password. Backs both obfuscation cipher keys when they

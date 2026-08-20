@@ -165,9 +165,15 @@ pub fn serve(listener: TcpListener, rt: Arc<ClientRuntime>) -> anyhow::Result<()
     );
     let stats: Arc<ClientStats> = Arc::new(ClientStats::default());
     spawn_heartbeat(Arc::clone(&stats));
-    for stream in listener.incoming() {
+    nextppp_common::shutdown::install(listener.local_addr()?);
+    'accept: for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                // Wake-up connect from the signal handler: shut down, not
+                // a real inbound session.
+                if nextppp_common::shutdown::requested() {
+                    break 'accept;
+                }
                 // Best-effort gate against local apps wedging the process
                 // with half-open socks sessions (load/increment not atomic).
                 if let Some(max) = rt.max_connections {
@@ -200,11 +206,16 @@ pub fn serve(listener: TcpListener, rt: Arc<ClientRuntime>) -> anyhow::Result<()
                 }
             },
             Err(e) => {
+                if nextppp_common::shutdown::requested() {
+                    break 'accept;
+                }
                 warn!("accept failed: {e}");
                 pump::accept_backoff(&e);
             },
         }
     }
+    info!("shutdown signal received; draining sessions");
+    nextppp_common::shutdown::drain_sessions(|| stats.active.load(Ordering::Relaxed));
     Ok(())
 }
 

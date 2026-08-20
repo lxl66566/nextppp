@@ -7,7 +7,7 @@
   // obfuscation cipher keys when they are left unset.
   "password": "CHANGE_ME",
 
-  // Remote openppp3 server.
+  // Remote nextppp server.
   "server": {
     "address": "your.server.example:6666",
     // "connect_timeout": 10,

@@ -27,7 +27,7 @@ use nextppp_common::{
     addr::ProxyAddr,
     config::{ObfuscationConfig, ServerConfig},
     fmt::{fmt_bytes, fmt_duration},
-    proto, pump,
+    proto, pump, shutdown,
 };
 use nextppp_core::{ObfuscationKey, Transmission};
 use rand::Rng;
@@ -115,12 +115,18 @@ pub fn serve(listener: TcpListener, rt: ServerRuntime) -> anyhow::Result<()> {
     );
     let stats: Arc<ServerStats> = Arc::new(ServerStats::default());
     spawn_heartbeat(Arc::clone(&stats));
+    shutdown::install(listener.local_addr()?);
 
     let base = u128::from(rand::rng().next_u64()); // session ids only need uniqueness
     let counter = AtomicU64::new(0);
-    for stream in listener.incoming() {
+    'accept: for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                // Wake-up connect from the signal handler: shut down, not
+                // a real session.
+                if shutdown::requested() {
+                    break 'accept;
+                }
                 // Best-effort session gate: the load/increment below is not
                 // atomic, so a burst can overshoot by a few; good enough
                 // against slowloris-style thread/fd exhaustion.
@@ -150,11 +156,16 @@ pub fn serve(listener: TcpListener, rt: ServerRuntime) -> anyhow::Result<()> {
                 }
             },
             Err(e) => {
+                if shutdown::requested() {
+                    break 'accept;
+                }
                 warn!("accept failed: {e}");
                 pump::accept_backoff(&e);
             },
         }
     }
+    info!("shutdown signal received; draining sessions");
+    shutdown::drain_sessions(|| stats.active.load(Ordering::Relaxed));
     Ok(())
 }
 

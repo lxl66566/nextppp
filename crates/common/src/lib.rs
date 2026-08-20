@@ -11,6 +11,7 @@ pub mod config;
 pub mod fmt;
 pub mod proto;
 pub mod pump;
+pub mod shutdown;
 
 pub use addr::{Host, ProxyAddr};
 pub use config::{ClientConfig, ConfigError, ObfuscationConfig, ServerConfig};
