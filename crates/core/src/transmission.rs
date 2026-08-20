@@ -194,6 +194,17 @@ impl<R: Rng> TxCore<R> {
             Some(ivv),
         );
     }
+
+    /// Marks the handshake complete. In binary framing mode the base94-only
+    /// scratch (sized by pre-handshake traffic, which always uses base94,
+    /// up to ~131KB) is dead weight for the rest of the connection and gets
+    /// released instead of pinned.
+    fn on_handshake_complete(&mut self) {
+        self.handshaked = true;
+        if !self.key.plaintext {
+            self.scratch_bin = Vec::new();
+        }
+    }
 }
 
 /// Rx-direction codec state, the exact inverse of [`TxCore`]. Shared
@@ -349,6 +360,15 @@ impl RxCore {
             Some(ivv),
         )
         .for_decryption();
+    }
+
+    /// See [`TxCore::on_handshake_complete`]: drops the base94 read scratch
+    /// (~131KB peak) once binary framing takes over.
+    fn on_handshake_complete(&mut self) {
+        self.handshaked = true;
+        if !self.key.plaintext {
+            self.scratch_read = Vec::new();
+        }
     }
 }
 
@@ -507,8 +527,8 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
         }
 
         self.rekey(ivv);
-        self.tx.handshaked = true;
-        self.rx.handshaked = true;
+        self.tx.on_handshake_complete();
+        self.rx.on_handshake_complete();
         self.session_id = sid;
         Ok((sid, mux))
     }
@@ -541,8 +561,8 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
             return Err(Error::HandshakeFailed("client ivv is zero"));
         }
         self.rekey(ivv);
-        self.tx.handshaked = true;
-        self.rx.handshaked = true;
+        self.tx.on_handshake_complete();
+        self.rx.on_handshake_complete();
         self.session_id = session_id;
         Ok(())
     }
@@ -690,5 +710,46 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
             io: rx_io,
             core: rx,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    fn test_rng() -> StdRng {
+        StdRng::try_from_rng(&mut rand::rngs::SysRng).expect("failed to seed StdRng")
+    }
+
+    // Pre-handshake traffic always uses base94 and sizes the scratch
+    // buffers; binary mode must release them at handshake completion while
+    // plaintext mode keeps them (they stay on the hot path there).
+    #[test]
+    fn scratch_released_in_binary_mode_kept_in_plaintext_mode() {
+        for (plaintext, expect_kept) in [(false, false), (true, true)] {
+            let key = ObfuscationKey {
+                plaintext,
+                ..ObfuscationKey::default()
+            };
+            // TxCore::write / RxCore::read_buf take the transport as a
+            // parameter, so the transmission itself carries a unit sink.
+            let mut wire = Vec::new();
+            let mut tx = Transmission::with_rng((), key.clone(), test_rng());
+            tx.tx.write(&mut wire, b"handshake-ish payload").unwrap();
+            assert!(tx.tx.scratch_bin.capacity() > 0);
+
+            let mut rx = Transmission::with_rng((), key, test_rng());
+            rx.rx.read_buf(&mut Cursor::new(&wire)).unwrap();
+            assert!(rx.rx.scratch_read.capacity() > 0);
+
+            tx.tx.on_handshake_complete();
+            rx.rx.on_handshake_complete();
+            let kept_bin = tx.tx.scratch_bin.capacity() > 0;
+            let kept_read = rx.rx.scratch_read.capacity() > 0;
+            assert_eq!(kept_bin, expect_kept);
+            assert_eq!(kept_read, expect_kept);
+        }
     }
 }
