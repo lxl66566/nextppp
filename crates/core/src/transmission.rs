@@ -51,6 +51,29 @@ use crate::{
     },
 };
 
+/// Shared in-memory decrypt tail: parses the binary header off `buf` (the
+/// full `[header][body]` packet), validates length consistency, then
+/// deobfuscates the body in place. Returns the message past the header
+/// (the header bytes stay in place; no strip memmove).
+fn decrypt_tail<'a>(
+    key: &ObfuscationKey,
+    protocol_rx: &mut SessionCipher,
+    transport_rx: &mut SessionCipher,
+    handshaked: bool,
+    buf: &'a mut [u8],
+) -> Result<&'a [u8]> {
+    if buf.len() <= HEADER_SIZE {
+        return Err(Error::InvalidFrame);
+    }
+    let header: [u8; HEADER_SIZE] = buf[..HEADER_SIZE].try_into().expect("length checked");
+    let (_, header_kf) = parse_binary_header(key.kf, protocol_rx, header, Some(buf.len()))?;
+    let (_, body) = buf.split_at_mut(HEADER_SIZE);
+    let flags = effective_flags(key, handshaked);
+    payload_deobfuscate(body, &flags, header_kf, key.kf);
+    transport_rx.apply(body);
+    Ok(body)
+}
+
 /// Parses a binary frame header and validates the declared body length
 /// against `PPP_BUFFER_SIZE`. `declared_total` is the full packet's byte
 /// length on in-memory paths, where it guards against truncation/splicing;
@@ -257,34 +280,57 @@ impl RxCore {
     }
 
     /// Decrypts one complete wire packet (in-memory inverse of
-    /// [`TxCore::encrypt_into`]).
+    /// [`TxCore::encrypt_into`]). Allocating compatibility path; see
+    /// [`Self::decrypt_in_place`] for the zero-alloc hot path.
     fn decrypt(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
-        let mut binary = if !self.handshaked || self.key.plaintext {
-            self.b94.decode_packet(packet)?
+        if !self.handshaked || self.key.plaintext {
+            let Self {
+                b94, scratch_body, ..
+            } = self;
+            b94.decode_packet_into(scratch_body, packet)?;
         } else {
-            packet.to_vec()
-        };
-        if binary.len() <= HEADER_SIZE {
-            return Err(Error::InvalidFrame);
+            self.scratch_body.clear();
+            self.scratch_body.extend_from_slice(packet);
         }
-        let header: [u8; HEADER_SIZE] = binary[..HEADER_SIZE].try_into().expect("length checked");
-        let (_, header_kf) = parse_binary_header(
-            self.key.kf,
-            &mut self.protocol_rx,
-            header,
-            Some(binary.len()),
-        )?;
-        // Decrypt in place, then drop the header: one allocation total.
-        binary.drain(..HEADER_SIZE);
-        self.decrypt_body(header_kf, &mut binary);
-        Ok(binary)
+        let Self {
+            key,
+            protocol_rx,
+            transport_rx,
+            handshaked,
+            scratch_body,
+            ..
+        } = self;
+        decrypt_tail(key, protocol_rx, transport_rx, *handshaked, scratch_body).map(<[u8]>::to_vec)
     }
 
-    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "RxCore"))]
-    fn decrypt_body(&mut self, header_kf: u32, body: &mut [u8]) {
-        let flags = effective_flags(&self.key, self.handshaked);
-        payload_deobfuscate(body, &flags, header_kf, self.key.kf);
-        self.transport_rx.apply(body);
+    /// In-place variant of [`Self::decrypt`]: `packet` (one complete wire
+    /// packet) is decrypted and the message borrows either `packet` (binary
+    /// framing) or the internal base94 scratch — zero allocation either
+    /// way, and no header-strip memmove (the header stays in place and the
+    /// returned slice starts past it).
+    fn decrypt_in_place<'a>(&'a mut self, packet: &'a mut [u8]) -> Result<&'a [u8]> {
+        if !self.handshaked || self.key.plaintext {
+            let Self {
+                b94,
+                scratch_body,
+                key,
+                protocol_rx,
+                transport_rx,
+                handshaked,
+                ..
+            } = self;
+            b94.decode_packet_into(scratch_body, packet)?;
+            decrypt_tail(key, protocol_rx, transport_rx, *handshaked, scratch_body)
+        } else {
+            let Self {
+                key,
+                protocol_rx,
+                transport_rx,
+                handshaked,
+                ..
+            } = self;
+            decrypt_tail(key, protocol_rx, transport_rx, *handshaked, packet)
+        }
     }
 
     /// Reads one framed message from `io`, returning a slice into the
@@ -474,6 +520,13 @@ impl<T, R: Rng> Transmission<T, R> {
     /// [`Self::encrypt_into`]).
     pub fn decrypt(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
         self.rx.decrypt(packet)
+    }
+
+    /// [`Self::decrypt`] without allocation: the decrypted message borrows
+    /// `packet` (binary framing) or an internal scratch (base94 framing),
+    /// overwritten by the next call.
+    pub fn decrypt_in_place<'a>(&'a mut self, packet: &'a mut [u8]) -> Result<&'a [u8]> {
+        self.rx.decrypt_in_place(packet)
     }
 
     /// Rebuilds all four cipher instances with per-connection key material.
@@ -717,6 +770,13 @@ impl<T: Read> TransmissionRx<T> {
     pub fn read_buf(&mut self) -> Result<&[u8]> {
         self.core.read_buf(&mut self.io)
     }
+
+    /// In-memory decrypt for datagram-style callers (see
+    /// [`Transmission::decrypt_in_place`]): zero allocation, no header
+    /// strip; the message borrows `packet` or the internal base94 scratch.
+    pub fn decrypt_in_place<'a>(&'a mut self, packet: &'a mut [u8]) -> Result<&'a [u8]> {
+        self.core.decrypt_in_place(packet)
+    }
 }
 
 /// Split support: requires a duplex transport (read + write per half).
@@ -752,7 +812,7 @@ mod tests {
 
     use super::*;
 
-    fn test_rng() -> StdRng {
+    pub(super) fn test_rng() -> StdRng {
         StdRng::try_from_rng(&mut rand::rngs::SysRng).expect("failed to seed StdRng")
     }
 
@@ -804,5 +864,35 @@ mod tests {
         assert_eq!(msg, [
             0xd1, b'h', b'e', b'l', b'l', b'o', b' ', b't', b'a', b'g', b'g', b'e', b'd'
         ]);
+    }
+}
+
+#[cfg(test)]
+mod decrypt_in_place_tests {
+    use super::{tests::test_rng, *};
+
+    // decrypt_in_place must agree with the allocating decrypt on both
+    // framings, and the message must start past the 3-byte header without
+    // any strip memmove.
+    #[test]
+    fn in_place_matches_allocating_decrypt() {
+        for plaintext in [false, true] {
+            let key = ObfuscationKey {
+                plaintext,
+                ..ObfuscationKey::default()
+            };
+            let mut wire = Vec::new();
+            let mut tx = Transmission::with_rng((), key.clone(), test_rng());
+            tx.tx.write(&mut wire, b"datagram body").unwrap();
+
+            let mut rx_a = Transmission::with_rng((), key.clone(), test_rng());
+            let alloc = rx_a.rx.decrypt(&wire).unwrap();
+
+            let mut rx_b = Transmission::with_rng((), key, test_rng());
+            let mut owned = wire.clone();
+            let in_place = rx_b.rx.decrypt_in_place(&mut owned).unwrap();
+            assert_eq!(alloc, in_place);
+            assert_eq!(in_place, b"datagram body");
+        }
     }
 }

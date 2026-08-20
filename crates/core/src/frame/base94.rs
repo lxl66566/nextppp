@@ -285,6 +285,15 @@ impl Base94Framer {
     /// not advance the first-frame flag.
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "Base94Framer"))]
     pub fn decode_packet(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.decode_packet_into(&mut out, packet)?;
+        Ok(out)
+    }
+
+    /// [`Self::decode_packet`] into a caller-owned reusable buffer (zero
+    /// allocation once the buffer is warm; `out` is fully overwritten).
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "Base94Framer"))]
+    pub fn decode_packet_into(&mut self, out: &mut Vec<u8>, packet: &[u8]) -> Result<()> {
         let (header_len, len) = if self.rx_first {
             if packet.len() < HEADER_EXTENDED {
                 return Err(Error::InvalidFrame);
@@ -307,10 +316,11 @@ impl Base94Framer {
         if len + header_len != packet.len() {
             return Err(Error::InvalidFrame);
         }
-        let mut out = Vec::with_capacity(len);
-        base94_decode_into(&mut out, &packet[header_len..], self.kf)?;
+        out.clear();
+        out.reserve(len);
+        base94_decode_into(out, &packet[header_len..], self.kf)?;
         self.rx_first = false;
-        Ok(out)
+        Ok(())
     }
 }
 
