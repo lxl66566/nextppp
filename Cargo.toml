@@ -51,9 +51,9 @@ wildcard_imports        = "allow"
 unsafe_code           = "warn"
 unused_qualifications = "warn"
 
-# If you are building bin target, uncomment this
+# Performance first (see AGENTS.md); size stays reasonable via strip + LTO.
 [profile.release]
-opt-level     = "s"
+opt-level     = 3
 strip         = true
 lto           = true
 panic         = "unwind"
