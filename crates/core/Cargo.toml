@@ -37,7 +37,7 @@ ctr       = { workspace = true }
 [features]
 # Profiling instrumentation (linux dev tooling; noop and zero-cost when off,
 # so Windows/default builds never pull the profiler in).
-hotpath       = ["dep:hotpath", "hotpath/hotpath"]
+hotpath       = ["dep:hotpath", "hotpath/hotpath", "base94-simd/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 # Sampling CPU attribution via samply (linux/macos only; needs a debug-info
 # profile and the external samply/hotpath-samply binaries at runtime).

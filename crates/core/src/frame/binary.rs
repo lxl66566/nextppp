@@ -60,6 +60,7 @@ impl PayloadFlags {
 /// `header_kf` used later for the payload transform.
 ///
 /// `payload_len` must be in `1..=PPP_BUFFER_SIZE`.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn header_encrypt<R: Rng>(
     rng: &mut R,
     kf: u32,
@@ -88,6 +89,7 @@ pub fn header_encrypt<R: Rng>(
 }
 
 /// Decrypts a 3-byte header. Returns `(payload_len, header_kf)`.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn header_decrypt(
     kf: u32,
     protocol: Option<&mut SessionCipher>,

@@ -116,11 +116,13 @@ pub fn unshuffle(data: &mut [u8], key: u32) {
 ///
 /// Safe to run in place: the previous plaintext byte is kept in a local.
 /// SIMD-accelerated (`crypto::simd`); wire output identical.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn delta_encode(data: &mut [u8], kf: u32) {
     simd::delta_encode(data, kf as u8);
 }
 
 /// In-place inverse of [`delta_encode`]. SIMD-accelerated (prefix-sum scan).
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn delta_decode(data: &mut [u8], kf: u32) {
     simd::delta_decode(data, kf as u8);
 }

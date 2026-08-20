@@ -25,3 +25,11 @@ wildcard_imports        = "allow"
 [lints.rust]
 unsafe_code           = "allow"
 unused_qualifications = "warn"
+
+[features]
+# Profiling instrumentation (noop and zero-cost when off); the encode/decode
+# entry points are the hottest functions in the nextppp data plane.
+hotpath = ["dep:hotpath", "hotpath/hotpath"]
+
+[dependencies]
+hotpath = { workspace = true, optional = true }

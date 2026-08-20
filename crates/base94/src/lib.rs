@@ -66,6 +66,7 @@ pub fn encode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) {
 /// `len` must be exactly `encoded_len(src, kf)`. A wrong value corrupts or
 /// overruns the output buffer (the writes trust `len` for capacity);
 /// `debug_assert` catches misuse in debug builds.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn encode_into_with_len(out: &mut Vec<u8>, src: &[u8], kf: u32, len: usize) {
     // 8-wide unroll: the output offsets form a short serial prefix chain
     // (7 adds amortized over 8 bytes) while the 16 leader/follower stores
@@ -158,6 +159,7 @@ pub fn encoded_len(src: &[u8], kf: u32) -> usize {
 /// reconstruction and leader compaction in-register). Invalid constructs fall
 /// back to the scalar reference loop, which reports the exact wire-legal
 /// error; both paths are bit-exact (pinned by the fuzz test below).
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn decode_into(out: &mut Vec<u8>, src: &[u8], kf: u32) -> Result<(), DecodeError> {
     if !simd::all_ge(src, 0x20) {
         return Err(DecodeError);

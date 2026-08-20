@@ -172,6 +172,7 @@ pub fn accept_backoff(err: &io::Error) {
 ///
 /// DNS resolution failure/timeout or every candidate address failing to
 /// connect before the deadline.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn tcp_connect(host: &Host, port: u16, timeout: Duration) -> io::Result<TcpStream> {
     match host {
         Host::Ip(ip) => TcpStream::connect_timeout(&SocketAddr::new(*ip, port), timeout),

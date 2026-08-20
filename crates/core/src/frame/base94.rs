@@ -283,6 +283,7 @@ impl Base94Framer {
     /// transports: decodes one frame from the front of `packet`, honoring
     /// first-frame state and the length-consistency check. Failed decodes do
     /// not advance the first-frame flag.
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "Base94Framer"))]
     pub fn decode_packet(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
         let (header_len, len) = if self.rx_first {
             if packet.len() < HEADER_EXTENDED {
