@@ -39,8 +39,8 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 /// Immutable runtime parameters derived from the configuration.
 #[derive(Clone)]
 pub struct ServerRuntime {
-    /// Obfuscation/cipher parameters.
-    pub key: ObfuscationKey,
+    /// Obfuscation/cipher parameters, shared across sessions.
+    pub key: Arc<ObfuscationKey>,
     /// Server -> target connect timeout.
     pub connect_timeout: Duration,
     /// Handshake timeout (anti slow-loris).
@@ -61,7 +61,7 @@ impl ServerRuntime {
             .context("obfuscation config")?;
         ObfuscationConfig::warn_placeholder(&key);
         Ok(Self {
-            key,
+            key: Arc::new(key),
             connect_timeout: Duration::from_secs(cfg.connect_timeout),
             handshake_timeout: Duration::from_secs(cfg.handshake_timeout),
         })
@@ -186,7 +186,7 @@ fn handle_conn_inner(
     stream.set_write_timeout(Some(rt.handshake_timeout))?;
     let rx_io = stream.try_clone().context("clone stream")?;
 
-    let mut tx = Transmission::new(stream, rt.key.clone());
+    let mut tx = Transmission::new(stream, Arc::clone(&rt.key));
     if let Err(e) = tx.handshake_server(sid, false) {
         stats.handshake_failures.fetch_add(1, Ordering::Relaxed);
         // Probes/scanners with wrong secrets land here (checksum/base94

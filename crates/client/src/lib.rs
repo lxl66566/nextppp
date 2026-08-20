@@ -12,17 +12,18 @@ use anyhow::Context;
 use nextppp_common::{addr::Host, config::ClientConfig};
 use nextppp_core::ObfuscationKey;
 use spdlog::prelude::*;
-
 pub mod outbound;
 pub mod socks5;
 
 /// Immutable runtime parameters derived from the configuration.
 #[derive(Clone)]
 pub struct ClientRuntime {
-    /// Remote nextppp server address (`host:port`, kept unresolved).
-    pub server_address: String,
-    /// Obfuscation parameters shared with the server.
-    pub server_key: ObfuscationKey,
+    /// Remote nextppp server endpoint, parsed once at startup (per-CONNECT
+    /// re-parsing cost a lowercase alloc and a split every time).
+    pub server_host: Host,
+    pub server_port: u16,
+    /// Obfuscation parameters shared with the server, shared across tunnels.
+    pub server_key: Arc<ObfuscationKey>,
     /// Connect + handshake timeout toward the server.
     pub connect_timeout: Duration,
 }
@@ -41,11 +42,12 @@ impl ClientRuntime {
             .map_err(anyhow::Error::msg)
             .context("obfuscation config")?;
         nextppp_common::ObfuscationConfig::warn_placeholder(&key);
-        parse_host_port(&cfg.server.address)
+        let (server_host, server_port) = parse_host_port(&cfg.server.address)
             .with_context(|| format!("invalid server address {:?}", cfg.server.address))?;
         Ok(Self {
-            server_address: cfg.server.address.clone(),
-            server_key: key,
+            server_host,
+            server_port,
+            server_key: Arc::new(key),
             connect_timeout: Duration::from_secs(cfg.server.connect_timeout),
         })
     }

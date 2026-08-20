@@ -28,6 +28,7 @@
 use std::{
     io::{self, Read, Write},
     mem,
+    sync::Arc,
 };
 
 use rand::{Rng, RngExt, SeedableRng, rngs::StdRng};
@@ -91,7 +92,7 @@ fn effective_flags(key: &ObfuscationKey, handshaked: bool) -> PayloadFlags {
 /// apart.
 struct TxCore<R> {
     rng: R,
-    key: ObfuscationKey,
+    key: Arc<ObfuscationKey>,
     b94: Base94Framer,
     protocol_tx: SessionCipher,
     transport_tx: SessionCipher,
@@ -104,7 +105,7 @@ struct TxCore<R> {
 }
 
 impl<R: Rng> TxCore<R> {
-    fn new(key: &ObfuscationKey, rng: R) -> Self {
+    fn new(key: Arc<ObfuscationKey>, rng: R) -> Self {
         Self {
             rng,
             b94: Base94Framer::new(key.kf),
@@ -114,7 +115,7 @@ impl<R: Rng> TxCore<R> {
                 CipherRole::Transport,
                 &key.transport_key,
             ),
-            key: key.clone(),
+            key,
             handshaked: false,
             scratch_bin: Vec::new(),
             scratch_out: Vec::new(),
@@ -210,7 +211,7 @@ impl<R: Rng> TxCore<R> {
 /// Rx-direction codec state, the exact inverse of [`TxCore`]. Shared
 /// verbatim by [`Transmission`] and its split [`TransmissionRx`] half.
 struct RxCore {
-    key: ObfuscationKey,
+    key: Arc<ObfuscationKey>,
     b94: Base94Framer,
     protocol_rx: SessionCipher,
     transport_rx: SessionCipher,
@@ -222,7 +223,7 @@ struct RxCore {
 }
 
 impl RxCore {
-    fn new(key: &ObfuscationKey) -> Self {
+    fn new(key: Arc<ObfuscationKey>) -> Self {
         Self {
             b94: Base94Framer::new(key.kf),
             protocol_rx: SessionCipher::new(key.protocol, CipherRole::Protocol, &key.protocol_key)
@@ -233,7 +234,7 @@ impl RxCore {
                 &key.transport_key,
             )
             .for_decryption(),
-            key: key.clone(),
+            key,
             handshaked: false,
             scratch_read: Vec::new(),
             scratch_body: Vec::new(),
@@ -387,9 +388,12 @@ pub struct Transmission<T, R = StdRng> {
 }
 
 impl<T> Transmission<T, StdRng> {
-    /// Creates a transmission with an OS-seeded CSPRNG.
+    /// Creates a transmission with an OS-seeded CSPRNG. Accepts an owned or
+    /// already-shared ([`Arc`]) key; long-lived callers should share one
+    /// `Arc<ObfuscationKey>` across connections instead of cloning the
+    /// struct (it carries two `String` passwords) per connection.
     #[must_use]
-    pub fn new(io: T, key: ObfuscationKey) -> Self {
+    pub fn new(io: T, key: impl Into<Arc<ObfuscationKey>>) -> Self {
         // rand 0.10 removed SeedableRng::from_os_rng; SysRng is the stateless
         // OS-entropy interface, StdRng::try_from_rng seeds it from there.
         let rng = StdRng::try_from_rng(&mut rand::rngs::SysRng)
@@ -401,20 +405,17 @@ impl<T> Transmission<T, StdRng> {
 /// Transport-independent core: in-memory packet codec, state and rekeying.
 impl<T, R: Rng> Transmission<T, R> {
     /// Creates a transmission with an explicit RNG (deterministic tests).
-    // By value for API ergonomics (ownership transfer); the per-direction
-    // cores clone the key internally because they split into separate
-    // threads later.
-    #[allow(clippy::needless_pass_by_value)]
     #[must_use]
-    pub fn with_rng(io: T, key: ObfuscationKey, rng: R) -> Self {
+    pub fn with_rng(io: T, key: impl Into<Arc<ObfuscationKey>>, rng: R) -> Self {
+        let key = key.into();
         // Config validation is the upper layer's job (see
         // `ObfuscationKey::validate`); this only guards against misuse in
         // debug builds, e.g. hand-constructed keys in tests.
         debug_assert!(key.validate().is_ok());
         Self {
             io,
-            tx: TxCore::new(&key, rng),
-            rx: RxCore::new(&key),
+            tx: TxCore::new(Arc::clone(&key), rng),
+            rx: RxCore::new(key),
             session_id: 0,
         }
     }
