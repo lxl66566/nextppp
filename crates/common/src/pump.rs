@@ -1,4 +1,4 @@
-//! Bidirectional connection pumps for the synchronous two-thread model.
+//! Bidirectional connection pumps for the synchronous pump model.
 //!
 //! The single shape: a local TCP peer against a split nextppp tunnel,
 //! wrapping data in `FRAME_DATA` frames and propagating half-closes as
@@ -8,10 +8,17 @@
 //! reset / fault) so callers can log connection teardown at the right level.
 //! A non-graceful end shuts down both sockets, waking the sibling pump;
 //! a graceful half-close (`FRAME_EOF`) leaves the other direction running.
+//!
+//! Threading: the uplink runs inline on the caller's thread and only the
+//! downlink gets a dedicated small-stack thread, so a session costs two
+//! threads total. The local socket is shared via `Arc` (`&TcpStream`
+//! implements both `Read` and `Write`), so no fd clones are needed for
+//! concurrent access or teardown.
 
 use std::{
     io::{self, ErrorKind, Read, Write},
     net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -28,6 +35,11 @@ use crate::{
 /// Read chunk size: small enough for interactive latency, large enough to
 /// amortize per-frame crypto/header overhead.
 const CHUNK: usize = 16 * 1024;
+
+/// Stack for the spawned downlink pump: the call chain is shallow (read ->
+/// decrypt -> local write, no recursion, no large stack arrays), so the
+/// 2MiB default is pure waste at 10k+ connections.
+const PUMP_STACK: usize = 256 * 1024;
 
 /// How one pump direction terminated.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,7 +167,17 @@ pub fn tcp_connect(host: &Host, port: u16, timeout: Duration) -> io::Result<TcpS
 // local-read wait); subtracting the nested `tx.write` time yields the local
 // I/O share.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn tunnel_up(mut tx: TransmissionTx<TcpStream>, mut local: TcpStream) -> (u64, PumpEnd) {
+fn tunnel_up(mut tx: TransmissionTx<TcpStream>, local: Arc<TcpStream>) -> (u64, PumpEnd) {
+    let r = pump_up_loop(&mut tx, &local);
+    if r.1.kills_session() {
+        kill_session(tx.io(), &local);
+    }
+    r
+}
+
+// `mut` on the shared reference: Read/Write are implemented for
+// `&TcpStream`, whose methods need `&mut &TcpStream`.
+fn pump_up_loop(tx: &mut TransmissionTx<TcpStream>, mut local: &TcpStream) -> (u64, PumpEnd) {
     let mut buf = vec![0u8; CHUNK];
     let mut frame = Vec::with_capacity(CHUNK + 1);
     let mut total = 0u64;
@@ -188,7 +210,15 @@ fn tunnel_up(mut tx: TransmissionTx<TcpStream>, mut local: TcpStream) -> (u64, P
 /// Tunnel -> local direction: unwraps `FRAME_DATA`, forwards `FRAME_EOF` as
 /// a local write-side shutdown.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn tunnel_down(mut rx: TransmissionRx<TcpStream>, mut local: TcpStream) -> (u64, PumpEnd) {
+fn tunnel_down(mut rx: TransmissionRx<TcpStream>, local: Arc<TcpStream>) -> (u64, PumpEnd) {
+    let r = pump_down_loop(&mut rx, &local);
+    if r.1.kills_session() {
+        kill_session(rx.io(), &local);
+    }
+    r
+}
+
+fn pump_down_loop(rx: &mut TransmissionRx<TcpStream>, mut local: &TcpStream) -> (u64, PumpEnd) {
     let mut total = 0u64;
     loop {
         match rx.read_buf() {
@@ -285,29 +315,16 @@ impl PumpEnd {
     }
 }
 
-/// Session teardown handles. Dropping one clone of a socket never wakes a
-/// thread blocked in `read` on another clone (no FIN is sent while handles
-/// remain); `shutdown` acts on the socket itself and does. Both pumps keep
-/// one of these so a non-graceful end can unblock its sibling instead of
-/// leaving it parked on a dead connection forever (NAT timeouts and network
-/// partitions make this routine on proxied networks).
-struct KillSwitch {
-    tunnel: TcpStream,
-    local: TcpStream,
-}
-
-impl KillSwitch {
-    fn new(tunnel: &TcpStream, local: &TcpStream) -> Self {
-        Self {
-            tunnel: tunnel.try_clone().expect("tcp stream clone"),
-            local: local.try_clone().expect("tcp stream clone"),
-        }
-    }
-
-    fn activate(&self) {
-        let _ = self.tunnel.shutdown(Shutdown::Both);
-        let _ = self.local.shutdown(Shutdown::Both);
-    }
+/// Wakes the sibling pump after a non-graceful end. Dropping a handle never
+/// wakes a thread blocked in `read`/`write` on another handle of the same
+/// socket (no FIN is sent while handles remain); `shutdown` acts on the
+/// socket itself and does. Shutting down both directions of both sockets
+/// unblocks the sibling wherever it is parked (NAT timeouts and network
+/// partitions make this routine on proxied networks). Each pump uses the
+/// handles it already owns, so no fd clones are needed.
+fn kill_session(tunnel: &TcpStream, local: &TcpStream) {
+    let _ = tunnel.shutdown(Shutdown::Both);
+    let _ = local.shutdown(Shutdown::Both);
 }
 
 /// Logs a pumped connection's teardown at `info`, escalating to `warn` when
@@ -336,35 +353,33 @@ pub fn pump_tunnel(
     rx: TransmissionRx<TcpStream>,
     local: TcpStream,
 ) -> PumpStats {
-    let local_w = local.try_clone().expect("tcp stream clone");
-    thread::scope(|s| {
-        let up_kill = KillSwitch::new(rx.io(), &local);
-        let down_kill = KillSwitch::new(tx.io(), &local_w);
-        let down = s.spawn(move || {
-            let r = tunnel_down(rx, local_w);
-            if r.1.kills_session() {
-                down_kill.activate();
-            }
-            r
+    let local = Arc::new(local);
+    // Downlink on a dedicated small-stack thread; uplink runs inline, one
+    // spawned thread per session instead of two.
+    let spawned = thread::Builder::new()
+        .name("nextppp-pump-down".to_owned())
+        .stack_size(PUMP_STACK)
+        .spawn({
+            let local = Arc::clone(&local);
+            move || tunnel_down(rx, local)
         });
-        let up = s.spawn(move || {
-            let r = tunnel_up(tx, local);
-            if r.1.kills_session() {
-                up_kill.activate();
-            }
-            r
-        });
-        let (up, up_end) = up
+    let (up, up_end) = tunnel_up(tx, local);
+    let (down, down_end) = match spawned {
+        Ok(handle) => handle
             .join()
-            .unwrap_or((0, PumpEnd::Fault("up pump panicked".into())));
-        let (down, down_end) = down
-            .join()
-            .unwrap_or((0, PumpEnd::Fault("down pump panicked".into())));
-        PumpStats {
-            up,
-            down,
-            up_end,
-            down_end,
-        }
-    })
+            .unwrap_or((0, PumpEnd::Fault("down pump panicked".into()))),
+        Err(e) => {
+            // Thread-creation failure (resource exhaustion): the downlink
+            // never ran; report it and let the already-failing session
+            // tear itself down.
+            error!("downlink pump spawn failed: {e}");
+            (0, PumpEnd::Fault("down pump spawn failed".into()))
+        },
+    };
+    PumpStats {
+        up,
+        down,
+        up_end,
+        down_end,
+    }
 }
