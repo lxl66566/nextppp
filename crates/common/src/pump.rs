@@ -242,7 +242,6 @@ fn tunnel_up(mut tx: TransmissionTx<TcpStream>, local: Arc<TcpStream>) -> (u64, 
 // `&TcpStream`, whose methods need `&mut &TcpStream`.
 fn pump_up_loop(tx: &mut TransmissionTx<TcpStream>, mut local: &TcpStream) -> (u64, PumpEnd) {
     let mut buf = vec![0u8; CHUNK];
-    let mut frame = Vec::with_capacity(CHUNK + 1);
     let mut total = 0u64;
     loop {
         match local.read(&mut buf) {
@@ -256,10 +255,8 @@ fn pump_up_loop(tx: &mut TransmissionTx<TcpStream>, mut local: &TcpStream) -> (u
                 };
             },
             Ok(n) => {
-                frame.clear();
-                frame.push(FRAME_DATA);
-                frame.extend_from_slice(&buf[..n]);
-                if let Err(e) = tx.write(&frame) {
+                // Tagged write: no intermediate [tag][payload] buffer.
+                if let Err(e) = tx.write_tagged(FRAME_DATA, &buf[..n]) {
                     return (total, classify_core(e));
                 }
                 total += n as u64;

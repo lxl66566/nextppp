@@ -124,13 +124,22 @@ impl<R: Rng> TxCore<R> {
 
     /// Encrypts `plaintext` into a complete wire packet appended to `out`.
     fn encrypt_into(&mut self, out: &mut Vec<u8>, plaintext: &[u8]) -> Result<()> {
-        if plaintext.is_empty() {
+        self.encrypt_impl(out, None, plaintext)
+    }
+
+    /// Tagged variant of [`TxCore::encrypt_into`]: the wire message is
+    /// `tag || payload`, assembled without an intermediate buffer.
+    fn encrypt_into_tagged(&mut self, out: &mut Vec<u8>, tag: u8, payload: &[u8]) -> Result<()> {
+        self.encrypt_impl(out, Some(tag), payload)
+    }
+
+    fn encrypt_impl(&mut self, out: &mut Vec<u8>, tag: Option<u8>, payload: &[u8]) -> Result<()> {
+        let total = payload.len() + usize::from(tag.is_some());
+        if total == 0 {
             return Err(Error::ZeroLength);
         }
-        if plaintext.len() > PPP_BUFFER_SIZE {
-            return Err(Error::FrameTooLarge {
-                len: plaintext.len(),
-            });
+        if total > PPP_BUFFER_SIZE {
+            return Err(Error::FrameTooLarge { len: total });
         }
 
         let flags = effective_flags(&self.key, self.handshaked);
@@ -138,7 +147,7 @@ impl<R: Rng> TxCore<R> {
             &mut self.rng,
             self.key.kf,
             Some(&mut self.protocol_tx),
-            plaintext.len(),
+            total,
         )?;
 
         if !self.handshaked || self.key.plaintext {
@@ -146,9 +155,12 @@ impl<R: Rng> TxCore<R> {
             // input buffer, so it is assembled in scratch first.
             let bin = &mut self.scratch_bin;
             bin.clear();
-            bin.reserve(HEADER_SIZE + plaintext.len());
+            bin.reserve(HEADER_SIZE + total);
             bin.extend_from_slice(&header);
-            bin.extend_from_slice(plaintext);
+            if let Some(tag) = tag {
+                bin.push(tag);
+            }
+            bin.extend_from_slice(payload);
             let body = &mut bin[HEADER_SIZE..];
             self.transport_tx.apply(body);
             payload_obfuscate(body, &flags, header_kf, self.key.kf);
@@ -157,9 +169,12 @@ impl<R: Rng> TxCore<R> {
             // Binary framing builds the packet directly in `out`: one full
             // packet copy saved vs assembling in scratch first.
             let start = out.len();
-            out.reserve(HEADER_SIZE + plaintext.len());
+            out.reserve(HEADER_SIZE + total);
             out.extend_from_slice(&header);
-            out.extend_from_slice(plaintext);
+            if let Some(tag) = tag {
+                out.push(tag);
+            }
+            out.extend_from_slice(payload);
             let body = &mut out[start + HEADER_SIZE..];
             self.transport_tx.apply(body);
             payload_obfuscate(body, &flags, header_kf, self.key.kf);
@@ -642,6 +657,23 @@ impl<T: Write, R: Rng> TransmissionTx<T, R> {
     pub fn write(&mut self, plaintext: &[u8]) -> Result<()> {
         self.core.write(&mut self.io, plaintext)
     }
+
+    /// Tagged streaming write: the message is `tag || payload`, encrypted
+    /// without assembling an intermediate contiguous buffer (one full
+    /// payload copy saved per frame vs `write(&[tag, ..payload])`).
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "TransmissionTx"))]
+    pub fn write_tagged(&mut self, tag: u8, payload: &[u8]) -> Result<()> {
+        let mut out = mem::take(&mut self.core.scratch_out);
+        out.clear();
+        // Restore the scratch even on failure: dropping it here would cost
+        // the allocation on every subsequent packet.
+        let result = self
+            .core
+            .encrypt_into_tagged(&mut out, tag, payload)
+            .and_then(|()| self.io.write_all(&out).map_err(Error::Io));
+        self.core.scratch_out = out;
+        result
+    }
 }
 
 /// Receiving half of a [`Transmission`] produced by
@@ -752,5 +784,25 @@ mod tests {
             assert_eq!(kept_bin, expect_kept);
             assert_eq!(kept_read, expect_kept);
         }
+    }
+
+    // write_tagged frames `tag || payload`; the rx side must see exactly
+    // that, both pre-handshake (base94 envelope) and in binary mode the
+    // callers always handshake first, so this covers the pre-handshake leg
+    // plus the encrypt_into_tagged assembly itself.
+    #[test]
+    fn tagged_write_roundtrip_pre_handshake() {
+        let key = ObfuscationKey::default();
+        let mut wire = Vec::new();
+        let mut tx = Transmission::with_rng((), key.clone(), test_rng());
+        tx.tx
+            .encrypt_into_tagged(&mut wire, 0xd1, b"hello tagged")
+            .unwrap();
+
+        let mut rx = Transmission::with_rng((), key, test_rng());
+        let msg = rx.rx.read_buf(&mut Cursor::new(&wire)).unwrap();
+        assert_eq!(msg, [
+            0xd1, b'h', b'e', b'l', b'l', b'o', b' ', b't', b'a', b'g', b'g', b'e', b'd'
+        ]);
     }
 }
