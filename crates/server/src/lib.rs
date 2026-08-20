@@ -233,8 +233,10 @@ fn handle_conn_inner(
 
             let (txh, rxh) = tx.split_with(rx_io);
             let s = pump::pump_tunnel(txh, rxh, target_stream);
-            stats.bytes_to_targets.fetch_add(s.up, Ordering::Relaxed);
-            stats.bytes_to_clients.fetch_add(s.down, Ordering::Relaxed);
+            // `local` is the target stream here, so `s.up` is target->client
+            // (downlink) and `s.down` is client->target (uplink).
+            stats.bytes_to_clients.fetch_add(s.up, Ordering::Relaxed);
+            stats.bytes_to_targets.fetch_add(s.down, Ordering::Relaxed);
             pump::log_close(
                 &format!("session {sid:016x} ({peer})"),
                 &target,
