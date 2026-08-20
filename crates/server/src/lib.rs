@@ -36,6 +36,9 @@ use spdlog::prelude::*;
 /// Heartbeat interval for the health/stats log line.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Stack size for per-session handler threads (see `serve`).
+const SESSION_STACK: usize = 256 * 1024;
+
 /// Immutable runtime parameters derived from the configuration.
 #[derive(Clone)]
 pub struct ServerRuntime {
@@ -121,12 +124,19 @@ pub fn serve(listener: TcpListener, rt: ServerRuntime) -> anyhow::Result<()> {
                 }
                 let spawned = thread::Builder::new()
                     .name(format!("nextppp-{sid:016x}"))
+                    // Session threads have shallow call chains (handshake,
+                    // crypto, pump loop; every large buffer is heap-owned);
+                    // 256KiB beats the 2MiB default at 10k+ sessions.
+                    .stack_size(SESSION_STACK)
                     .spawn(move || handle_conn(stream, &rt, sid, &stats));
                 if let Err(e) = spawned {
                     error!("session {sid:016x} spawn failed: {e}");
                 }
             },
-            Err(e) => warn!("accept failed: {e}"),
+            Err(e) => {
+                warn!("accept failed: {e}");
+                pump::accept_backoff(&e);
+            },
         }
     }
     Ok(())

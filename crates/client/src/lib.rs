@@ -9,11 +9,15 @@
 use std::{net::TcpListener, sync::Arc, thread, time::Duration};
 
 use anyhow::Context;
-use nextppp_common::{addr::Host, config::ClientConfig};
+use nextppp_common::{addr::Host, config::ClientConfig, pump};
 use nextppp_core::ObfuscationKey;
 use spdlog::prelude::*;
+
 pub mod outbound;
 pub mod socks5;
+
+/// Stack size for per-connection handler threads (see `serve`).
+const SESSION_STACK: usize = 256 * 1024;
 
 /// Immutable runtime parameters derived from the configuration.
 #[derive(Clone)]
@@ -104,15 +108,27 @@ pub fn serve(listener: TcpListener, rt: Arc<ClientRuntime>) -> anyhow::Result<()
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                // Name threads per peer so stacks of stuck inbound sessions
+                // are distinguishable in logs/debuggers.
+                let name = stream.peer_addr().map_or_else(
+                    |_| String::from("nextppp-in-?"),
+                    |a| format!("nextppp-in-{a}"),
+                );
                 let rt = rt.clone();
                 let spawned = thread::Builder::new()
-                    .name("nextppp-inbound".to_owned())
+                    .name(name)
+                    // Shallow call chain (negotiation, tunnel, pump loop;
+                    // large buffers are heap-owned); see also the server.
+                    .stack_size(SESSION_STACK)
                     .spawn(move || socks5::handle(stream, &rt));
                 if let Err(e) = spawned {
                     error!("inbound spawn failed: {e}");
                 }
             },
-            Err(e) => warn!("accept failed: {e}"),
+            Err(e) => {
+                warn!("accept failed: {e}");
+                pump::accept_backoff(&e);
+            },
         }
     }
     Ok(())

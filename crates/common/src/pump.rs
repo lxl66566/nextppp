@@ -138,6 +138,26 @@ pub fn nodelay(stream: &TcpStream) {
     let _ = stream.set_nodelay(true);
 }
 
+/// Accept-loop backoff on resource exhaustion. Once accept() starts failing
+/// with EMFILE/ENFILE/ENOMEM it fails again immediately, so the loop would
+/// spin at 100% CPU (and flood the log) until descriptors free up; a short
+/// pause lets sessions drain. Other accept errors (ECONNABORTED under port
+/// scans, transient resets) are routine and must not stall the loop.
+pub fn accept_backoff(err: &io::Error) {
+    // Raw errno constants: libc is only a dev-dependency here. Unix:
+    // ENFILE/EMFILE/ENOMEM. Windows sockets exhaust as WSAENOBUFS.
+    #[cfg(unix)]
+    let exhausted = matches!(err.raw_os_error(), Some(23 | 24 | 12));
+    #[cfg(windows)]
+    let exhausted = matches!(err.raw_os_error(), Some(10055));
+    #[cfg(not(any(unix, windows)))]
+    let exhausted = false;
+    if exhausted {
+        warn!("accept exhausted ({err}); backing off 100ms for sessions to drain");
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Connects to `host:port` honoring a timeout. All resolved addresses are
 /// tried in order (first success wins; no happy-eyeballs).
 ///
