@@ -1,7 +1,11 @@
 //! Crate error types.
 
 /// Errors produced by the nextppp core protocol stack.
+///
+/// Non-exhaustive so new variants are not a semver-breaking change for
+/// downstream matchers (the crate's own matches always carry a wildcard arm).
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// Underlying transport I/O failure (connection reset, EOF, timeout, ...).
     #[error("io error: {0}")]
@@ -78,8 +82,8 @@ impl PartialEq for Error {
             | (Self::InvalidSessionId, Self::InvalidSessionId)
             | (Self::FlagsMismatch, Self::FlagsMismatch)
             | (Self::ZeroLength, Self::ZeroLength) => true,
-            (Self::HandshakeFailed(a), Self::HandshakeFailed(b)) => a == b,
-            (Self::InvalidConfig(a), Self::InvalidConfig(b)) => a == b,
+            (Self::HandshakeFailed(a), Self::HandshakeFailed(b))
+            | (Self::InvalidConfig(a), Self::InvalidConfig(b)) => a == b,
             (Self::FrameTooLarge { len: a }, Self::FrameTooLarge { len: b }) => a == b,
             _ => false,
         }
