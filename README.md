@@ -66,7 +66,7 @@ nextppp 隧道 -> server -> 本地 echo），测单向字节速率。AMD 7945HX 
 
 ```sh
 cargo test -p nextppp-client --release --test throughput -- --ignored --nocapture
-# throughput: 268435456 bytes (256 MiB) in 1.64s = 156.45 MiB/s (server cpu 0, client cpu 1)
+# throughput: 268435456 bytes (256 MiB) in 1.54s = 165.76 MiB/s (server cpu 0, client cpu 1)
 ```
 
 ## 文档

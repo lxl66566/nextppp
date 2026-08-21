@@ -25,8 +25,8 @@ use std::io::{self, Read};
 
 use base94_simd::{
     DECIMAL_MAX_LEN as BASE94_DECIMAL_MAX_LEN, decimal_decode as base94_decimal_decode,
-    decimal_encode as base94_decimal_encode, decode_into as base94_decode_into,
-    encode_into_with_len, encoded_len as base94_encoded_len,
+    decimal_encode as base94_decimal_encode, decode_into_kf as base94_decode_into,
+    encode_into_with_len_kf, encoded_len_kf as base94_encoded_len,
 };
 use rand::{Rng, RngExt};
 
@@ -95,7 +95,7 @@ impl Base94Framer {
         out.extend_from_slice(&header[..hlen]);
         // The length scan already happened above for the bounds check;
         // reuse it instead of re-scanning inside the encoder.
-        encode_into_with_len(out, binary, self.kf, encoded_len);
+        encode_into_with_len_kf(out, binary, self.kf, encoded_len);
         Ok(())
     }
 

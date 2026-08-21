@@ -3,8 +3,8 @@
 use std::hint::black_box;
 
 use base94_simd::{
-    decode_into as base94_decode_into, encode_into as base94_encode_into,
-    encoded_len as base94_encoded_len,
+    decode_into_kf as base94_decode_into, encode_into_kf as base94_encode_into,
+    encoded_len_kf as base94_encoded_len,
 };
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use nextppp_core::crypto::{

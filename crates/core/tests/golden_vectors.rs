@@ -181,8 +181,8 @@ mod vectors {
 
 use base94_simd::{
     DECIMAL_MAX_LEN as BASE94_DECIMAL_MAX_LEN, decimal_decode as base94_decimal_decode,
-    decimal_encode as base94_decimal_encode, decode_into as base94_decode_into,
-    encode_into as base94_encode_into,
+    decimal_encode as base94_decimal_encode, decode_into_kf as base94_decode_into,
+    encode_into_kf as base94_encode_into,
 };
 use nextppp_core::{
     ObfuscationKey,
