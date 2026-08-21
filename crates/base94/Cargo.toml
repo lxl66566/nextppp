@@ -1,11 +1,11 @@
 [package]
 name         = "base94-simd"
-version      = "0.1.0"
+version      = "0.1.1"
 edition      = "2024"
 rust-version = "1.85"
 description  = "SIMD-accelerated base94 codec"
 readme       = "README.md"
-homepage     = "https://github.com/lxl66566/nextppp/crates/base94"
+homepage     = "https://github.com/lxl66566/nextppp/tree/main/crates/base94"
 repository   = "https://github.com/lxl66566/nextppp"
 license      = "MIT OR Apache-2.0"
 keywords     = ["ascii", "base94", "encoding", "printable", "simd"]
@@ -32,4 +32,4 @@ unused_qualifications = "warn"
 hotpath = ["dep:hotpath", "hotpath/hotpath"]
 
 [dependencies]
-hotpath = { workspace = true, optional = true }
+hotpath = { version = "0.23", optional = true }

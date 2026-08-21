@@ -140,7 +140,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "base94-simd"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hotpath",
 ]
@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "nextppp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -936,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "nextppp-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "hotpath",
@@ -949,7 +949,7 @@ dependencies = [
 
 [[package]]
 name = "nextppp-common"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "ctrlc",
@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "nextppp-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes",
  "base94-simd",
@@ -980,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "nextppp-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "hotpath",
