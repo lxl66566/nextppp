@@ -280,7 +280,9 @@ pub struct MuxSection {
     /// Long-lived tunnels kept hot; new streams pick the least-loaded one.
     /// `0` behaves like `enabled: false`.
     pub pool_size: u32,
-    /// Streams a tunnel may carry before the pool prefers another one.
+    /// Streams a tunnel may carry before the pool prefers another one;
+    /// with every tunnel at the cap the pool is saturated and new streams
+    /// ride dedicated overflow tunnels.
     pub max_streams: u32,
 }
 

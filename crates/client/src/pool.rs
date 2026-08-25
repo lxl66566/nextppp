@@ -8,8 +8,11 @@
 //! connects, but streams on one tunnel share its TCP loss fate (HOL).
 //! `pool_size` + least-loaded assignment bounds the blast radius, and a
 //! dead tunnel fails only its own streams while the maintainer dials a
-//! replacement. `pool_size = 0` disables pooling: one dedicated tunnel
-//! per CONNECT (full loss isolation, the pre-mux behavior).
+//! replacement. When every pool tunnel sits at `max_streams`, new streams
+//! ride dedicated overflow tunnels: bursts beyond pool capacity degrade
+//! to the per-connect dial cost, never to an error. `pool_size = 0`
+//! disables pooling: one dedicated tunnel per CONNECT (full loss
+//! isolation, the pre-mux behavior).
 //!
 //! Lifecycle: `Tunnel::mark_dead` (reader task or a failed OPEN send)
 //! flips `alive`, fails every pending OPEN (dropping the oneshot senders)
@@ -100,8 +103,8 @@ impl Pool {
     }
 
     /// Opens a mux stream to `addr`: picks the least-loaded live tunnel,
-    /// waits for the maintainer when the pool is empty, and dials a
-    /// dedicated tunnel when pooling is disabled.
+    /// waits for the maintainer when the pool is empty, dials a dedicated
+    /// tunnel when the pool is saturated or pooling is disabled.
     ///
     /// Budgets are per phase, each a full `connect_timeout`: waiting for a
     /// pool tunnel, dialing (with retries) and the OPEN/REPLY exchange
@@ -124,8 +127,17 @@ impl Pool {
         let wait_deadline = Instant::now() + self.rt.connect_timeout;
         loop {
             let Some(tunnel) = self.pick() else {
-                // Kick the maintainer (it may be idling) and wait for a
-                // tunnel to arrive.
+                if self.any_live() {
+                    // Every live tunnel is at max_streams. Serve this
+                    // stream on a dedicated overflow tunnel instead of
+                    // stalling for the whole budget and failing: bursts
+                    // beyond pool capacity degrade to the per-connect dial
+                    // cost, never to an error.
+                    debug!("pool saturated; opening a dedicated overflow tunnel");
+                    return self.open_dedicated(addr).await;
+                }
+                // Pool empty: kick the maintainer (it may be idling) and
+                // wait for a tunnel to arrive.
                 self.inner.died.notify_one();
                 let remaining = wait_deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero()
@@ -186,6 +198,14 @@ impl Pool {
             .filter(|t| t.alive() && t.streams.load(Ordering::Relaxed) < self.rt.max_streams)
             .min_by_key(|t| t.streams.load(Ordering::Relaxed))
             .cloned()
+    }
+
+    /// Whether the pool still holds a live tunnel. `pick` returning `None`
+    /// plus this being true means the pool is saturated (every live tunnel
+    /// at `max_streams`); false means it is empty and the maintainer must
+    /// refill it.
+    fn any_live(&self) -> bool {
+        self.inner.tunnels.lock().unwrap().iter().any(|t| t.alive())
     }
 }
 

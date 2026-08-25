@@ -635,6 +635,43 @@ fn half_close_propagates_through_tunnel() {
     assert_eq!(got, b"ping");
 }
 
+/// Regression: when every pool tunnel sits at `max_streams` (saturated
+/// pool), a new CONNECT must get service via a dedicated overflow tunnel
+/// — quickly — instead of waiting out the whole connect_timeout and then
+/// failing, which is what an overflow-less pool did.
+#[test]
+fn saturated_pool_serves_connects_via_overflow_tunnel() {
+    let echo = start_echo();
+    let (server, handshakes) = start_mini_server(MiniServer {
+        rst_first: false,
+        drop_on_first_data: false,
+    });
+    // One pool tunnel carrying at most one stream.
+    let client = start_client_full(server, 3, 0, 1, 1);
+
+    // Warm up, then occupy the pool tunnel's only stream slot with an
+    // idle-but-open connection.
+    wait_until("pool warmup", || handshakes.load(Ordering::Relaxed) >= 1);
+    let mut first = socks5_connect(client, &Host::Ip("127.0.0.1".parse().unwrap()), echo.port());
+
+    let t0 = Instant::now();
+    let mut second = socks5_connect(client, &Host::Ip("127.0.0.1".parse().unwrap()), echo.port());
+    let elapsed = t0.elapsed();
+    echo_roundtrip(&mut second, b"overflow stream");
+    assert_eq!(
+        handshakes.load(Ordering::Relaxed),
+        2,
+        "the saturated pool must dial exactly one overflow tunnel"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "overflow must serve the connect fast, not stall a full timeout ({elapsed:?})"
+    );
+
+    // The pool tunnel and its original stream are unaffected.
+    echo_roundtrip(&mut first, b"pool stream still alive");
+}
+
 #[test]
 fn pool_tunnels_are_shared_across_socks_connections() {
     let echo = start_echo();
