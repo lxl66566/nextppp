@@ -27,6 +27,12 @@ A2 改握手时序，放在自己的提交里便于回归定位；A3 依赖 A2 �
   评估，若收益明确再单列提交）。
 - B8 mux 连接池、B9 事件驱动、C10 UDP 承载：下一批次。
 
+## 状态：已完成 ✅
+
+`cargo fmt --check` / `cargo clippy --workspace --all-targets [--features hotpath]` /
+`cargo test --workspace`（16 个测试目标全绿）/ `cargo bench --no-run` 均通过。仅存量的
+`needless_pass_by_value`（pump.rs `tunnel_up/down`）警告未动。
+
 ## 实施日志
 
 - **A1**：`pump::keepalive`（60s 空闲 / 15s 间隔 / 3 次探测，Windows 走系统默认重试）。挂载点：
