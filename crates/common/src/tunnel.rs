@@ -182,7 +182,7 @@ pub async fn tcp_connect(
     let stream =
         tokio::task::spawn_blocking(move || crate::pump::tcp_connect(&host, port, timeout, &dns))
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
+            .map_err(io::Error::other)??;
     stream.set_nonblocking(true)?;
     tokio::net::TcpStream::from_std(stream)
 }

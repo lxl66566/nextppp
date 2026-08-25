@@ -1,6 +1,13 @@
 //! Async tunnel drivers over real loopback sockets: writer batching,
 //! incremental frame reassembly and clean-EOF propagation.
 
+// Test fixtures use mirrored c_/s_ names and small index casts.
+#![allow(
+    clippy::similar_names,
+    clippy::cast_possible_truncation,
+    clippy::items_after_statements
+)]
+
 use std::{net::TcpListener, thread};
 
 use nextppp_common::{
@@ -12,7 +19,7 @@ use tokio::sync::mpsc;
 
 /// Handshakes a loopback pair and returns both ends as split async
 /// halves over tokio streams.
-async fn tunnel_pair() -> (
+fn tunnel_pair() -> (
     (SessionTx, SessionRx, tokio::net::TcpStream),
     (SessionTx, SessionRx, tokio::net::TcpStream),
 ) {
@@ -43,14 +50,14 @@ async fn tunnel_pair() -> (
 
 #[tokio::test]
 async fn writer_reader_roundtrip_mixed_sizes() {
-    let ((client_tx, _, client_sock), (_, server_rx, server_sock)) = tunnel_pair().await;
-    let (client_rh, client_wh) = client_sock.into_split();
-    let (server_rh, _server_wh) = server_sock.into_split();
-    drop(client_rh);
+    let ((c_txs, _, c_sock), (_, s_rxs, s_sock)) = tunnel_pair();
+    let (c_rd, c_wr) = c_sock.into_split();
+    let (s_rd, _sw) = s_sock.into_split();
+    drop(c_rd);
 
     let (out_tx, out_rx) = mpsc::channel::<OutFrame>(256);
-    let writer = tokio::spawn(run_writer(client_tx, client_wh, out_rx));
-    let mut reader = FrameReader::new(server_rx, server_rh);
+    let writer = tokio::spawn(run_writer(c_txs, c_wr, out_rx));
+    let mut reader = FrameReader::new(s_rxs, s_rd);
 
     let payloads: Vec<Vec<u8>> = vec![
         b"one".to_vec(),
@@ -58,9 +65,9 @@ async fn writer_reader_roundtrip_mixed_sizes() {
         b"three".to_vec(),
         vec![0xaa; 60_000],
     ];
-    for (i, p) in payloads.iter().enumerate() {
+    for (i, p) in (1u32..).zip(payloads.iter()) {
         out_tx
-            .send(OutFrame::new(FrameKind::Data, i as u32 + 1, p.clone()))
+            .send(OutFrame::new(FrameKind::Data, i, p.clone()))
             .await
             .unwrap();
     }
@@ -82,17 +89,18 @@ async fn writer_reader_roundtrip_mixed_sizes() {
 
 #[tokio::test]
 async fn backlog_is_batched_but_order_preserved() {
-    let ((client_tx, _, client_sock), (_, server_rx, server_sock)) = tunnel_pair().await;
-    let (_client_rh, client_wh) = client_sock.into_split();
-    let (server_rh, _server_wh) = server_sock.into_split();
-
-    let (out_tx, out_rx) = mpsc::channel::<OutFrame>(4096);
-    tokio::spawn(run_writer(client_tx, client_wh, out_rx));
-    let mut reader = FrameReader::new(server_rx, server_rh);
+    let ((c_txs, _, c_sock), (_, s_rxs, s_sock)) = tunnel_pair();
+    let (_cr, c_wr) = c_sock.into_split();
+    let (s_rd, _sw) = s_sock.into_split();
 
     // Fill the channel faster than the writer drains: exercises the
     // try_recv batching path without depending on timing.
     const N: u32 = 500;
+
+    let (out_tx, out_rx) = mpsc::channel::<OutFrame>(4096);
+    tokio::spawn(run_writer(c_txs, c_wr, out_rx));
+    let mut reader = FrameReader::new(s_rxs, s_rd);
+
     for i in 0..N {
         out_tx
             .send(OutFrame::new(
@@ -114,17 +122,16 @@ async fn backlog_is_batched_but_order_preserved() {
 
 #[tokio::test]
 async fn bidirectional_simultaneous() {
-    let ((client_tx, client_rx, client_sock), (server_tx, server_rx, server_sock)) =
-        tunnel_pair().await;
-    let (client_rh, client_wh) = client_sock.into_split();
-    let (server_rh, server_wh) = server_sock.into_split();
+    let ((c_txs, c_rxs, c_sock), (s_txs, s_rxs, s_sock)) = tunnel_pair();
+    let (c_rd, c_wr) = c_sock.into_split();
+    let (s_rd, s_wr) = s_sock.into_split();
 
     let (c_tx, c_rx) = mpsc::channel::<OutFrame>(256);
     let (s_tx, s_rx) = mpsc::channel::<OutFrame>(256);
-    tokio::spawn(run_writer(client_tx, client_wh, c_rx));
-    tokio::spawn(run_writer(server_tx, server_wh, s_rx));
-    let mut client_reader = FrameReader::new(client_rx, client_rh);
-    let mut server_reader = FrameReader::new(server_rx, server_rh);
+    tokio::spawn(run_writer(c_txs, c_wr, c_rx));
+    tokio::spawn(run_writer(s_txs, s_wr, s_rx));
+    let mut client_reader = FrameReader::new(c_rxs, c_rd);
+    let mut server_reader = FrameReader::new(s_rxs, s_rd);
 
     let up = tokio::spawn(async move {
         for i in 0..100u32 {
