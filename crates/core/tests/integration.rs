@@ -497,3 +497,131 @@ fn split_halves_interop_with_unsplit_peer() {
         });
     }
 }
+
+// ---------------------------------------------------------------------------
+// Session (transport-free incremental codec for event-driven callers)
+// ---------------------------------------------------------------------------
+
+use nextppp_core::Session;
+
+fn session_pair(plaintext: bool) -> (Session, Session) {
+    let key = ObfuscationKey {
+        plaintext,
+        ..ObfuscationKey::default()
+    };
+    let (client, server) = make_pair(key.clone(), key, false);
+    let (client, _io) = client.into_session();
+    let (server, _io) = server.into_session();
+    (client, server)
+}
+
+/// Drains every complete frame from `buf` into `out`; returns when the
+/// remaining bytes are an incomplete frame.
+fn drain_frames(session: &mut Session, buf: &mut Vec<u8>, out: &mut Vec<Vec<u8>>) {
+    loop {
+        let decoded = session.poll_frame(buf).unwrap().map(<[u8]>::to_vec);
+        match decoded {
+            Some(msg) => {
+                let n = session.take_consumed();
+                buf.drain(..n);
+                out.push(msg);
+            },
+            None => return,
+        }
+    }
+}
+
+#[test]
+fn session_incremental_decode_random_chunks() {
+    for plaintext in [false, true] {
+        let (mut client, mut server) = session_pair(plaintext);
+        let messages: Vec<Vec<u8>> = vec![
+            b"tiny".to_vec(),
+            vec![0x42; 1],
+            (0..=255u32).map(|i| i as u8).collect(),
+            vec![0xab; 65536],
+            b"tail".to_vec(),
+        ];
+        let mut wire = Vec::new();
+        for m in &messages {
+            client.encrypt_into(&mut wire, m).unwrap();
+        }
+
+        // Awkward chunk sizes (incl. 1-byte drips) must reassemble exactly.
+        let mut buf = Vec::new();
+        let mut decoded: Vec<Vec<u8>> = Vec::new();
+        let mut pos = 0;
+        for (i, &chunk) in [1usize, 7, 4096, 3, 65536, 2].iter().cycle().enumerate() {
+            if pos >= wire.len() {
+                break;
+            }
+            let end = (pos + chunk).min(wire.len());
+            buf.extend_from_slice(&wire[pos..end]);
+            pos = end;
+            drain_frames(&mut server, &mut buf, &mut decoded);
+            assert!(i < 10_000, "cycle guard");
+        }
+        while pos < wire.len() {
+            buf.push(wire[pos]);
+            pos += 1;
+            drain_frames(&mut server, &mut buf, &mut decoded);
+        }
+        assert_eq!(decoded, messages, "plaintext={plaintext}");
+        assert!(buf.is_empty(), "all frames consumed, plaintext={plaintext}");
+    }
+}
+
+#[test]
+fn session_prefixed_roundtrip() {
+    for plaintext in [false, true] {
+        let (mut client, mut server) = session_pair(plaintext);
+        let mut wire = Vec::new();
+        client
+            .encrypt_into_prefixed(&mut wire, &[0x02, 0xac, 0x02], b"payload")
+            .unwrap();
+        let mut decoded = Vec::new();
+        drain_frames(&mut server, &mut wire.clone(), &mut decoded);
+        assert_eq!(decoded, vec![b"\x02\xac\x02payload".to_vec()]);
+    }
+}
+
+#[test]
+fn session_interops_with_streaming_peer() {
+    // One end on the incremental Session API, the other on the classic
+    // streaming Transmission: the wire codec must be identical.
+    for plaintext in [false, true] {
+        let key = ObfuscationKey {
+            plaintext,
+            ..ObfuscationKey::default()
+        };
+        let (client, mut server) = make_pair(key.clone(), key, false);
+        let (mut client_session, mut client_io) = client.into_session();
+
+        // Session -> streaming read.
+        let mut wire = Vec::new();
+        client_session
+            .encrypt_into(&mut wire, b"session to stream")
+            .unwrap();
+        client_io.write_all(&wire).unwrap();
+        assert_eq!(server.read().unwrap(), b"session to stream");
+
+        // Streaming write -> session poll (byte-by-byte feed).
+        server.write(b"stream to session").unwrap();
+        let mut buf = Vec::new();
+        let mut decoded = Vec::new();
+        while decoded.is_empty() {
+            let mut byte = [0u8; 1];
+            client_io.read_exact(&mut byte).unwrap();
+            buf.push(byte[0]);
+            drain_frames(&mut client_session, &mut buf, &mut decoded);
+        }
+        assert_eq!(decoded, vec![b"stream to session".to_vec()]);
+    }
+}
+
+#[test]
+fn session_id_preserved_through_into_session() {
+    let (client, _server) = default_pair();
+    let (session, _io) = client.into_session();
+    assert_eq!(session.session_id(), TEST_SID);
+}

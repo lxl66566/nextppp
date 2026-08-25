@@ -208,6 +208,32 @@ impl Base94Framer {
         }
     }
 
+    /// Total frame length (header + encoded body) of the frame at the front
+    /// of `buf`, or `None` when the header is not fully buffered yet.
+    /// Pure peek used by incremental (event-driven) decoders: the header is
+    /// decoded from a copy and the first-frame flag is left untouched.
+    pub(crate) fn peek_frame_len(&self, buf: &[u8]) -> Result<Option<usize>> {
+        if self.rx_first {
+            if buf.len() < HEADER_EXTENDED {
+                return Ok(None);
+            }
+            let mut header: [u8; HEADER_EXTENDED] =
+                buf[..HEADER_EXTENDED].try_into().expect("length checked");
+            let len = self.decode_header_extended(&mut header)?;
+            Self::check_bound(len)?;
+            Ok(Some(HEADER_EXTENDED + len))
+        } else {
+            if buf.len() < HEADER_SIMPLE {
+                return Ok(None);
+            }
+            let mut header: [u8; HEADER_SIMPLE] =
+                buf[..HEADER_SIMPLE].try_into().expect("length checked");
+            let len = self.decode_header_simple(&mut header)?;
+            Self::check_bound(len)?;
+            Ok(Some(HEADER_SIMPLE + len))
+        }
+    }
+
     /// Reads one complete base94 frame from `r` and returns the decoded
     /// binary packet. Blocking; requires the whole frame to arrive. The
     /// first-frame flag advances only after the entire frame validates.

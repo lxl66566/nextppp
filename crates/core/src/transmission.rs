@@ -67,7 +67,7 @@ use crate::{
 /// full `[header][body]` packet), validates length consistency, then
 /// deobfuscates the body in place. Returns the message past the header
 /// (the header bytes stay in place; no strip memmove).
-fn decrypt_tail<'a>(
+pub(crate) fn decrypt_tail<'a>(
     key: &ObfuscationKey,
     protocol_rx: &mut SessionCipher,
     transport_rx: &mut SessionCipher,
@@ -90,7 +90,7 @@ fn decrypt_tail<'a>(
 /// against `PPP_BUFFER_SIZE`. `declared_total` is the full packet's byte
 /// length on in-memory paths, where it guards against truncation/splicing;
 /// stream callers pass `None` because they read exactly `len` bytes.
-fn parse_binary_header(
+pub(crate) fn parse_binary_header(
     kf: u32,
     cipher: &mut SessionCipher,
     header: [u8; HEADER_SIZE],
@@ -109,7 +109,7 @@ fn parse_binary_header(
 }
 
 /// Data-plane flags; pre-handshake everything is forced on ("safest").
-fn effective_flags(key: &ObfuscationKey, handshaked: bool) -> PayloadFlags {
+pub(crate) fn effective_flags(key: &ObfuscationKey, handshaked: bool) -> PayloadFlags {
     if handshaked {
         PayloadFlags {
             masked: key.masked,
@@ -125,7 +125,7 @@ fn effective_flags(key: &ObfuscationKey, handshaked: bool) -> PayloadFlags {
 /// packets. Shared verbatim by [`Transmission`] and its split
 /// [`TransmissionTx`] half, so streaming and split paths can never drift
 /// apart.
-struct TxCore<R> {
+pub(crate) struct TxCore<R> {
     rng: R,
     key: Arc<ObfuscationKey>,
     b94: Base94Framer,
@@ -158,18 +158,29 @@ impl<R: Rng> TxCore<R> {
     }
 
     /// Encrypts `plaintext` into a complete wire packet appended to `out`.
-    fn encrypt_into(&mut self, out: &mut Vec<u8>, plaintext: &[u8]) -> Result<()> {
-        self.encrypt_impl(out, None, plaintext)
+    pub(crate) fn encrypt_into(&mut self, out: &mut Vec<u8>, plaintext: &[u8]) -> Result<()> {
+        self.encrypt_impl(out, &[], plaintext)
     }
 
     /// Tagged variant of [`TxCore::encrypt_into`]: the wire message is
     /// `tag || payload`, assembled without an intermediate buffer.
     fn encrypt_into_tagged(&mut self, out: &mut Vec<u8>, tag: u8, payload: &[u8]) -> Result<()> {
-        self.encrypt_impl(out, Some(tag), payload)
+        self.encrypt_impl(out, &[tag], payload)
     }
 
-    fn encrypt_impl(&mut self, out: &mut Vec<u8>, tag: Option<u8>, payload: &[u8]) -> Result<()> {
-        let total = payload.len() + usize::from(tag.is_some());
+    /// Prefixed variant of [`TxCore::encrypt_into`]: the wire message is
+    /// `prefix || payload` (mux framing: kind + varint stream id + payload).
+    pub(crate) fn encrypt_into_prefixed(
+        &mut self,
+        out: &mut Vec<u8>,
+        prefix: &[u8],
+        payload: &[u8],
+    ) -> Result<()> {
+        self.encrypt_impl(out, prefix, payload)
+    }
+
+    fn encrypt_impl(&mut self, out: &mut Vec<u8>, prefix: &[u8], payload: &[u8]) -> Result<()> {
+        let total = payload.len() + prefix.len();
         if total == 0 {
             return Err(Error::ZeroLength);
         }
@@ -192,9 +203,7 @@ impl<R: Rng> TxCore<R> {
             bin.clear();
             bin.reserve(HEADER_SIZE + total);
             bin.extend_from_slice(&header);
-            if let Some(tag) = tag {
-                bin.push(tag);
-            }
+            bin.extend_from_slice(prefix);
             bin.extend_from_slice(payload);
             let body = &mut bin[HEADER_SIZE..];
             self.transport_tx.apply(body);
@@ -206,9 +215,7 @@ impl<R: Rng> TxCore<R> {
             let start = out.len();
             out.reserve(HEADER_SIZE + total);
             out.extend_from_slice(&header);
-            if let Some(tag) = tag {
-                out.push(tag);
-            }
+            out.extend_from_slice(prefix);
             out.extend_from_slice(payload);
             let body = &mut out[start + HEADER_SIZE..];
             self.transport_tx.apply(body);
@@ -260,16 +267,16 @@ impl<R: Rng> TxCore<R> {
 
 /// Rx-direction codec state, the exact inverse of [`TxCore`]. Shared
 /// verbatim by [`Transmission`] and its split [`TransmissionRx`] half.
-struct RxCore {
-    key: Arc<ObfuscationKey>,
-    b94: Base94Framer,
-    protocol_rx: SessionCipher,
-    transport_rx: SessionCipher,
-    handshaked: bool,
+pub(crate) struct RxCore {
+    pub(crate) key: Arc<ObfuscationKey>,
+    pub(crate) b94: Base94Framer,
+    pub(crate) protocol_rx: SessionCipher,
+    pub(crate) transport_rx: SessionCipher,
+    pub(crate) handshaked: bool,
     /// Encoded (pre-decode) frame bytes, reused across packets.
     scratch_read: Vec<u8>,
     /// Decoded message, reused across packets and borrowed out by `read_buf`.
-    scratch_body: Vec<u8>,
+    pub(crate) scratch_body: Vec<u8>,
 }
 
 impl RxCore {
@@ -552,6 +559,23 @@ impl<T, R: Rng> Transmission<T, R> {
     fn rekey(&mut self, ivv: u128) {
         self.tx.rekey(ivv);
         self.rx.rekey(ivv);
+    }
+
+    /// Converts into the transport-free [`crate::session::Session`]
+    /// (event-driven callers), returning the codec state and the transport
+    /// separately. Typically called after a completed handshake run on a
+    /// blocking thread; the session then drives framed I/O over any async
+    /// transport via `encrypt_into` / `poll_frame`.
+    #[must_use]
+    pub fn into_session(self) -> (crate::session::Session<R>, T) {
+        let Self {
+            io,
+            tx,
+            rx,
+            session_id,
+            pending_ivv: _,
+        } = self;
+        (crate::session::Session::from_cores(tx, rx, session_id), io)
     }
 }
 

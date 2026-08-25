@@ -34,11 +34,13 @@ pub mod crypto;
 pub mod error;
 pub mod frame;
 pub mod handshake;
+pub mod session;
 pub mod transmission;
 
 pub use config::ObfuscationKey;
 pub use crypto::cipher::{CipherRole, Method, SessionCipher};
 pub use error::{Error, Result};
+pub use session::Session;
 pub use transmission::{Transmission, TransmissionRx, TransmissionTx};
 
 /// 128-bit session identifier (openppp2 `Int128`).
