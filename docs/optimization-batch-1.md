@@ -14,7 +14,7 @@
 | 1 | A1 TCP keepalive：堵住死连接线程/fd 泄漏 | §A1 | ✅ | `perf(common)` |
 | 2 | A5 listen backlog 4096 + `TCP_DEFER_ACCEPT`（Linux） | §A5 | ✅ | `perf(common)` |
 | 3 | A6 DNS 缓存（正 TTL 300s / 负 TTL 30s / stale-while-error） | §A6 | ✅ | `perf(common)` |
-| 4 | A2 握手 0-RTT：`handshake_client` 拆 send/confirm，request 提前 1 RTT | §A2 | ⬜ | |
+| 4 | A2 握手 0-RTT：`handshake_client` 拆 send/confirm，request 提前 1 RTT | §A2 | ✅ | `perf(core,client)` |
 | 5 | A3 `tunnel_connect` 快速重试（`connect_retries`，复用 A6 的缓存不重复解析） | §A3 | ⬜ | |
 | 6 | A7 探针节流：握手并发上限 + 失败日志限频 | §A7 | ⬜ | |
 
@@ -44,3 +44,9 @@ A2 改握手时序，放在自己的提交里便于回归定位；A3 依赖 A2 �
   目标域名，client 缓存服务器域名）。解析失败回吐过期缓存（stale-while-error）。单测注入 lookup
   闭包覆盖：新鲜命中跳过解析、过期触发重查、负缓存、stale 兜底、过期负缓存不误伤；另有
   localhost 真解析用例 + e2e 域名链路回归。
+- **A2**：`handshake_client` 拆为 `handshake_client_send`（prelude + ivv + tx rekey，零读取）与
+  `handshake_client_confirm`（读 sid/nmux + canary + rx rekey），原函数保留为组合封装。rekey 材料是
+  客户端自生成的 ivv，tx 方向无需等服务端任何字节；server 本来就先发 sid/nmux 再读 ivv，时序天然
+  兼容、服务端零改动。`outbound` 在 confirm 前发 request，CONNECT 关键路径 −1 RTT。新增测试：
+  0-RTT 请求在 confirm 前到达且服务端可解码、confirm 无副作用前置报错、canary 不匹配错误推迟到
+  confirm（`FlagsMismatch` 语义不变）。`is_handshaked` 注释更新为"tx 先翻"。

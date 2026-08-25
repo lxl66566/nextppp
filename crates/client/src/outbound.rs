@@ -45,14 +45,19 @@ pub fn tunnel_connect(addr: &ProxyAddr, rt: &ClientRuntime) -> anyhow::Result<Tu
     let rx_io = stream.try_clone().context("clone stream")?;
 
     let mut tx = Transmission::new(stream, Arc::clone(&rt.server_key));
-    let (sid, _mux) = tx.handshake_client().context("nextppp handshake")?;
+    // 0-RTT: the tx direction rekeys from the client-generated ivv, so the
+    // request flies immediately after the ivv instead of waiting one RTT
+    // for the server's sid/nmux. The confirm phase (rx rekey + canary
+    // check) runs just before the first read.
+    tx.handshake_client_send().context("nextppp handshake")?;
+    tx.write(&addr.encode()).context("send request")?;
+    let (sid, _mux) = tx.handshake_client_confirm().context("nextppp handshake")?;
     debug!(
         "tunnel {sid:016x} to {}:{} handshaked in {}",
         rt.server_host.to_display(),
         rt.server_port,
         nextppp_common::fmt_duration(started.elapsed())
     );
-    tx.write(&addr.encode()).context("send request")?;
     let reply = tx.read().context("read reply")?;
     if reply.first() != Some(&STATUS_OK) {
         anyhow::bail!(

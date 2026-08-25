@@ -458,6 +458,10 @@ pub struct Transmission<T, R = StdRng> {
     tx: TxCore<R>,
     rx: RxCore,
     session_id: SessionId,
+    /// Client ivv awaiting the confirm phase (`Some` between
+    /// [`Transmission::handshake_client_send`] and
+    /// [`Transmission::handshake_client_confirm`]).
+    pending_ivv: Option<u128>,
 }
 
 impl<T> Transmission<T, StdRng> {
@@ -490,13 +494,16 @@ impl<T, R: Rng> Transmission<T, R> {
             tx: TxCore::new(Arc::clone(&key), rng),
             rx: RxCore::new(key),
             session_id: 0,
+            pending_ivv: None,
         }
     }
 
     /// Whether the handshake completed and data-plane framing is active.
     #[must_use]
     pub fn is_handshaked(&self) -> bool {
-        // The handshake flips both cores together; they never diverge.
+        // The tx direction flips first (handshake_client_send) and the rx
+        // direction at confirm; between the two this reports the tx state,
+        // which is what "ready to write data frames" means.
         self.tx.handshaked
     }
 
@@ -575,20 +582,57 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
 
     /// Runs the client-side handshake. Returns `(server_session_id, mux)`;
     /// `mux` reflects the server's multiplexing decision (parity of `nmux`).
+    ///
+    /// This is [`Self::handshake_client_send`] + [`Self::handshake_client_confirm`]
+    /// back to back; callers that want to fly a request 1 RTT earlier split
+    /// the phases themselves.
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "Transmission"))]
     pub fn handshake_client(&mut self) -> Result<(SessionId, bool)> {
-        self.handshake_prelude()?;
+        self.handshake_client_send()?;
+        self.handshake_client_confirm()
+    }
 
-        let sid = self.read_session_id()?;
-        if sid == 0 {
-            return Err(Error::HandshakeFailed("server session id is zero"));
-        }
+    /// Client handshake, phase 1: sends the NOP prelude and the ivv, then
+    /// immediately rekeys the **tx** direction and switches it to data-plane
+    /// framing. No read is performed: the rekey material is the
+    /// client-generated ivv, so nothing from the server is needed to start
+    /// sending. The caller should write its request now (0-RTT) and run
+    /// [`Self::handshake_client_confirm`] before the first read.
+    ///
+    /// Wire compatibility: the server sends its sid and nmux before it ever
+    /// reads the ivv, so client->server `[NOP..][ivv][rekeyed frames]` and
+    /// server->client `[sid][nmux][rekeyed frames]` never interleave old
+    /// and new ciphers within a direction.
+    pub fn handshake_client_send(&mut self) -> Result<()> {
+        self.handshake_prelude()?;
 
         let ivv: u128 = self.tx.rng.random();
         if ivv == 0 {
             return Err(Error::HandshakeFailed("ivv generated as zero"));
         }
         self.send_session_id(ivv)?;
+
+        self.tx.rekey(ivv);
+        self.tx.on_handshake_complete();
+        self.pending_ivv = Some(ivv);
+        Ok(())
+    }
+
+    /// Client handshake, phase 2: reads the server sid and nmux (both are
+    /// sent with pre-rekey ciphers, so the **rx** direction is rekeyed only
+    /// afterwards), validates the obfuscation-flag canary, and switches rx
+    /// to data-plane framing. Must run before the first read after
+    /// [`Self::handshake_client_send`].
+    pub fn handshake_client_confirm(&mut self) -> Result<(SessionId, bool)> {
+        let ivv = self
+            .pending_ivv
+            .take()
+            .ok_or(Error::HandshakeFailed("confirm without send phase"))?;
+
+        let sid = self.read_session_id()?;
+        if sid == 0 {
+            return Err(Error::HandshakeFailed("server session id is zero"));
+        }
 
         let nmux = self.read_session_id()?;
         if nmux == 0 {
@@ -607,8 +651,7 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
             }
         }
 
-        self.rekey(ivv);
-        self.tx.on_handshake_complete();
+        self.rx.rekey(ivv);
         self.rx.on_handshake_complete();
         self.session_id = sid;
         Ok((sid, mux))
@@ -810,6 +853,7 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
             tx,
             rx,
             session_id: _,
+            pending_ivv: _,
         } = self;
         (TransmissionTx { io, core: tx }, TransmissionRx {
             io: rx_io,

@@ -364,6 +364,66 @@ fn session_id_and_state_reported() {
 }
 
 #[test]
+fn zero_rtt_request_flies_before_confirm() {
+    // 0-RTT client: send phase -> request frame -> confirm phase. The
+    // server (unchanged, sends sid+nmux before reading the ivv) must decode
+    // the rekeyed request, and the client must still learn the sid/mux.
+    let (client_io, server_io) = duplex_pair();
+    scope(|s| {
+        let server = s.spawn(move || {
+            let mut server = Transmission::new(server_io, ObfuscationKey::default());
+            server.handshake_server(TEST_SID, true).unwrap();
+            assert_eq!(server.read().unwrap(), b"0-rtt request");
+            server.write(b"0-rtt reply").unwrap();
+            server
+        });
+
+        let mut client = Transmission::new(client_io, ObfuscationKey::default());
+        client.handshake_client_send().unwrap();
+        // The request flies before sid/nmux have been read: 1 RTT saved.
+        client.write(b"0-rtt request").unwrap();
+        assert!(client.is_handshaked(), "tx is data-plane after the send phase");
+        let (sid, mux) = client.handshake_client_confirm().unwrap();
+        assert_eq!(sid, TEST_SID);
+        assert!(mux);
+        assert_eq!(client.read().unwrap(), b"0-rtt reply");
+        server.join().unwrap();
+    });
+}
+
+#[test]
+fn confirm_without_send_is_rejected() {
+    let (client_io, _server_io) = duplex_pair();
+    let mut client = Transmission::new(client_io, ObfuscationKey::default());
+    let err = client.handshake_client_confirm().unwrap_err();
+    assert_eq!(err, Error::HandshakeFailed("confirm without send phase"));
+}
+
+#[test]
+fn zero_rtt_defers_canary_mismatch_to_confirm() {
+    // The flag-canary error moves from the handshake to the confirm phase;
+    // the already-sent 0-RTT request is simply dropped by the client.
+    let client_key = ObfuscationKey {
+        shuffle_data: !ObfuscationKey::default().shuffle_data,
+        ..ObfuscationKey::default()
+    };
+    let (client_io, server_io) = duplex_pair();
+    let server_thread = std::thread::spawn(move || {
+        let mut server = Transmission::new(server_io, ObfuscationKey::default());
+        // The server's own decode of the request fails too (flags differ);
+        // ignore its result, the client-side assert is the point.
+        let _ = server.handshake_server(7, false);
+        let _ = server.read();
+    });
+    let mut client = Transmission::new(client_io, client_key);
+    client.handshake_client_send().unwrap();
+    client.write(b"doomed request").unwrap();
+    let err = client.handshake_client_confirm().unwrap_err();
+    server_thread.join().unwrap();
+    assert_eq!(err, Error::FlagsMismatch);
+}
+
+#[test]
 fn abrupt_close_surfaces_io_error() {
     let (mut client, server_io) = duplex_pair();
     let mut client = Transmission::new(&mut client, ObfuscationKey::default());
