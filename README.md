@@ -62,11 +62,13 @@ nextppp client -c nextppp-client.jsonc
 ### 端到端吞吐量
 
 集成测试 `crates/client/tests/throughput.rs` 走完整链路（socks5 入站 -> client ->
-nextppp 隧道 -> server -> 本地 echo），测单向字节速率。AMD 7945HX 上 server 与 client 均为单核的吞吐量：
+mux 隧道 -> server -> 本地 echo），测单向字节速率。AMD 7945HX 上 server 与 client
+均限单核、默认配置（binary 帧 + aes-256-ctr）下 6 轮 256 MiB 传输：
 
 ```sh
 cargo test -p nextppp-client --release --test throughput -- --ignored --nocapture
-# throughput: 268435456 bytes (256 MiB) in 1.54s = 165.76 MiB/s (server cpu 0, client cpu 1)
+# throughput: 268435456 bytes (256 MiB) in 1.45-1.55s = 165.22-177.18 MiB/s
+# （中位数 ≈171.6 MiB/s，server cpu 0, client cpu 1）
 ```
 
 ## 文档
