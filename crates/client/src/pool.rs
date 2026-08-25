@@ -103,25 +103,31 @@ impl Pool {
     /// waits for the maintainer when the pool is empty, and dials a
     /// dedicated tunnel when pooling is disabled.
     ///
+    /// Budgets are per phase, each a full `connect_timeout`: waiting for a
+    /// pool tunnel, dialing (with retries) and the OPEN/REPLY exchange
+    /// never eat into each other. A single shared deadline made every
+    /// slow-recovered dial (blackholed first attempt, retry succeeds) fail
+    /// with a fake REPLY timeout — the dial had already spent the whole
+    /// budget.
+    ///
     /// # Errors
     ///
     /// Target refused by the server, or no usable tunnel within
     /// `connect_timeout`.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn open_stream(&self, addr: &ProxyAddr) -> anyhow::Result<Stream> {
-        let deadline = Instant::now() + self.rt.connect_timeout;
         if self.rt.pool_size == 0 {
-            let (session, io) = dial(&self.rt).await?;
-            let tunnel = spawn_tunnel(session, io, Weak::new())?;
-            // Dedicated tunnels die with their single stream.
-            return tunnel.open(addr, deadline).await;
+            return self.open_dedicated(addr).await;
         }
+        // The pool-wait phase is bounded once, from entry; every dial and
+        // OPEN exchange below carries a budget of its own.
+        let wait_deadline = Instant::now() + self.rt.connect_timeout;
         loop {
             let Some(tunnel) = self.pick() else {
                 // Kick the maintainer (it may be idling) and wait for a
                 // tunnel to arrive.
                 self.inner.died.notify_one();
-                let remaining = deadline.saturating_duration_since(Instant::now());
+                let remaining = wait_deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero()
                     || tokio::time::timeout(remaining, self.inner.added.notified())
                         .await
@@ -136,7 +142,7 @@ impl Pool {
                 }
                 continue;
             };
-            match tunnel.open(addr, deadline).await {
+            match tunnel.open(addr, self.rt.connect_timeout).await {
                 Ok(stream) => return Ok(stream),
                 // Tunnel died mid-open: drop it and try another one.
                 Err(e) if !tunnel.alive() => {
@@ -150,6 +156,14 @@ impl Pool {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    /// Dials a tunnel dedicated to this one stream (pooling disabled) and
+    /// runs the OPEN on it. Dedicated tunnels die with their single stream.
+    async fn open_dedicated(&self, addr: &ProxyAddr) -> anyhow::Result<Stream> {
+        let (session, io) = dial(&self.rt).await?;
+        let tunnel = spawn_tunnel(session, io, Weak::new())?;
+        tunnel.open(addr, self.rt.connect_timeout).await
     }
 
     /// Least-loaded live tunnel with stream capacity left.
@@ -217,13 +231,16 @@ impl Tunnel {
         self.streams.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Sends OPEN and waits for the server's REPLY under `deadline`.
+    /// Sends OPEN and waits for the server's REPLY under a budget of
+    /// `budget` starting now (see [`Pool::open_stream`] for why the budget
+    /// is per exchange).
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     async fn open(
         self: &Arc<Tunnel>,
         addr: &ProxyAddr,
-        deadline: Instant,
+        budget: Duration,
     ) -> anyhow::Result<Stream> {
+        let deadline = Instant::now() + budget;
         let sid = self.alloc_stream();
         let (reply_tx, reply_rx) = oneshot::channel();
         let (ev_tx, ev_rx) = mpsc::channel(STREAM_BOUND);

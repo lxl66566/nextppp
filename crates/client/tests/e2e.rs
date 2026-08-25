@@ -12,7 +12,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use nextppp_client::ClientRuntime;
@@ -85,6 +85,18 @@ fn start_client(server: SocketAddr) -> SocketAddr {
 }
 
 fn start_client_with(server: SocketAddr, connect_retries: u32, pool_size: u32) -> SocketAddr {
+    start_client_full(server, 5, connect_retries, pool_size, 64)
+}
+
+/// Full-fidelity client harness: explicit `connect_timeout`, retry count,
+/// pool size and per-tunnel stream cap (saturation tests need them).
+fn start_client_full(
+    server: SocketAddr,
+    connect_timeout: u64,
+    connect_retries: u32,
+    pool_size: u32,
+    max_streams: u32,
+) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let cfg = ClientConfig {
@@ -93,12 +105,12 @@ fn start_client_with(server: SocketAddr, connect_retries: u32, pool_size: u32) -
         max_connections: None,
         server: ServerSection {
             address: server.to_string(),
-            connect_timeout: 5,
+            connect_timeout,
             connect_retries,
             mux: MuxSection {
                 enabled: true,
                 pool_size,
-                max_streams: 64,
+                max_streams,
             },
             obfuscation: ObfuscationConfig::default(),
         },
@@ -126,6 +138,79 @@ fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
 // the mux wire protocol (handshake -> demux -> target pumps), used to prove
 // interop and to inject tunnel-level failures the real server never causes.
 // ---------------------------------------------------------------------------
+
+/// Accepts connections but never speaks: a dial attempt against it burns
+/// its full handshake timeout (the slowest failure mode — unlike RST).
+fn start_blackhole() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        // Hold every accepted socket open forever (test-lifetime leak on
+        // purpose; the blackhole must not close anything).
+        for conn in listener.incoming().flatten() {
+            Box::leak(Box::new(conn));
+        }
+    });
+    addr
+}
+
+/// A stand-in server address whose connection #0 is forwarded to `first`
+/// and every later connection to `rest`. Downlink chunks are delayed a
+/// few milliseconds to model real-network RTT: on pure loopback a REPLY
+/// can outrun `timeout(Duration::ZERO)`'s ~1ms timer tick and mask
+/// deadline-budget bugs.
+fn start_flaky_forwarder(first: SocketAddr, rest: SocketAddr) -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let conns = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&conns);
+    thread::spawn(move || {
+        for (i, conn) in listener.incoming().enumerate() {
+            let mut conn = conn.unwrap();
+            seen.fetch_add(1, Ordering::Relaxed);
+            let target = if i == 0 {
+                first
+            } else {
+                rest
+            };
+            let up = TcpStream::connect(target).unwrap();
+            let up_dn = up.try_clone().unwrap();
+            // target -> client (downlink, delayed per chunk)
+            let mut dn = conn.try_clone().unwrap();
+            thread::spawn(move || {
+                let mut up = up_dn;
+                let mut buf = [0u8; 8192];
+                loop {
+                    match up.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            thread::sleep(Duration::from_millis(2));
+                            if dn.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        },
+                    }
+                }
+            });
+            // client -> target (uplink, plain)
+            thread::spawn(move || {
+                let mut up = up;
+                let mut buf = [0u8; 8192];
+                loop {
+                    match conn.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if up.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        },
+                    }
+                }
+            });
+        }
+    });
+    (addr, conns)
+}
 
 /// Shared mux writer: encrypts `kind || sid || payload` frames on demand.
 /// The mutex serializes the tx cipher across per-stream pump threads.
@@ -440,6 +525,39 @@ fn retry_recovers_from_rst_during_handshake() {
         handshakes.load(Ordering::Relaxed),
         1,
         "the RST attempt dies pre-handshake; exactly one tunnel handshakes"
+    );
+}
+
+/// Regression: a dial whose first attempt burns the whole connect_timeout
+/// (black hole) and whose retry then succeeds must still complete the
+/// OPEN/REPLY exchange. With a deadline shared across dial and open, the
+/// dial always spent the whole budget and the OPEN failed with a fake
+/// REPLY timeout.
+#[test]
+fn slow_retry_dial_does_not_starve_the_open_exchange() {
+    let echo = start_echo();
+    let server = start_server();
+    let (fwd, conns) = start_flaky_forwarder(start_blackhole(), server);
+    // 2s budget, one retry: attempt 1 eats its full timeout in the black
+    // hole, attempt 2 reaches the real server.
+    let client = start_client_full(fwd, 2, 1, 0, 64);
+
+    let t0 = Instant::now();
+    let mut s = socks5_connect(client, &Host::Ip("127.0.0.1".parse().unwrap()), echo.port());
+    let elapsed = t0.elapsed();
+    echo_roundtrip(&mut s, b"fresh budget for the open");
+    assert_eq!(
+        conns.load(Ordering::Relaxed),
+        2,
+        "the blackhole attempt plus one retry"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(2),
+        "the blackhole attempt must burn its full timeout ({elapsed:?})"
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "the open exchange must not wait out another full timeout ({elapsed:?})"
     );
 }
 
