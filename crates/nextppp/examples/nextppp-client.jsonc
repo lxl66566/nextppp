@@ -11,6 +11,10 @@
   "server": {
     "address": "your.server.example:6666",
     // "connect_timeout": 10,
+    // Extra connect attempts after a routine transport failure
+    // (RST/timeout). Raises the success rate on RST-bombed links
+    // (1-(1-p)^n), at the cost of a more visible connect cadence.
+    // "connect_retries": 1,
     // Must mirror the server configuration (password included).
     // "obfuscation": { ... },
   },

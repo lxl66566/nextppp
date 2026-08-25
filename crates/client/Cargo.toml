@@ -17,11 +17,13 @@ hotpath        = { workspace = true, optional = true }
 nextppp-common = { workspace = true }
 nextppp-core   = { workspace = true }
 spdlog-rs      = { workspace = true }
+thiserror      = { workspace = true }
 
 [dev-dependencies]
 hotpath        = { workspace = true }
 libc           = { workspace = true }
 nextppp-server = { workspace = true }
+socket2        = { workspace = true }
 
 [features]
 # Profiling instrumentation; see nextppp-core's feature docs. The dev-dep

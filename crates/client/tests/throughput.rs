@@ -140,6 +140,7 @@ fn start_client(cpu: usize, server: SocketAddr) -> SocketAddr {
         server: ServerSection {
             address: server.to_string(),
             connect_timeout: 5,
+            connect_retries: 0,
             obfuscation: ObfuscationConfig::default(),
         },
     };

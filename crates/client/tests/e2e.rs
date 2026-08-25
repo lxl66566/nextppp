@@ -5,16 +5,23 @@
 use std::{
     io::{Read, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::Duration,
 };
 
 use nextppp_client::ClientRuntime;
 use nextppp_common::{
-    addr::Host,
+    addr::{Host, ProxyAddr},
     config::{ClientConfig, ObfuscationConfig, ServerConfig, ServerSection},
+    dns::DnsCache,
+    pump,
+    proto::{STATUS_OK, STATUS_REFUSED},
 };
+use nextppp_core::{ObfuscationKey, Transmission};
 use nextppp_server::ServerRuntime;
 
 // ---------------------------------------------------------------------------
@@ -69,6 +76,10 @@ fn start_server() -> SocketAddr {
 }
 
 fn start_client(server: SocketAddr) -> SocketAddr {
+    start_client_with(server, 0)
+}
+
+fn start_client_with(server: SocketAddr, connect_retries: u32) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let cfg = ClientConfig {
@@ -78,6 +89,7 @@ fn start_client(server: SocketAddr) -> SocketAddr {
         server: ServerSection {
             address: server.to_string(),
             connect_timeout: 5,
+            connect_retries,
             obfuscation: ObfuscationConfig::default(),
         },
     };
@@ -86,6 +98,59 @@ fn start_client(server: SocketAddr) -> SocketAddr {
         nextppp_client::serve(listener, rt).unwrap();
     });
     addr
+}
+
+/// Minimal in-test nextppp server speaking the real protocol (handshake,
+/// request, target connect, STATUS, pump) and counting completed handshakes.
+/// With `rst_first`, the very first accepted connection is killed with a RST
+/// (linger-0 close) to simulate a handshake cut mid-flight.
+fn start_mini_server(rst_first: bool) -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handshakes = Arc::new(AtomicUsize::new(0));
+    let hs = Arc::clone(&handshakes);
+    thread::spawn(move || {
+        for (i, conn) in listener.incoming().enumerate() {
+            let conn = conn.unwrap();
+            if rst_first && i == 0 {
+                // linger(0) turns the close into a RST: the client's
+                // in-flight handshake attempt dies with ECONNRESET.
+                // (`TcpStream::set_linger` is unstable; socket2 it is.)
+                socket2::SockRef::from(&conn)
+                    .set_linger(Some(Duration::ZERO))
+                    .unwrap();
+                drop(conn);
+                continue;
+            }
+            let hs = Arc::clone(&hs);
+            thread::spawn(move || serve_protocol(conn, &hs));
+        }
+    });
+    (addr, handshakes)
+}
+
+fn serve_protocol(conn: TcpStream, handshakes: &Arc<AtomicUsize>) {
+    let rx_io = conn.try_clone().unwrap();
+    let mut t = Transmission::new(conn, ObfuscationKey::default());
+    t.handshake_server(7, false).unwrap();
+    handshakes.fetch_add(1, Ordering::Relaxed);
+    let req = t.read().unwrap();
+    let addr = ProxyAddr::decode(&req).unwrap();
+    match pump::tcp_connect(
+        &addr.host,
+        addr.port,
+        Duration::from_secs(5),
+        &DnsCache::new(),
+    ) {
+        Ok(target) => {
+            t.write(&[STATUS_OK]).unwrap();
+            let (txh, rxh) = t.split_with(rx_io);
+            let _stats = pump::pump_tunnel(txh, rxh, target);
+        },
+        Err(_) => {
+            let _ = t.write(&[STATUS_REFUSED]);
+        },
+    }
 }
 
 fn timed(stream: TcpStream) -> TcpStream {
@@ -205,6 +270,41 @@ fn socks5_unreachable_target_reports_failure() {
     let client = start_client(start_server());
     let rep = socks5_connect_rep(client, &Host::Ip("127.0.0.1".parse().unwrap()), dead.port());
     assert_eq!(rep, 0x01, "expected general failure for refused target");
+}
+
+#[test]
+fn retry_recovers_from_rst_during_handshake() {
+    let echo = start_echo();
+    // First TCP connection is RST mid-handshake; only a retry can succeed.
+    let (server, handshakes) = start_mini_server(true);
+    let client = start_client_with(server, 1);
+
+    let mut s = socks5_connect(client, &Host::Ip("127.0.0.1".parse().unwrap()), echo.port());
+    echo_roundtrip(&mut s, b"second attempt wins");
+    assert_eq!(
+        handshakes.load(Ordering::Relaxed),
+        1,
+        "the RST attempt dies pre-handshake; exactly one tunnel handshakes"
+    );
+}
+
+#[test]
+fn refused_target_is_not_retried() {
+    let dead = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a = l.local_addr().unwrap();
+        drop(l);
+        a
+    };
+    let (server, handshakes) = start_mini_server(false);
+    let client = start_client_with(server, 2);
+    let rep = socks5_connect_rep(client, &Host::Ip("127.0.0.1".parse().unwrap()), dead.port());
+    assert_eq!(rep, 0x01, "expected general failure for refused target");
+    assert_eq!(
+        handshakes.load(Ordering::Relaxed),
+        1,
+        "STATUS_REFUSED is a deterministic verdict; retries must not fire"
+    );
 }
 
 #[test]

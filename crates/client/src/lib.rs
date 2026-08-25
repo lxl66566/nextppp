@@ -38,6 +38,8 @@ pub struct ClientRuntime {
     pub server_key: Arc<ObfuscationKey>,
     /// Connect + handshake timeout toward the server.
     pub connect_timeout: Duration,
+    /// Extra connect attempts after a routine transport failure.
+    pub connect_retries: u32,
     /// Maximum concurrently active inbound connections (`None` = unlimited).
     pub max_connections: Option<u64>,
     /// Server-address DNS cache: without it every SOCKS CONNECT re-resolves
@@ -66,6 +68,7 @@ impl ClientRuntime {
             server_port,
             server_key: Arc::new(key),
             connect_timeout: Duration::from_secs(cfg.server.connect_timeout),
+            connect_retries: cfg.server.connect_retries,
             max_connections: cfg.max_connections,
             dns: Arc::new(nextppp_common::dns::DnsCache::new()),
         })

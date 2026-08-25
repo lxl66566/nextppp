@@ -237,6 +237,12 @@ pub struct ServerSection {
     /// Connect + handshake timeout in seconds.
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout: u64,
+    /// Extra connect attempts after the first one fails with a routine
+    /// transport error (RST/timeout). 80% RST links nearly double their
+    /// success rate per retry (`1-(1-p)^n`); the tradeoff is a more visible
+    /// connect-attempt cadence to a censor, so this is opt-in.
+    #[serde(default = "default_connect_retries")]
+    pub connect_retries: u32,
     /// Obfuscation parameters, must match the server.
     #[serde(default)]
     pub obfuscation: ObfuscationConfig,
@@ -244,6 +250,10 @@ pub struct ServerSection {
 
 fn default_connect_timeout() -> u64 {
     10
+}
+
+fn default_connect_retries() -> u32 {
+    1
 }
 
 fn default_handshake_timeout() -> u64 {

@@ -15,7 +15,7 @@
 | 2 | A5 listen backlog 4096 + `TCP_DEFER_ACCEPT`（Linux） | §A5 | ✅ | `perf(common)` |
 | 3 | A6 DNS 缓存（正 TTL 300s / 负 TTL 30s / stale-while-error） | §A6 | ✅ | `perf(common)` |
 | 4 | A2 握手 0-RTT：`handshake_client` 拆 send/confirm，request 提前 1 RTT | §A2 | ✅ | `perf(core,client)` |
-| 5 | A3 `tunnel_connect` 快速重试（`connect_retries`，复用 A6 的缓存不重复解析） | §A3 | ⬜ | |
+| 5 | A3 `tunnel_connect` 快速重试（`connect_retries`，复用 A6 的缓存不重复解析） | §A3 | ✅ | `perf(client)` |
 | 6 | A7 探针节流：握手并发上限 + 失败日志限频 | §A7 | ⬜ | |
 
 排序理由：A1/A5 独立且最小，先落地；A6 先行使 A3 的重试不必重复跑 resolver；
@@ -50,3 +50,9 @@ A2 改握手时序，放在自己的提交里便于回归定位；A3 依赖 A2 �
   兼容、服务端零改动。`outbound` 在 confirm 前发 request，CONNECT 关键路径 −1 RTT。新增测试：
   0-RTT 请求在 confirm 前到达且服务端可解码、confirm 无副作用前置报错、canary 不匹配错误推迟到
   confirm（`FlagsMismatch` 语义不变）。`is_handshaked` 注释更新为"tx 先翻"。
+- **A3**：`tunnel_connect` 拆出 `tunnel_connect_once`，外层重试循环（`connect_retries`，默认 1，
+  每次全新 TcpStream，DNS 走 A6 缓存不重解析）。重试判定 `retryable()`：复用 `is_clean_close`（RST/
+  超时/EOF 等 routine teardown）+ SYN 被 RST 呈现的 `ConnectionRefused`；`FlagsMismatch`（配置错）与
+  服务端 `STATUS_REFUSED`（新引入的 `RefusedTarget` 类型化错误）确定性不重试。测试：单测覆盖
+  分类表；e2e 用 mini server（linger(0) 制造握手期 RST + 握手计数器）证明 RST 后重试成功且
+  `STATUS_REFUSED` 不触发重试。经验：`TcpStream::set_linger` 尚 unstable，测试改用 socket2。
