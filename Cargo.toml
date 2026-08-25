@@ -3,7 +3,7 @@ resolver = "3"
 members  = ["crates/*"]
 
 [workspace.package]
-version      = "0.1.1"
+version      = "0.2.0"
 edition      = "2024"
 rust-version = "1.85"
 repository   = "https://github.com/lxl66566/nextppp"
@@ -37,7 +37,7 @@ nextppp-server = { path = "crates/server" }
 serde          = { version = "1", features = ["derive"] }
 socket2        = { version = "0.6", features = ["all"] }
 spdlog-rs      = "0.5"
-tokio          = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util", "macros"] }
+tokio          = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [workspace.lints.clippy]
 all                     = { level = "warn", priority = -1 }

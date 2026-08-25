@@ -1,6 +1,6 @@
 # nextppp
 
-Rust 写的代理，bypass GFW。协议魔改自 [openppp2](https://github.com/liulilittle/openppp2)。
+Rust 写的代理隧道，bypass GFW。协议魔改自 [openppp2](https://github.com/liulilittle/openppp2)。
 
 - 性能详见[端到端吞吐量](#端到端吞吐量)。
 
