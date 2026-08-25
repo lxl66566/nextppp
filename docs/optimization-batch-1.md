@@ -11,7 +11,7 @@
 | # | 条目 | 来源 | 状态 | 提交 |
 |---|------|------|------|------|
 | 0 | 本进度文档 | — | ✅ | 本次 |
-| 1 | A1 TCP keepalive：堵住死连接线程/fd 泄漏 | §A1 | ⬜ | |
+| 1 | A1 TCP keepalive：堵住死连接线程/fd 泄漏 | §A1 | ✅ | `perf(common)` |
 | 2 | A5 listen backlog 4096 + `TCP_DEFER_ACCEPT`（Linux） | §A5 | ⬜ | |
 | 3 | A6 DNS 缓存（正 TTL 300s / 负 TTL 30s / stale-while-error） | §A6 | ⬜ | |
 | 4 | A2 握手 0-RTT：`handshake_client` 拆 send/confirm，request 提前 1 RTT | §A2 | ⬜ | |
@@ -29,4 +29,8 @@ A2 改握手时序，放在自己的提交里便于回归定位；A3 依赖 A2 �
 
 ## 实施日志
 
-（随提交追加）
+- **A1**：`pump::keepalive`（60s 空闲 / 15s 间隔 / 3 次探测，Windows 走系统默认重试）。挂载点：
+  `tcp_connect` 两条成功路径（client→server 与 server→target 同时覆盖）、socks5 inbound、
+  server accept 流。探测包为纯 ACK，不引入 DPI 指纹。测试：`keepalive_is_applied` 用
+  socket2 getter 断言参数落核（Linux 全参数，其他平台断 SO_KEEPALIVE）。
+  备注：clippy 的 `needless_pass_by_value`（pump.rs `tunnel_up/down`）为存量警告，本批次不动。

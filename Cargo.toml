@@ -35,6 +35,7 @@ nextppp-common = { path = "crates/common" }
 nextppp-core   = { path = "crates/core" }
 nextppp-server = { path = "crates/server" }
 serde          = { version = "1", features = ["derive"] }
+socket2        = { version = "0.6", features = ["all"] }
 spdlog-rs      = "0.5"
 
 [workspace.lints.clippy]

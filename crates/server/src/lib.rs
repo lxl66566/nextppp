@@ -220,6 +220,9 @@ fn handle_conn_inner(
     stats: &ServerStats,
 ) -> anyhow::Result<()> {
     pump::nodelay(&stream);
+    // The tunnel stream is long-lived and the data plane clears all
+    // timeouts; keepalive is the only dead-peer detection it has.
+    pump::keepalive(&stream);
     stream.set_read_timeout(Some(rt.handshake_timeout))?;
     stream.set_write_timeout(Some(rt.handshake_timeout))?;
     let rx_io = stream.try_clone().context("clone stream")?;

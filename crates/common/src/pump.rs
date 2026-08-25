@@ -138,6 +138,32 @@ pub fn nodelay(stream: &TcpStream) {
     let _ = stream.set_nodelay(true);
 }
 
+/// Enables kernel dead-peer detection on long-lived proxied streams.
+///
+/// The data plane runs with all socket timeouts cleared (a stall must
+/// surface as slow, never as a spurious error), so without keepalive a
+/// thread parked in `read()` on a silently-dead peer (NAT timeout, power
+/// loss, blackholed path) would hang until process restart. After 60s
+/// idle the kernel probes every 15s; a dead peer errors the socket with
+/// ETIMEDOUT/RST, which [`routine_cause`] already classifies as a routine
+/// close — no log-path changes needed. Keepalive probes are empty ACKs
+/// and add no DPI fingerprint.
+pub fn keepalive(stream: &TcpStream) {
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(15));
+    // Custom probe counts are not portable: Windows uses a fixed system
+    // default. 3 probes after 60s idle bounds detection at ~105s.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    let ka = ka.with_retries(3);
+    let _ = socket2::SockRef::from(stream).set_tcp_keepalive(&ka);
+}
+
 /// Accept-loop backoff on resource exhaustion. Once accept() starts failing
 /// with EMFILE/ENFILE/ENOMEM it fails again immediately, so the loop would
 /// spin at 100% CPU (and flood the log) until descriptors free up; a short
@@ -175,7 +201,11 @@ pub fn accept_backoff(err: &io::Error) {
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn tcp_connect(host: &Host, port: u16, timeout: Duration) -> io::Result<TcpStream> {
     match host {
-        Host::Ip(ip) => TcpStream::connect_timeout(&SocketAddr::new(*ip, port), timeout),
+        Host::Ip(ip) => {
+            let s = TcpStream::connect_timeout(&SocketAddr::new(*ip, port), timeout)?;
+            keepalive(&s);
+            Ok(s)
+        },
         Host::Domain(domain) => {
             let deadline = Instant::now() + timeout;
             let (tx, rx) = mpsc::channel();
@@ -215,7 +245,10 @@ pub fn tcp_connect(host: &Host, port: u16, timeout: Duration) -> io::Result<TcpS
                     ));
                 }
                 match TcpStream::connect_timeout(&addr, remaining) {
-                    Ok(s) => return Ok(s),
+                    Ok(s) => {
+                        keepalive(&s);
+                        return Ok(s);
+                    },
                     Err(e) => last = e,
                 }
             }

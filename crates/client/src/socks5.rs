@@ -43,6 +43,7 @@ const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Handles one SOCKS5 connection end to end, logging its full lifecycle.
 pub fn handle(stream: TcpStream, rt: &Arc<ClientRuntime>, stats: &ClientStats) {
     pump::nodelay(&stream);
+    pump::keepalive(&stream);
     let peer = stream
         .peer_addr()
         .map_or_else(|_| String::from("?"), |a| a.to_string());

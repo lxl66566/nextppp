@@ -18,8 +18,12 @@ hotpath      = { workspace = true, optional = true }
 json5        = { workspace = true }
 nextppp-core = { workspace = true }
 serde        = { workspace = true }
+socket2      = { workspace = true }
 spdlog-rs    = { workspace = true }
 thiserror    = { workspace = true }
+
+[dev-dependencies]
+socket2 = { workspace = true }
 
 [features]
 # Profiling instrumentation; see nextppp-core's feature docs.
