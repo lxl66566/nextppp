@@ -55,10 +55,10 @@
 | `kx` | 128 | 握手包 padding 量（实际取 `kx % 256`） |
 | `protocol` | `Aes128Cfb` | 帧头长度字段保护密码 |
 | `protocol_key` | `"nextppp"` | 协议密码口令，**部署必须修改** |
-| `transport` | `Aes256Cfb` | 负载保护密码 |
+| `transport` | `Aes256Ctr` | 负载保护密码 |
 | `transport_key` | `"nextppp"` | 传输密码口令，**部署必须修改** |
 | `masked` | true | 负载 masked-XOR 开关（数据面；握手前强制开启） |
-| `plaintext` | true | 握手后是否保留 base94 可打印外壳；`false` 则切换紧凑 3 字节二进制帧头 |
+| `plaintext` | false | 握手后是否保留 base94 可打印外壳（~1.64x 线上字节膨胀的 DPI 伪装）；`false` 则切换紧凑 3 字节二进制帧头 |
 | `delta_encode` | true | 负载 delta 编码开关 |
 | `shuffle_data` | true | 负载 shuffle 开关 |
 
@@ -263,10 +263,9 @@ seq += 1
 - 64 位计数器在单连接内实际不可能回绕（2^64 包 × 64KiB 远超任何会话规模）；
   ChaCha20 的 32 位 XOR 宽度同样安全（重复一个 nonce 需单方向 2^32 包 ≈ 256 TiB）。
 
-> **部署提示（吞吐）**：CFB 的加密方向是串行反馈链（≈3 c/B），解密已批量化但
-> server 的下行（大流量方向）走的是加密。高吞吐场景建议把 `transport` 配置为
-> `aes-256-ctr` 或 `chacha20-ietf`（两者全并行，wire 语义与 CFB 互不兼容，
-> 两端需一致）。
+> **部署提示（吞吐）**：默认 `transport` 已是全并行的 `aes-256-ctr`（CFB 的加密方向
+> 是串行反馈链 ≈3 c/B，仅握手前的 SAFEST 阶段与协议头使用）。无 AES-NI 的机器建议
+> 改配 `chacha20-ietf`（wire 语义与 AES 互不兼容，两端需一致）。
 
 ## 6. 帧格式
 

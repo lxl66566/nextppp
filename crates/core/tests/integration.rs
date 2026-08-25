@@ -346,6 +346,11 @@ fn truncated_packet_rejected_in_memory() {
     client
         .encrypt_into(&mut wire, b"will-be-truncated")
         .unwrap();
+    assert_eq!(server.decrypt(&wire).unwrap(), b"will-be-truncated");
+    // NOTE: on the binary path a *failed* decrypt still advances the rx
+    // cipher (the header must be decrypted to learn the length), so the
+    // success case runs first; after any failure the session is desynced
+    // and only the error kind is asserted.
     assert_eq!(
         server.decrypt(&wire[..wire.len() - 1]).unwrap_err(),
         Error::InvalidFrame
@@ -353,7 +358,6 @@ fn truncated_packet_rejected_in_memory() {
     let mut doubled = wire.clone();
     doubled.extend_from_slice(&wire);
     assert_eq!(server.decrypt(&doubled).unwrap_err(), Error::InvalidFrame);
-    assert_eq!(server.decrypt(&wire).unwrap(), b"will-be-truncated");
 }
 
 #[test]

@@ -351,7 +351,7 @@ mod tests {
         assert_eq!(key.protocol_key, "sekrit");
         // Unset transport key falls back to the placeholder.
         assert_eq!(key.transport_key, "nextppp");
-        assert_eq!(key.transport, Method::Aes256Cfb);
+        assert_eq!(key.transport, Method::Aes256Ctr);
     }
 
     #[test]

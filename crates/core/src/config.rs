@@ -36,8 +36,9 @@ pub struct ObfuscationKey {
     /// Payload masked-XOR switch (data plane only; always on pre-handshake).
     pub masked: bool,
     /// Keep the printable base94 shell after the handshake. `true` maximizes
-    /// DPI resistance (all traffic stays printable ASCII); `false` switches
-    /// to the compact 3-byte binary header after handshaking.
+    /// DPI resistance (all traffic stays printable ASCII) at ~1.64x wire-byte
+    /// inflation; `false` (the default) switches to the compact 3-byte binary
+    /// header after handshaking, matching TLS/SSH's random-byte profile.
     pub plaintext: bool,
     /// Payload delta-encoding switch.
     pub delta_encode: bool,
@@ -56,10 +57,17 @@ impl Default for ObfuscationKey {
             kx: 128,
             protocol: Method::Aes128Cfb,
             protocol_key: String::from("nextppp"),
-            transport: Method::Aes256Cfb,
+            // CTR over CFB: CFB encryption is a serial feedback chain (~3
+            // c/B) and the server's downlink (the bulk direction) encrypts;
+            // CTR/ChaCha20 are fully parallel. AES-NI is assumed (servers);
+            // pick chacha20-ietf on hardware without it.
+            transport: Method::Aes256Ctr,
             transport_key: String::from("nextppp"),
             masked: true,
-            plaintext: true,
+            // Binary framing after the handshake: no ~1.64x base94 wire
+            // inflation on the data plane. Opt into `plaintext` only when
+            // printable-ASCII camouflage outweighs throughput.
+            plaintext: false,
             delta_encode: true,
             shuffle_data: true,
         }

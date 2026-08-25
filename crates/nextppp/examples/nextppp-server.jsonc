@@ -28,10 +28,12 @@
   //     "kx": 128,
   //     "protocol": "aes-128-cfb",
   //     "protocol_key": "optional, defaults to password",
-  //     "transport": "aes-256-cfb",
+  //     "transport": "aes-256-ctr",
   //     "transport_key": "optional, defaults to password",
   //     "masked": true,
-  //     "plaintext": true,
+  //     // true keeps the whole stream printable ASCII (DPI camouflage) at
+  //     // ~1.64x wire-byte inflation; false (default) is binary framing.
+  //     "plaintext": false,
   //     "delta_encode": true,
   //     "shuffle_data": true,
   // },
