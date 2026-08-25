@@ -15,6 +15,7 @@ pub mod mux;
 pub mod proto;
 pub mod pump;
 pub mod shutdown;
+pub mod tunnel;
 
 pub use addr::{Host, ProxyAddr};
 pub use config::{ClientConfig, ConfigError, ObfuscationConfig, ServerConfig};

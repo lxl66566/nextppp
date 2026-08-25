@@ -37,6 +37,7 @@ nextppp-server = { path = "crates/server" }
 serde          = { version = "1", features = ["derive"] }
 socket2        = { version = "0.6", features = ["all"] }
 spdlog-rs      = "0.5"
+tokio          = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util", "macros"] }
 
 [workspace.lints.clippy]
 all                     = { level = "warn", priority = -1 }

@@ -21,9 +21,11 @@ serde        = { workspace = true }
 socket2      = { workspace = true }
 spdlog-rs    = { workspace = true }
 thiserror    = { workspace = true }
+tokio        = { workspace = true }
 
 [dev-dependencies]
 socket2 = { workspace = true }
+tokio   = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
