@@ -27,6 +27,13 @@ const LISTEN_BACKLOG: i32 = 4096;
 /// Socket creation / bind / listen failure.
 pub fn bind_listen(addr: SocketAddr) -> io::Result<TcpListener> {
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
+    // SO_REUSEADDR gives unix its TIME_WAIT rebind semantics for quick
+    // restarts. On Windows the flag has no TIME_WAIT meaning and instead
+    // lets a second process silently double-bind (hijack) the port, so it
+    // must stay off there; a Windows restart simply waits out any lingering
+    // sockets, and socket2 (0.6) exposes no SO_EXCLUSIVEADDRUSE to do
+    // better.
+    #[cfg(not(windows))]
     socket.set_reuse_address(true)?;
     #[cfg(target_os = "linux")]
     set_defer_accept(&socket)?;
