@@ -163,7 +163,17 @@ impl Pool {
     async fn open_dedicated(&self, addr: &ProxyAddr) -> anyhow::Result<Stream> {
         let (session, io) = dial(&self.rt).await?;
         let tunnel = spawn_tunnel(session, io, Weak::new())?;
-        tunnel.open(addr, self.rt.connect_timeout).await
+        match tunnel.open(addr, self.rt.connect_timeout).await {
+            Ok(stream) => Ok(stream),
+            Err(e) => {
+                // Refused target, REPLY timeout or tunnel death: nothing
+                // will ever use this tunnel again, and the server cannot
+                // close it for us — tear it down or its reader/writer
+                // tasks and socket park until process exit.
+                tunnel.kill();
+                Err(e)
+            },
+        }
     }
 
     /// Least-loaded live tunnel with stream capacity left.
@@ -214,6 +224,18 @@ impl Tunnel {
         self.registry.lock().unwrap().clear();
         if let Some(pool) = self.pool.upgrade() {
             pool.died.notify_one();
+        }
+    }
+
+    /// Immediate teardown for tunnels that must not outlive their purpose:
+    /// [`Self::mark_dead`], then abort the reader task. The tunnel struct
+    /// dies with its last Arc; dropping it drops the outbound channel,
+    /// which ends the writer with a socket shutdown — so the connection
+    /// closes without any further help. Idempotent.
+    fn kill(&self) {
+        self.mark_dead();
+        if let Some(reader) = self.reader.lock().unwrap().take() {
+            reader.abort();
         }
     }
 
@@ -341,9 +363,7 @@ impl Drop for Stream {
         }
         // Dedicated tunnels (no pool back-reference) die with their stream.
         if self.tunnel.pool.strong_count() == 0 {
-            if let Some(reader) = self.tunnel.reader.lock().unwrap().take() {
-                reader.abort();
-            }
+            self.tunnel.kill();
         }
     }
 }

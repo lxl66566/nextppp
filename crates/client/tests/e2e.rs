@@ -133,6 +133,14 @@ fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
+/// A loopback port with no listener: connects to it are refused.
+fn closed_port() -> SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let a = l.local_addr().unwrap();
+    drop(l);
+    a
+}
+
 // ---------------------------------------------------------------------------
 // Minimal in-test mux server: an independent, synchronous implementation of
 // the mux wire protocol (handshake -> demux -> target pumps), used to prove
@@ -259,10 +267,19 @@ struct MiniServer {
 /// Starts the mini mux server, returning its address and the completed-
 /// handshake counter.
 fn start_mini_server(opts: MiniServer) -> (SocketAddr, Arc<AtomicUsize>) {
+    let (addr, handshakes, _live) = start_mini_server_gauged(opts);
+    (addr, handshakes)
+}
+
+/// [`start_mini_server`] plus a live-connection gauge (tunnels currently
+/// held open server-side) — leak tests watch it drain back to zero.
+fn start_mini_server_gauged(opts: MiniServer) -> (SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let handshakes = Arc::new(AtomicUsize::new(0));
+    let live = Arc::new(AtomicUsize::new(0));
     let hs = Arc::clone(&handshakes);
+    let lv = Arc::clone(&live);
     thread::spawn(move || {
         for (i, conn) in listener.incoming().enumerate() {
             let conn = conn.unwrap();
@@ -277,11 +294,16 @@ fn start_mini_server(opts: MiniServer) -> (SocketAddr, Arc<AtomicUsize>) {
                 continue;
             }
             let hs = Arc::clone(&hs);
+            let lv = Arc::clone(&lv);
             let drop_on_first_data = opts.drop_on_first_data;
-            thread::spawn(move || serve_mux(conn, &hs, drop_on_first_data));
+            lv.fetch_add(1, Ordering::Relaxed);
+            thread::spawn(move || {
+                serve_mux(conn, &hs, drop_on_first_data);
+                lv.fetch_sub(1, Ordering::Relaxed);
+            });
         }
     });
-    (addr, handshakes)
+    (addr, handshakes, live)
 }
 
 /// Serves one mux tunnel against live targets (the loopback echo in
@@ -498,12 +520,7 @@ fn socks5_tunnel_roundtrip_ipv4_and_domain() {
 
 #[test]
 fn socks5_unreachable_target_reports_failure() {
-    let dead = {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let a = l.local_addr().unwrap();
-        drop(l);
-        a
-    };
+    let dead = closed_port();
     let client = start_client(start_server());
     let rep = socks5_connect_rep(client, &Host::Ip("127.0.0.1".parse().unwrap()), dead.port());
     assert_eq!(rep, 0x01, "expected general failure for refused target");
@@ -563,12 +580,7 @@ fn slow_retry_dial_does_not_starve_the_open_exchange() {
 
 #[test]
 fn refused_target_is_not_retried() {
-    let dead = {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let a = l.local_addr().unwrap();
-        drop(l);
-        a
-    };
+    let dead = closed_port();
     let (server, handshakes) = start_mini_server(MiniServer {
         rst_first: false,
         drop_on_first_data: false,
@@ -581,6 +593,30 @@ fn refused_target_is_not_retried() {
         1,
         "REPLY REFUSED is a per-stream verdict; no redial must fire"
     );
+}
+
+/// Regression: a dedicated tunnel whose OPEN fails (refused target) must
+/// be torn down. It used to leak — reader/writer tasks and the socket
+/// parked until process exit, holding the server-side connection open,
+/// because nothing ever aborted the reader after the error return.
+#[test]
+fn failed_open_tears_down_dedicated_tunnel() {
+    let dead = closed_port();
+    let (server, _handshakes, live) = start_mini_server_gauged(MiniServer {
+        rst_first: false,
+        drop_on_first_data: false,
+    });
+    // Dedicated mode: one tunnel per CONNECT.
+    let client = start_client_full(server, 5, 0, 0, 64);
+
+    let rep = socks5_connect_rep(client, &Host::Ip("127.0.0.1".parse().unwrap()), dead.port());
+    assert_eq!(rep, 0x01, "expected general failure for refused target");
+
+    // The refused tunnel must close server-side: the live gauge drains to
+    // zero instead of parking the connection forever.
+    wait_until("dedicated tunnel teardown", || {
+        live.load(Ordering::Relaxed) == 0
+    });
 }
 
 #[test]
