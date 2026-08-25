@@ -25,7 +25,7 @@ pub type Tunnel = (
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn tunnel_connect(addr: &ProxyAddr, rt: &ClientRuntime) -> anyhow::Result<Tunnel> {
     let started = std::time::Instant::now();
-    let stream = pump::tcp_connect(&rt.server_host, rt.server_port, rt.connect_timeout)
+    let stream = pump::tcp_connect(&rt.server_host, rt.server_port, rt.connect_timeout, &rt.dns)
         .with_context(|| {
             format!(
                 "connect server {}:{}",

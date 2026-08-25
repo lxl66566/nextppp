@@ -8,6 +8,7 @@
 
 pub mod addr;
 pub mod config;
+pub mod dns;
 pub mod fmt;
 pub mod listen;
 pub mod proto;

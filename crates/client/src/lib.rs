@@ -40,6 +40,9 @@ pub struct ClientRuntime {
     pub connect_timeout: Duration,
     /// Maximum concurrently active inbound connections (`None` = unlimited).
     pub max_connections: Option<u64>,
+    /// Server-address DNS cache: without it every SOCKS CONNECT re-resolves
+    /// the server domain on its own resolver thread.
+    pub dns: Arc<nextppp_common::dns::DnsCache>,
 }
 
 impl ClientRuntime {
@@ -64,6 +67,7 @@ impl ClientRuntime {
             server_key: Arc::new(key),
             connect_timeout: Duration::from_secs(cfg.server.connect_timeout),
             max_connections: cfg.max_connections,
+            dns: Arc::new(nextppp_common::dns::DnsCache::new()),
         })
     }
 }

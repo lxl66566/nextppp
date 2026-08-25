@@ -17,8 +17,8 @@
 
 use std::{
     io::{self, ErrorKind, Read, Write},
-    net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs},
-    sync::{Arc, mpsc},
+    net::{Shutdown, SocketAddr, TcpStream},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -185,76 +185,49 @@ pub fn accept_backoff(err: &io::Error) {
 }
 
 /// Connects to `host:port` under one overall `timeout` deadline: DNS
-/// resolution and every resolved-address attempt share it (previously each
-/// address got a full timeout, N A-records cost N * timeout). Addresses are
-/// tried in order, first success wins; no happy-eyeballs.
-///
-/// `getaddrinfo` has no deadline API, so resolution runs on a helper thread
-/// and the wait is bounded: a hung resolver parks exactly that one helper
-/// thread (until libc gives up) instead of the caller's session thread
-/// forever, unkillable by socket shutdowns.
+/// resolution (served by `dns`, see [`crate::dns`]) and every
+/// resolved-address attempt share it (previously each address got a full
+/// timeout, N A-records cost N * timeout). Addresses are tried in order,
+/// first success wins; no happy-eyeballs.
 ///
 /// # Errors
 ///
-/// DNS resolution failure/timeout or every candidate address failing to
-/// connect before the deadline.
+/// DNS resolution failure/timeout (without a usable stale cache entry) or
+/// every candidate address failing to connect before the deadline.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub fn tcp_connect(host: &Host, port: u16, timeout: Duration) -> io::Result<TcpStream> {
-    match host {
-        Host::Ip(ip) => {
-            let s = TcpStream::connect_timeout(&SocketAddr::new(*ip, port), timeout)?;
-            keepalive(&s);
-            Ok(s)
-        },
-        Host::Domain(domain) => {
-            let deadline = Instant::now() + timeout;
-            let (tx, rx) = mpsc::channel();
-            let owned = domain.clone();
-            let spawned = thread::Builder::new()
-                .name("nextppp-resolve".to_owned())
-                .spawn(move || {
-                    // The send races with `recv_timeout` giving up; a late
-                    // send just fails silently, the thread then exits.
-                    let res = (owned.as_str(), port)
-                        .to_socket_addrs()
-                        .map(Iterator::collect::<Vec<SocketAddr>>);
-                    let _ = tx.send(res);
-                });
-            let addrs = match spawned {
-                Ok(_) => match rx.recv_timeout(timeout) {
-                    Ok(res) => res?,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        return Err(io::Error::new(
-                            ErrorKind::TimedOut,
-                            "dns resolution timed out",
-                        ));
-                    },
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err(io::Error::other("resolver thread died"));
-                    },
-                },
-                Err(e) => return Err(io::Error::other(e)),
-            };
-            let mut last = io::Error::new(ErrorKind::AddrNotAvailable, "no addresses resolved");
-            for addr in addrs {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(io::Error::new(
-                        ErrorKind::TimedOut,
-                        "connect deadline exceeded",
-                    ));
-                }
-                match TcpStream::connect_timeout(&addr, remaining) {
-                    Ok(s) => {
-                        keepalive(&s);
-                        return Ok(s);
-                    },
-                    Err(e) => last = e,
-                }
-            }
-            Err(last)
-        },
+pub fn tcp_connect(
+    host: &Host,
+    port: u16,
+    timeout: Duration,
+    dns: &crate::dns::DnsCache,
+) -> io::Result<TcpStream> {
+    let deadline = Instant::now() + timeout;
+    let addrs: Vec<SocketAddr> = match host {
+        Host::Ip(ip) => vec![SocketAddr::new(*ip, port)],
+        Host::Domain(domain) => dns
+            .resolve(domain, deadline.saturating_duration_since(Instant::now()))?
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect(),
+    };
+    let mut last = io::Error::new(ErrorKind::AddrNotAvailable, "no addresses resolved");
+    for addr in addrs {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                ErrorKind::TimedOut,
+                "connect deadline exceeded",
+            ));
+        }
+        match TcpStream::connect_timeout(&addr, remaining) {
+            Ok(s) => {
+                keepalive(&s);
+                return Ok(s);
+            },
+            Err(e) => last = e,
+        }
     }
+    Err(last)
 }
 
 /// Local -> tunnel direction: wraps chunks in `FRAME_DATA`, emits `FRAME_EOF`

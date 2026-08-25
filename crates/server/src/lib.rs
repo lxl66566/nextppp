@@ -50,6 +50,9 @@ pub struct ServerRuntime {
     pub handshake_timeout: Duration,
     /// Maximum concurrently active sessions (`None` = unlimited).
     pub max_connections: Option<u64>,
+    /// Target DNS cache: collapses per-session `getaddrinfo` bursts into a
+    /// single lookup per TTL window.
+    pub dns: Arc<nextppp_common::dns::DnsCache>,
 }
 
 impl ServerRuntime {
@@ -70,6 +73,7 @@ impl ServerRuntime {
             connect_timeout: Duration::from_secs(cfg.connect_timeout),
             handshake_timeout: Duration::from_secs(cfg.handshake_timeout),
             max_connections: cfg.max_connections,
+            dns: Arc::new(nextppp_common::dns::DnsCache::new()),
         })
     }
 }
@@ -259,7 +263,7 @@ fn handle_conn_inner(
     stats.sessions.fetch_add(1, Ordering::Relaxed);
     info!("session {sid:016x} ({peer}) -> {target}");
 
-    let outgoing = pump::tcp_connect(&addr.host, addr.port, rt.connect_timeout);
+    let outgoing = pump::tcp_connect(&addr.host, addr.port, rt.connect_timeout, &rt.dns);
     match outgoing {
         Ok(target_stream) => {
             pump::nodelay(&target_stream);
