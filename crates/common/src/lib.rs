@@ -9,6 +9,7 @@
 pub mod addr;
 pub mod config;
 pub mod fmt;
+pub mod listen;
 pub mod proto;
 pub mod pump;
 pub mod shutdown;

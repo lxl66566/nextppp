@@ -25,6 +25,12 @@ thiserror    = { workspace = true }
 [dev-dependencies]
 socket2 = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = { workspace = true }
+
 [features]
 # Profiling instrumentation; see nextppp-core's feature docs.
 hotpath       = ["dep:hotpath", "hotpath/hotpath", "nextppp-core/hotpath"]

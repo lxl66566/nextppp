@@ -89,7 +89,7 @@ fn bind_listen(spec: &str) -> anyhow::Result<TcpListener> {
              hostnames are not resolved)"
         )
     })?;
-    TcpListener::bind(listen).with_context(|| format!("bind {listen}"))
+    nextppp_common::listen::bind_listen(listen).with_context(|| format!("bind {listen}"))
 }
 
 fn write_example(path: &Path, example: &str) -> anyhow::Result<()> {

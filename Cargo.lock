@@ -957,6 +957,7 @@ dependencies = [
  "ctrlc",
  "hotpath",
  "json5",
+ "libc",
  "nextppp-core",
  "serde",
  "socket2",
