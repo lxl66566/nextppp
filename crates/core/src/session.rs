@@ -30,6 +30,8 @@ use crate::{
 
 /// A handshaked nextppp session decoupled from its transport; see the
 /// module docs.
+// `session_id` mirrors Transmission's field/accessor naming on purpose.
+#[allow(clippy::struct_field_names)]
 pub struct Session<R = StdRng> {
     tx: TxCore<R>,
     rx: RxCore,
@@ -120,24 +122,19 @@ impl<R: Rng> Session<R> {
         } else {
             // Binary framing: decrypt the header once the 3 bytes are in
             // (consuming them off the buffer), then wait for the body.
-            let (len, header_kf) = match self.pending_binary {
-                Some(pending) => pending,
-                None => {
-                    if buf.len() < HEADER_SIZE {
-                        return Ok(None);
-                    }
-                    let header: [u8; HEADER_SIZE] =
-                        buf[..HEADER_SIZE].try_into().expect("length checked");
-                    let (len, header_kf) = parse_binary_header(
-                        self.rx.key.kf,
-                        &mut self.rx.protocol_rx,
-                        header,
-                        None,
-                    )?;
-                    buf.drain(..HEADER_SIZE);
-                    self.pending_binary = Some((len, header_kf));
-                    (len, header_kf)
-                },
+            let (len, header_kf) = if let Some(pending) = self.pending_binary {
+                pending
+            } else {
+                if buf.len() < HEADER_SIZE {
+                    return Ok(None);
+                }
+                let header: [u8; HEADER_SIZE] =
+                    buf[..HEADER_SIZE].try_into().expect("length checked");
+                let (len, header_kf) =
+                    parse_binary_header(self.rx.key.kf, &mut self.rx.protocol_rx, header, None)?;
+                buf.drain(..HEADER_SIZE);
+                self.pending_binary = Some((len, header_kf));
+                (len, header_kf)
             };
             if buf.len() < len {
                 return Ok(None);
