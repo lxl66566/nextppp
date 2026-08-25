@@ -201,6 +201,14 @@ pub struct ServerConfig {
     /// dropped at accept time. `null` (the default) means unlimited.
     #[serde(default)]
     pub max_connections: Option<u64>,
+    /// Maximum concurrent in-progress handshakes, capped separately from
+    /// `max_connections`: probe floods would otherwise occupy the session
+    /// budget for the full `handshake_timeout` each and squeeze out real
+    /// users. Over the cap the connection is dropped at accept time, so a
+    /// probe costs one table slot instead of one thread + 15s. `null`
+    /// disables the cap (not recommended on a hostile network).
+    #[serde(default = "default_max_handshakes")]
+    pub max_handshakes: Option<u64>,
     /// Obfuscation parameters, shared with clients.
     #[serde(default)]
     pub obfuscation: ObfuscationConfig,
@@ -258,6 +266,13 @@ fn default_connect_retries() -> u32 {
 
 fn default_handshake_timeout() -> u64 {
     15
+}
+
+// The serde default fn must return the field's type; Some(256) is the
+// intended default, not an optional computation.
+#[allow(clippy::unnecessary_wraps)]
+fn default_max_handshakes() -> Option<u64> {
+    Some(256)
 }
 
 /// Loads and validates a jsonc configuration file.

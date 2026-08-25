@@ -16,7 +16,7 @@
 | 3 | A6 DNS 缓存（正 TTL 300s / 负 TTL 30s / stale-while-error） | §A6 | ✅ | `perf(common)` |
 | 4 | A2 握手 0-RTT：`handshake_client` 拆 send/confirm，request 提前 1 RTT | §A2 | ✅ | `perf(core,client)` |
 | 5 | A3 `tunnel_connect` 快速重试（`connect_retries`，复用 A6 的缓存不重复解析） | §A3 | ✅ | `perf(client)` |
-| 6 | A7 探针节流：握手并发上限 + 失败日志限频 | §A7 | ⬜ | |
+| 6 | A7 探针节流：握手并发上限 + 失败日志限频 | §A7 | ✅ | `feat(server)` |
 
 排序理由：A1/A5 独立且最小，先落地；A6 先行使 A3 的重试不必重复跑 resolver；
 A2 改握手时序，放在自己的提交里便于回归定位；A3 依赖 A2 后的新握手 API 语义；A7 收尾。
@@ -56,3 +56,8 @@ A2 改握手时序，放在自己的提交里便于回归定位；A3 依赖 A2 �
   服务端 `STATUS_REFUSED`（新引入的 `RefusedTarget` 类型化错误）确定性不重试。测试：单测覆盖
   分类表；e2e 用 mini server（linger(0) 制造握手期 RST + 握手计数器）证明 RST 后重试成功且
   `STATUS_REFUSED` 不触发重试。经验：`TcpStream::set_linger` 尚 unstable，测试改用 socket2。
+- **A7**：新增 `max_handshakes`（默认 256，`null` 关闭），accept 循环里与 `max_connections` 分开
+  单独闸"握手中"数量（`HandshakingGuard` 只覆盖握手调用本身）；超帽连接 accept 即丢，探针成本从
+  "线程 + 15s"降为"一次计数"。握手失败 warn 限频：第 1 条 + 每 64 条（`should_log_failure` 纯函数，
+  单测覆盖边界），精确总数仍走 heartbeat 计数器。集成测试 `handshake_cap_drops_excess_probes`：
+  cap=1 时静默探针占位后，第二个连接被 accept 即丢（read 立即 EOF/RST 而非挂 15s）。

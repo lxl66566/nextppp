@@ -66,6 +66,7 @@ fn start_server() -> SocketAddr {
         connect_timeout: 5,
         handshake_timeout: 10,
         max_connections: None,
+        max_handshakes: None,
         obfuscation: ObfuscationConfig::default(),
     };
     let rt = ServerRuntime::from_config(&cfg).unwrap();

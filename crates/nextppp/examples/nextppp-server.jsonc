@@ -13,6 +13,11 @@
   // Handshake timeout, seconds. Raises the cost of slow-loris probing.
   "handshake_timeout": 15,
 
+  // Maximum concurrent in-progress handshakes. Probe floods are dropped
+  // at accept time beyond this cap instead of each occupying a session
+  // thread for the full handshake_timeout.
+  // "max_handshakes": 256,
+
   // Obfuscation parameters; every field except the passwords feeds the
   // handshake flag-canary, so they must match the client configuration.
   // Per-layer key overrides (seldom needed):

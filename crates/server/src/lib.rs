@@ -50,6 +50,8 @@ pub struct ServerRuntime {
     pub handshake_timeout: Duration,
     /// Maximum concurrently active sessions (`None` = unlimited).
     pub max_connections: Option<u64>,
+    /// Maximum concurrent in-progress handshakes (`None` = unlimited).
+    pub max_handshakes: Option<u64>,
     /// Target DNS cache: collapses per-session `getaddrinfo` bursts into a
     /// single lookup per TTL window.
     pub dns: Arc<nextppp_common::dns::DnsCache>,
@@ -73,6 +75,7 @@ impl ServerRuntime {
             connect_timeout: Duration::from_secs(cfg.connect_timeout),
             handshake_timeout: Duration::from_secs(cfg.handshake_timeout),
             max_connections: cfg.max_connections,
+            max_handshakes: cfg.max_handshakes,
             dns: Arc::new(nextppp_common::dns::DnsCache::new()),
         })
     }
@@ -87,6 +90,10 @@ struct ServerStats {
     sessions: AtomicU64,
     /// Handshake failures: active probing, wrong secrets, timeouts.
     handshake_failures: AtomicU64,
+    /// Connections currently inside the handshake (probe-flood gate,
+    /// separate from `active` so slow handshakes cannot squeeze out the
+    /// session budget).
+    handshaking: AtomicU64,
     /// Connections dropped at accept time because `max_connections` was
     /// reached (the per-rejection log stays at `debug` to survive floods).
     rejected_overload: AtomicU64,
@@ -103,6 +110,30 @@ impl Drop for ActiveGuard<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+/// Decrements the in-progress-handshake counter; scoped to the handshake
+/// call itself so the gate only throttles the pre-auth phase.
+struct HandshakingGuard<'a>(&'a AtomicU64);
+
+impl HandshakingGuard<'_> {
+    fn new(counter: &AtomicU64) -> HandshakingGuard<'_> {
+        counter.fetch_add(1, Ordering::Relaxed);
+        HandshakingGuard(counter)
+    }
+}
+
+impl Drop for HandshakingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Rate limit for handshake-failure warnings: probe floods would otherwise
+/// turn the log into the actual DoS. The first failure and every 64th are
+/// logged; the heartbeat counter still carries the exact total.
+fn should_log_failure(n: u64) -> bool {
+    n == 1 || n % 64 == 0
 }
 
 /// Accept loop; blocks the calling thread forever.
@@ -139,6 +170,15 @@ pub fn serve(listener: TcpListener, rt: ServerRuntime) -> anyhow::Result<()> {
                         stats.rejected_overload.fetch_add(1, Ordering::Relaxed);
                         debug!("session rejected: connection limit {max} reached");
                         continue; // dropping `stream` closes it
+                    }
+                }
+                // Probe-flood gate: capped separately so a scanner cannot
+                // occupy the session budget for `handshake_timeout` apiece.
+                if let Some(max) = rt.max_handshakes {
+                    if stats.handshaking.load(Ordering::Relaxed) >= max {
+                        stats.rejected_overload.fetch_add(1, Ordering::Relaxed);
+                        debug!("connection rejected: handshake limit {max} reached");
+                        continue;
                     }
                 }
                 let rt = rt.clone();
@@ -232,11 +272,20 @@ fn handle_conn_inner(
     let rx_io = stream.try_clone().context("clone stream")?;
 
     let mut tx = Transmission::new(stream, Arc::clone(&rt.key));
-    if let Err(e) = tx.handshake_server(sid, false) {
-        stats.handshake_failures.fetch_add(1, Ordering::Relaxed);
+    // The handshaking gauge covers exactly the pre-auth phase.
+    let handshake = {
+        let _guard = HandshakingGuard::new(&stats.handshaking);
+        tx.handshake_server(sid, false)
+    };
+    if let Err(e) = handshake {
+        let n = stats.handshake_failures.fetch_add(1, Ordering::Relaxed) + 1;
         // Probes/scanners with wrong secrets land here (checksum/base94
         // errors); healthy deployments see almost none of these.
-        warn!("session {sid:016x} ({peer}) handshake failed: {e}");
+        if should_log_failure(n) {
+            warn!("session {sid:016x} ({peer}) handshake failed: {e} (failure #{n})");
+        } else {
+            debug!("session {sid:016x} ({peer}) handshake failed: {e}");
+        }
         return Err(e).context("handshake");
     }
 
@@ -299,3 +348,20 @@ fn handle_conn_inner(
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::should_log_failure;
+
+    #[test]
+    fn handshake_failure_log_rate_limit() {
+        assert!(should_log_failure(1));
+        for n in 2..64 {
+            assert!(!should_log_failure(n), "n={n}");
+        }
+        assert!(should_log_failure(64));
+        assert!(should_log_failure(128));
+        assert!(!should_log_failure(129));
+    }
+}
+
