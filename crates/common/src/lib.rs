@@ -11,6 +11,7 @@ pub mod config;
 pub mod dns;
 pub mod fmt;
 pub mod listen;
+pub mod mux;
 pub mod proto;
 pub mod pump;
 pub mod shutdown;
