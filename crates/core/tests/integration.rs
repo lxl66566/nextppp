@@ -382,7 +382,10 @@ fn zero_rtt_request_flies_before_confirm() {
         client.handshake_client_send().unwrap();
         // The request flies before sid/nmux have been read: 1 RTT saved.
         client.write(b"0-rtt request").unwrap();
-        assert!(client.is_handshaked(), "tx is data-plane after the send phase");
+        assert!(
+            client.is_handshaked(),
+            "tx is data-plane after the send phase"
+        );
         let (sid, mux) = client.handshake_client_confirm().unwrap();
         assert_eq!(sid, TEST_SID);
         assert!(mux);

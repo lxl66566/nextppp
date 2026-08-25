@@ -145,11 +145,8 @@ mod tests {
     #[test]
     fn retryable_classification() {
         // Routine transport teardown: retry.
-        let reset: anyhow::Error = CoreError::Io(std::io::Error::new(
-            ErrorKind::ConnectionReset,
-            "reset",
-        ))
-        .into();
+        let reset: anyhow::Error =
+            CoreError::Io(std::io::Error::new(ErrorKind::ConnectionReset, "reset")).into();
         assert!(retryable(&reset));
         // Refused SYN (RST attack on connect): retry.
         let refused_syn: anyhow::Error =
@@ -163,4 +160,3 @@ mod tests {
         assert!(!retryable(&anyhow::anyhow!("mystery")));
     }
 }
-

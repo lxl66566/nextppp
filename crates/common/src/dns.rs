@@ -112,7 +112,12 @@ impl DnsCache {
         }
     }
 
-    fn insert(&self, domain: &str, result: Result<Vec<IpAddr>, (ErrorKind, String)>, ttl: Duration) {
+    fn insert(
+        &self,
+        domain: &str,
+        result: Result<Vec<IpAddr>, (ErrorKind, String)>,
+        ttl: Duration,
+    ) {
         let mut map = self.map.write().expect("dns cache poisoned");
         if map.len() >= MAX_ENTRIES && !map.contains_key(domain) {
             // Cheap eviction: drop expired entries. If everything is fresh
@@ -200,7 +205,9 @@ mod tests {
         };
         // Two resolves share one lookup. First call consumes `lookup`, so
         // go through insert + a second counting closure instead.
-        let first = cache.resolve_with("a.test", Duration::ZERO, lookup).unwrap();
+        let first = cache
+            .resolve_with("a.test", Duration::ZERO, lookup)
+            .unwrap();
         assert_eq!(first, vec![ip("10.0.0.1")]);
         let second = cache
             .resolve_with("a.test", Duration::ZERO, |_, _| {
@@ -260,11 +267,17 @@ mod tests {
         // Seed a negative entry, let it expire, then succeed on lookup.
         assert!(
             cache
-                .resolve_with("e.test", Duration::ZERO, |_, _| Err(io::Error::other("boom")))
+                .resolve_with("e.test", Duration::ZERO, |_, _| Err(io::Error::other(
+                    "boom"
+                )))
                 .is_err()
         );
         // Force expiry by re-inserting through the zero-TTL path.
-        cache.insert("e.test", Err((ErrorKind::Other, "boom".into())), Duration::ZERO);
+        cache.insert(
+            "e.test",
+            Err((ErrorKind::Other, "boom".into())),
+            Duration::ZERO,
+        );
         let ips = cache
             .resolve_with("e.test", Duration::ZERO, ok_lookup(vec![ip("10.0.0.3")]))
             .unwrap();
@@ -276,8 +289,8 @@ mod tests {
         let cache = DnsCache::new();
         let ips = cache.resolve("localhost", Duration::from_secs(5)).unwrap();
         assert!(
-            ips.iter()
-                .any(|ip| *ip == IpAddr::from([127, 0, 0, 1]) || *ip == IpAddr::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])),
+            ips.iter().any(|ip| *ip == IpAddr::from([127, 0, 0, 1])
+                || *ip == IpAddr::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])),
             "localhost must resolve to a loopback address, got {ips:?}"
         );
     }

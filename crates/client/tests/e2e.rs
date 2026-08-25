@@ -18,8 +18,8 @@ use nextppp_common::{
     addr::{Host, ProxyAddr},
     config::{ClientConfig, ObfuscationConfig, ServerConfig, ServerSection},
     dns::DnsCache,
-    pump,
     proto::{STATUS_OK, STATUS_REFUSED},
+    pump,
 };
 use nextppp_core::{ObfuscationKey, Transmission};
 use nextppp_server::ServerRuntime;

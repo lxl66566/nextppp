@@ -364,4 +364,3 @@ mod tests {
         assert!(!should_log_failure(129));
     }
 }
-

@@ -23,7 +23,10 @@ fn keepalive_is_applied() {
     #[cfg(target_os = "linux")]
     {
         assert_eq!(sock.tcp_keepalive_time().unwrap(), Duration::from_secs(60));
-        assert_eq!(sock.tcp_keepalive_interval().unwrap(), Duration::from_secs(15));
+        assert_eq!(
+            sock.tcp_keepalive_interval().unwrap(),
+            Duration::from_secs(15)
+        );
         assert_eq!(sock.tcp_keepalive_retries().unwrap(), 3);
     }
 }
