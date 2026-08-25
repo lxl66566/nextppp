@@ -625,3 +625,47 @@ fn session_id_preserved_through_into_session() {
     let (session, _io) = client.into_session();
     assert_eq!(session.session_id(), TEST_SID);
 }
+
+#[test]
+fn split_session_halves_interop() {
+    // A split session (tx/rx halves on independent tasks, the mux tunnel
+    // shape) must stay wire-compatible with an unsplit streaming peer.
+    for plaintext in [false, true] {
+        let key = ObfuscationKey {
+            plaintext,
+            ..ObfuscationKey::default()
+        };
+        let (client, mut server) = make_pair(key.clone(), key, false);
+        let (client_session, mut client_io) = client.into_session();
+        let (mut tx, mut rx) = client_session.split();
+
+        // Split tx -> streaming read.
+        let mut wire = Vec::new();
+        tx.encrypt_into_prefixed(&mut wire, &[0x02, 0x01], b"split tx")
+            .unwrap();
+        client_io.write_all(&wire).unwrap();
+        assert_eq!(server.read().unwrap(), b"\x02\x01split tx");
+
+        // Streaming write -> split rx poll.
+        server.write(b"to split rx").unwrap();
+        let mut buf = Vec::new();
+        let mut decoded = Vec::new();
+        while decoded.is_empty() {
+            let mut chunk = [0u8; 5];
+            let n = client_io.read(&mut chunk).unwrap();
+            buf.extend_from_slice(&chunk[..n]);
+            loop {
+                let msg = rx.poll_frame(&mut buf).unwrap().map(<[u8]>::to_vec);
+                match msg {
+                    Some(m) => {
+                        let used = rx.take_consumed();
+                        buf.drain(..used);
+                        decoded.push(m);
+                    },
+                    None => break,
+                }
+            }
+        }
+        assert_eq!(decoded, vec![b"to split rx".to_vec()]);
+    }
+}

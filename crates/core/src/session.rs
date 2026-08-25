@@ -98,55 +98,12 @@ impl<R: Rng> Session<R> {
     /// path, any error means the session is desynced and must be dropped.
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "Session"))]
     pub fn poll_frame<'a>(&'a mut self, buf: &'a mut Vec<u8>) -> Result<Option<&'a [u8]>> {
-        if !self.rx.handshaked || self.rx.key.plaintext {
-            // base94 envelope: the header is unencrypted, so the frame
-            // length can be peeked without touching cipher state.
-            let Some(total) = self.rx.b94.peek_frame_len(buf)? else {
-                return Ok(None);
-            };
-            if buf.len() < total {
-                return Ok(None);
-            }
-            let Self { rx, consumed, .. } = self;
-            rx.b94
-                .decode_packet_into(&mut rx.scratch_body, &buf[..total])?;
-            let msg = decrypt_tail(
-                &rx.key,
-                &mut rx.protocol_rx,
-                &mut rx.transport_rx,
-                rx.handshaked,
-                &mut rx.scratch_body,
-            )?;
-            *consumed = total;
-            Ok(Some(msg))
-        } else {
-            // Binary framing: decrypt the header once the 3 bytes are in
-            // (consuming them off the buffer), then wait for the body.
-            let (len, header_kf) = if let Some(pending) = self.pending_binary {
-                pending
-            } else {
-                if buf.len() < HEADER_SIZE {
-                    return Ok(None);
-                }
-                let header: [u8; HEADER_SIZE] =
-                    buf[..HEADER_SIZE].try_into().expect("length checked");
-                let (len, header_kf) =
-                    parse_binary_header(self.rx.key.kf, &mut self.rx.protocol_rx, header, None)?;
-                buf.drain(..HEADER_SIZE);
-                self.pending_binary = Some((len, header_kf));
-                (len, header_kf)
-            };
-            if buf.len() < len {
-                return Ok(None);
-            }
-            let flags = effective_flags(&self.rx.key, self.rx.handshaked);
-            let body = &mut buf[..len];
-            payload_deobfuscate(body, &flags, header_kf, self.rx.key.kf);
-            self.rx.transport_rx.apply(body);
-            self.pending_binary = None;
-            self.consumed = len;
-            Ok(Some(body))
-        }
+        poll_frame_impl(
+            &mut self.rx,
+            &mut self.pending_binary,
+            &mut self.consumed,
+            buf,
+        )
     }
 
     /// Bytes of the caller's buffer occupied by the last frame from
@@ -154,5 +111,132 @@ impl<R: Rng> Session<R> {
     /// front once the returned borrow ends.
     pub fn take_consumed(&mut self) -> usize {
         std::mem::take(&mut self.consumed)
+    }
+
+    /// Splits into independent sending/receiving halves that can live on
+    /// separate async tasks (mux tunnels run one reader and one writer
+    /// task per connection). The halves stay wire-compatible with an
+    /// unsplit peer: per-direction cipher state never crosses over.
+    #[must_use]
+    pub fn split(self) -> (SessionTx<R>, SessionRx) {
+        let Self {
+            tx,
+            rx,
+            session_id: _,
+            pending_binary,
+            consumed,
+        } = self;
+        debug_assert!(pending_binary.is_none() && consumed == 0);
+        (SessionTx { core: tx }, SessionRx {
+            core: rx,
+            pending_binary,
+            consumed,
+        })
+    }
+}
+
+/// Sending half of a [`Session`] (see [`Session::split`]).
+pub struct SessionTx<R = StdRng> {
+    core: TxCore<R>,
+}
+
+impl<R: Rng> SessionTx<R> {
+    /// See [`Session::encrypt_into`].
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "SessionTx"))]
+    pub fn encrypt_into(&mut self, out: &mut Vec<u8>, plaintext: &[u8]) -> Result<()> {
+        self.core.encrypt_into(out, plaintext)
+    }
+
+    /// See [`Session::encrypt_into_prefixed`].
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "SessionTx"))]
+    pub fn encrypt_into_prefixed(
+        &mut self,
+        out: &mut Vec<u8>,
+        prefix: &[u8],
+        payload: &[u8],
+    ) -> Result<()> {
+        self.core.encrypt_into_prefixed(out, prefix, payload)
+    }
+}
+
+/// Receiving half of a [`Session`] (see [`Session::split`]).
+pub struct SessionRx {
+    core: RxCore,
+    pending_binary: Option<(usize, u32)>,
+    consumed: usize,
+}
+
+impl SessionRx {
+    /// See [`Session::poll_frame`].
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "SessionRx"))]
+    pub fn poll_frame<'a>(&'a mut self, buf: &'a mut Vec<u8>) -> Result<Option<&'a [u8]>> {
+        poll_frame_impl(
+            &mut self.core,
+            &mut self.pending_binary,
+            &mut self.consumed,
+            buf,
+        )
+    }
+
+    /// See [`Session::take_consumed`].
+    pub fn take_consumed(&mut self) -> usize {
+        std::mem::take(&mut self.consumed)
+    }
+}
+
+/// Shared incremental-decode body behind [`Session::poll_frame`] and
+/// [`SessionRx::poll_frame`].
+fn poll_frame_impl<'a>(
+    rx: &'a mut RxCore,
+    pending_binary: &'a mut Option<(usize, u32)>,
+    consumed: &'a mut usize,
+    buf: &'a mut Vec<u8>,
+) -> Result<Option<&'a [u8]>> {
+    if !rx.handshaked || rx.key.plaintext {
+        // base94 envelope: the header is unencrypted, so the frame
+        // length can be peeked without touching cipher state.
+        let Some(total) = rx.b94.peek_frame_len(buf)? else {
+            return Ok(None);
+        };
+        if buf.len() < total {
+            return Ok(None);
+        }
+        rx.b94
+            .decode_packet_into(&mut rx.scratch_body, &buf[..total])?;
+        let msg = decrypt_tail(
+            &rx.key,
+            &mut rx.protocol_rx,
+            &mut rx.transport_rx,
+            rx.handshaked,
+            &mut rx.scratch_body,
+        )?;
+        *consumed = total;
+        Ok(Some(msg))
+    } else {
+        // Binary framing: decrypt the header once the 3 bytes are in
+        // (consuming them off the buffer), then wait for the body.
+        let (len, header_kf) = if let Some(pending) = *pending_binary {
+            pending
+        } else {
+            if buf.len() < HEADER_SIZE {
+                return Ok(None);
+            }
+            let header: [u8; HEADER_SIZE] = buf[..HEADER_SIZE].try_into().expect("length checked");
+            let (len, header_kf) =
+                parse_binary_header(rx.key.kf, &mut rx.protocol_rx, header, None)?;
+            buf.drain(..HEADER_SIZE);
+            *pending_binary = Some((len, header_kf));
+            (len, header_kf)
+        };
+        if buf.len() < len {
+            return Ok(None);
+        }
+        let flags = effective_flags(&rx.key, rx.handshaked);
+        let body = &mut buf[..len];
+        payload_deobfuscate(body, &flags, header_kf, rx.key.kf);
+        rx.transport_rx.apply(body);
+        *pending_binary = None;
+        *consumed = len;
+        Ok(Some(body))
     }
 }
