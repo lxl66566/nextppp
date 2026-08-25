@@ -15,6 +15,17 @@
     // (RST/timeout). Raises the success rate on RST-bombed links
     // (1-(1-p)^n), at the cost of a more visible connect cadence.
     // "connect_retries": 1,
+    // Mux tunnel pool: many SOCKS CONNECTs share a few long-lived
+    // tunnels, cutting per-connect cost to ~0 RTT and keeping the
+    // thread/fd footprint flat under connection bursts. Streams on one
+    // tunnel share its TCP loss fate (head-of-line); pool_size spreads
+    // the risk. Set "enabled": false (or pool_size 0) for one dedicated
+    // tunnel per CONNECT (the pre-mux behavior).
+    // "mux": {
+    //     "enabled": true,
+    //     "pool_size": 4,
+    //     "max_streams": 64,
+    // },
     // Must mirror the server configuration (password included).
     // "obfuscation": { ... },
   },

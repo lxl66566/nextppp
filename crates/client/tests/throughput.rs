@@ -31,7 +31,9 @@ use std::{
 };
 
 use nextppp_client::ClientRuntime;
-use nextppp_common::config::{ClientConfig, ObfuscationConfig, ServerConfig, ServerSection};
+use nextppp_common::config::{
+    ClientConfig, MuxSection, ObfuscationConfig, ServerConfig, ServerSection,
+};
 use nextppp_server::ServerRuntime;
 
 /// Echo buffer: large enough that the loopback echo is never the bottleneck
@@ -117,6 +119,7 @@ fn start_server(cpu: usize) -> SocketAddr {
         handshake_timeout: 10,
         max_connections: None,
         max_handshakes: None,
+        max_streams_per_conn: None,
         obfuscation: ObfuscationConfig::default(),
     };
     let rt = ServerRuntime::from_config(&cfg).unwrap();
@@ -142,6 +145,13 @@ fn start_client(cpu: usize, server: SocketAddr) -> SocketAddr {
             address: server.to_string(),
             connect_timeout: 5,
             connect_retries: 0,
+            // One stream in flight; a single tunnel keeps the measurement
+            // focused on the crypto/data-plane path.
+            mux: MuxSection {
+                enabled: true,
+                pool_size: 1,
+                max_streams: 64,
+            },
             obfuscation: ObfuscationConfig::default(),
         },
     };

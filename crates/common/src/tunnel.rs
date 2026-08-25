@@ -12,15 +12,24 @@
 use std::io;
 
 use nextppp_core::{BASE94_MAX_FRAME, Error, SessionRx, SessionTx};
+use spdlog::prelude::*;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::TcpStream,
     sync::mpsc,
 };
 
-use crate::mux::{FrameHeader, FrameKind, StreamId};
+use crate::{
+    fmt::{fmt_bytes, fmt_duration},
+    mux::{FrameHeader, FrameKind, StreamId},
+    pump::routine_cause,
+};
 
 /// Read chunk for tunnel sockets.
 const READ_CHUNK: usize = 16 * 1024;
+
+/// Read chunk for local (app/target) sockets in stream pumps.
+const STREAM_CHUNK: usize = 16 * 1024;
 
 /// Upper bound on the reassembly buffer. A frame's wire form can never
 /// exceed `BASE94_MAX_FRAME` (+ the small headers); more buffered bytes
@@ -178,11 +187,157 @@ pub async fn tcp_connect(
     port: u16,
     timeout: std::time::Duration,
     dns: std::sync::Arc<crate::dns::DnsCache>,
-) -> io::Result<tokio::net::TcpStream> {
+) -> io::Result<TcpStream> {
     let stream =
         tokio::task::spawn_blocking(move || crate::pump::tcp_connect(&host, port, timeout, &dns))
             .await
             .map_err(io::Error::other)??;
     stream.set_nonblocking(true)?;
-    tokio::net::TcpStream::from_std(stream)
+    TcpStream::from_std(stream)
+}
+
+// ---------------------------------------------------------------------------
+// Per-stream pump
+// ---------------------------------------------------------------------------
+
+/// How one proxied stream terminated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamEnd {
+    /// Both directions half-closed cleanly (EOF exchanged both ways).
+    Graceful,
+    /// Routine teardown (reset, broken pipe, tunnel loss); the static
+    /// cause feeds the close log.
+    Closed(&'static str),
+    /// Unexpected I/O failure worth a warning.
+    Fault(String),
+}
+
+impl StreamEnd {
+    /// Short cause string for logs.
+    #[must_use]
+    pub fn cause(&self) -> &str {
+        match self {
+            Self::Graceful => "eof",
+            Self::Closed(why) => why,
+            Self::Fault(e) => e.as_str(),
+        }
+    }
+
+    /// Whether this end needs a warning rather than an info line.
+    #[must_use]
+    pub fn is_fault(&self) -> bool {
+        matches!(self, Self::Fault(_))
+    }
+
+    /// Clean both-directions half-close: no CLOSE frame is sent on drop.
+    #[must_use]
+    pub fn is_graceful(&self) -> bool {
+        matches!(self, Self::Graceful)
+    }
+}
+
+/// Outcome of pumping one stream end to end.
+#[derive(Debug)]
+pub struct PumpOutcome {
+    /// Bytes pumped local -> tunnel.
+    pub up: u64,
+    /// Bytes pumped tunnel -> local.
+    pub down: u64,
+    /// How the stream ended.
+    pub end: StreamEnd,
+}
+
+fn classify_io_end(err: &io::Error) -> StreamEnd {
+    match routine_cause(err.kind()) {
+        Some(cause) => StreamEnd::Closed(cause),
+        None => StreamEnd::Fault(err.to_string()),
+    }
+}
+
+/// Pumps one local socket against a mux stream until either side closes.
+/// One task per stream: a `select!` over the local read half and the
+/// stream's event channel, so no cross-task wake-ups are ever needed — a
+/// dead tunnel closes the channel and the loop breaks, dropping the local
+/// socket.
+///
+/// Half-close contract: a local EOF sends `EOF` and stops reading; an
+/// `EOF` event shuts the local write side down. When both happened the
+/// stream is [`StreamEnd::Graceful`] and the caller must not send `CLOSE`.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub async fn pump_stream(
+    local: TcpStream,
+    stream: StreamId,
+    events: &mut mpsc::Receiver<StreamEvent>,
+    out: &mpsc::Sender<OutFrame>,
+) -> PumpOutcome {
+    let (mut rd, mut wr) = local.into_split();
+    let mut buf = vec![0u8; STREAM_CHUNK];
+    let (mut up, mut down) = (0u64, 0u64);
+    let mut reading = true;
+    let mut writing = true;
+    let end = loop {
+        if !reading && !writing {
+            break StreamEnd::Graceful;
+        }
+        tokio::select! {
+            n = rd.read(&mut buf), if reading => match n {
+                Ok(0) => {
+                    reading = false;
+                    if out.send(OutFrame::bare(FrameKind::Eof, stream)).await.is_err() {
+                        break StreamEnd::Closed("tunnel closed");
+                    }
+                },
+                Ok(n) => {
+                    if out
+                        .send(OutFrame::new(FrameKind::Data, stream, buf[..n].to_vec()))
+                        .await
+                        .is_err()
+                    {
+                        break StreamEnd::Closed("tunnel closed");
+                    }
+                    up += n as u64;
+                },
+                Err(e) => {
+                    let _ = out.try_send(OutFrame::bare(FrameKind::Close, stream));
+                    break classify_io_end(&e);
+                },
+            },
+            ev = events.recv() => match ev {
+                // The demux dropped the sender: tunnel death or an
+                // abortive close it already logged.
+                None => break StreamEnd::Closed("tunnel closed"),
+                Some(StreamEvent::Data(data)) => {
+                    if let Err(e) = wr.write_all(&data).await {
+                        let _ = out.try_send(OutFrame::bare(FrameKind::Close, stream));
+                        break classify_io_end(&e);
+                    }
+                    down += data.len() as u64;
+                },
+                Some(StreamEvent::Eof) => {
+                    writing = false;
+                    let _ = wr.shutdown().await;
+                },
+                Some(StreamEvent::Close) => break StreamEnd::Closed("peer reset"),
+            },
+        }
+    };
+    PumpOutcome { up, down, end }
+}
+
+/// Logs a pumped stream's teardown at `info`, escalating to `warn` on a
+/// fault. `subject` identifies the owning connection (e.g.
+/// `[1.2.3.4:5] stream 7` client-side, `session 0123.. stream 7` server-side).
+pub fn log_stream_close(subject: &str, target: &str, o: &PumpOutcome, started: std::time::Instant) {
+    let summary = format!(
+        "up {} down {} in {} ({})",
+        fmt_bytes(o.up),
+        fmt_bytes(o.down),
+        fmt_duration(started.elapsed()),
+        o.end.cause(),
+    );
+    if let StreamEnd::Fault(fault) = &o.end {
+        warn!("{subject} {target} aborted: {summary}, fault: {fault}");
+    } else {
+        info!("{subject} {target} closed: {summary}");
+    }
 }

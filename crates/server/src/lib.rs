@@ -1,24 +1,29 @@
-//! nextppp proxy server: accepts nextppp-tunneled connections, connects
-//! to the requested target and pumps bytes both ways.
+//! nextppp proxy server: accepts nextppp-tunneled connections, demultiplexes
+//! their streams, connects to the requested targets and pumps bytes both
+//! ways.
 //!
-//! Connection model: one handshake thread per accepted stream, then the
-//! classic two-thread pump ([`nextppp_common::pump`]). Session ids are
-//! `random_base + counter`, never zero.
+//! Connection model: event-driven on a fixed tokio worker pool. Per
+//! accepted tunnel: one handshake (on the blocking pool, bounded by
+//! `handshake_timeout`), then one writer task + one demux loop; per mux
+//! stream: one pump task ([`nextppp_common::tunnel::pump_stream`]). No
+//! thread-per-connection anywhere, so capacity tracks the async runtime,
+//! not the OS thread limit. Session ids are `random_base + counter`,
+//! never zero.
 //!
 //! Logging contract:
-//! - `info`: connection lifecycle (tunnel established, target connected, connection closed with
-//!   byte counts) and the periodic heartbeat.
+//! - `info`: tunnel/stream lifecycle (established, closed with byte counts) and the periodic
+//!   heartbeat.
 //! - `warn`: handshake failures (probing / wrong secrets) and protocol faults detected on the data
 //!   plane.
 //! - `debug`: accepted sockets and other high-volume detail.
 
 use std::{
-    net::{TcpListener, TcpStream},
+    collections::HashMap,
+    net::TcpStream,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    thread,
     time::{Duration, Instant},
 };
 
@@ -27,17 +32,28 @@ use nextppp_common::{
     addr::ProxyAddr,
     config::{ObfuscationConfig, ServerConfig},
     fmt::{fmt_bytes, fmt_duration},
-    proto, pump, shutdown,
+    mux::{FrameKind, REPLY_OK, REPLY_REFUSED, StreamId, parse_frame},
+    pump, shutdown,
+    tunnel::{self, FrameReader, OutFrame, StreamEvent},
 };
-use nextppp_core::{ObfuscationKey, Transmission};
+use nextppp_core::{ObfuscationKey, Session, Transmission};
 use rand::Rng;
 use spdlog::prelude::*;
+use tokio::sync::mpsc;
 
 /// Heartbeat interval for the health/stats log line.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Stack size for per-session handler threads (see `serve`).
-const SESSION_STACK: usize = 256 * 1024;
+/// Per-tunnel outbound channel bound (frames); a full channel backpressures
+/// every stream's local reader on this tunnel.
+const OUTBOUND_BOUND: usize = 256;
+
+/// Per-stream event channel bound (frames).
+const STREAM_BOUND: usize = 32;
+
+/// How often the accept loop polls the shutdown flag (the signal handler's
+/// wake-up connect makes this a fallback, not the trigger).
+const SHUTDOWN_POLL: Duration = Duration::from_millis(200);
 
 /// Immutable runtime parameters derived from the configuration.
 #[derive(Clone)]
@@ -48,11 +64,13 @@ pub struct ServerRuntime {
     pub connect_timeout: Duration,
     /// Handshake timeout (anti slow-loris).
     pub handshake_timeout: Duration,
-    /// Maximum concurrently active sessions (`None` = unlimited).
+    /// Maximum concurrently active tunnels (`None` = unlimited).
     pub max_connections: Option<u64>,
     /// Maximum concurrent in-progress handshakes (`None` = unlimited).
     pub max_handshakes: Option<u64>,
-    /// Target DNS cache: collapses per-session `getaddrinfo` bursts into a
+    /// Maximum mux streams per tunnel (`None` = unlimited).
+    pub max_streams_per_conn: Option<u64>,
+    /// Target DNS cache: collapses per-stream `getaddrinfo` bursts into a
     /// single lookup per TTL window.
     pub dns: Arc<nextppp_common::dns::DnsCache>,
 }
@@ -76,6 +94,7 @@ impl ServerRuntime {
             handshake_timeout: Duration::from_secs(cfg.handshake_timeout),
             max_connections: cfg.max_connections,
             max_handshakes: cfg.max_handshakes,
+            max_streams_per_conn: cfg.max_streams_per_conn,
             dns: Arc::new(nextppp_common::dns::DnsCache::new()),
         })
     }
@@ -84,15 +103,15 @@ impl ServerRuntime {
 /// Lifetime counters backing the heartbeat log and ops monitoring.
 #[derive(Default)]
 struct ServerStats {
-    /// Currently open sessions.
+    /// Currently open tunnels.
     active: AtomicU64,
-    /// Total accepted connections (post-handshake successes).
+    /// Total streams served (post-OPEN successes).
     sessions: AtomicU64,
     /// Handshake failures: active probing, wrong secrets, timeouts.
     handshake_failures: AtomicU64,
     /// Connections currently inside the handshake (probe-flood gate,
     /// separate from `active` so slow handshakes cannot squeeze out the
-    /// session budget).
+    /// tunnel budget).
     handshaking: AtomicU64,
     /// Connections dropped at accept time because `max_connections` was
     /// reached (the per-rejection log stays at `debug` to survive floods).
@@ -103,12 +122,12 @@ struct ServerStats {
     bytes_to_clients: AtomicU64,
 }
 
-/// Decrements the active-session counter when a session ends, however it ends.
-struct ActiveGuard<'a>(&'a AtomicU64);
+/// Decrements the active-tunnel counter when a tunnel ends, however it ends.
+struct ActiveGuard(Arc<ServerStats>);
 
-impl Drop for ActiveGuard<'_> {
+impl Drop for ActiveGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -136,6 +155,11 @@ fn should_log_failure(n: u64) -> bool {
     n == 1 || n % 64 == 0
 }
 
+/// Per-tunnel stream registry: the demux loop routes events to stream
+/// pumps through these senders. Dropping the map (tunnel teardown) closes
+/// every channel, which breaks every pump out of its `select!`.
+type Registry = Arc<Mutex<HashMap<StreamId, mpsc::Sender<StreamEvent>>>>;
+
 /// Accept loop; blocks the calling thread forever.
 ///
 /// # Errors
@@ -143,210 +167,411 @@ fn should_log_failure(n: u64) -> bool {
 /// Fatal listener failure.
 // `serve` owns the listener: it lives exactly as long as the accept loop.
 #[allow(clippy::needless_pass_by_value)]
-pub fn serve(listener: TcpListener, rt: ServerRuntime) -> anyhow::Result<()> {
+pub fn serve(listener: std::net::TcpListener, rt: ServerRuntime) -> anyhow::Result<()> {
     info!(
         "nextppp server listening on {}",
         listener.local_addr()?.to_string()
     );
     let stats: Arc<ServerStats> = Arc::new(ServerStats::default());
-    spawn_heartbeat(Arc::clone(&stats));
-    shutdown::install(listener.local_addr()?);
+    listener.set_nonblocking(true)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("nextppp-worker")
+        .build()
+        .context("build tokio runtime")?;
+    runtime.block_on(async move {
+        let listener =
+            tokio::net::TcpListener::from_std(listener).context("convert listener to tokio")?;
+        shutdown::install(listener.local_addr()?);
+        spawn_heartbeat(Arc::clone(&stats));
+        accept_loop(&listener, &rt, &stats).await;
+        // Drain with the runtime alive (the sleep loop must not block a
+        // worker, hence spawn_blocking).
+        let drained = {
+            let stats = Arc::clone(&stats);
+            tokio::task::spawn_blocking(move || {
+                shutdown::drain_sessions(move || stats.active.load(Ordering::Relaxed));
+            })
+            .await
+        };
+        if let Err(e) = drained {
+            warn!("drain task failed: {e}");
+        }
+        Ok(())
+    })
+}
 
+/// The accept loop proper; returns when shutdown is requested.
+async fn accept_loop(
+    listener: &tokio::net::TcpListener,
+    rt: &ServerRuntime,
+    stats: &Arc<ServerStats>,
+) {
     let base = u128::from(rand::rng().next_u64()); // session ids only need uniqueness
     let counter = AtomicU64::new(0);
-    'accept: for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                // Wake-up connect from the signal handler: shut down, not
-                // a real session.
-                if shutdown::requested() {
-                    break 'accept;
-                }
-                // Best-effort session gate: the load/increment below is not
-                // atomic, so a burst can overshoot by a few; good enough
-                // against slowloris-style thread/fd exhaustion.
-                if let Some(max) = rt.max_connections {
-                    if stats.active.load(Ordering::Relaxed) >= max {
-                        stats.rejected_overload.fetch_add(1, Ordering::Relaxed);
-                        debug!("session rejected: connection limit {max} reached");
-                        continue; // dropping `stream` closes it
+    loop {
+        if shutdown::requested() {
+            break;
+        }
+        tokio::select! {
+            r = listener.accept() => match r {
+                Ok((stream, _)) => {
+                    // Best-effort tunnel gate: the load/increment below is
+                    // not atomic, so a burst can overshoot by a few; good
+                    // enough against slowloris-style exhaustion.
+                    if let Some(max) = rt.max_connections {
+                        if stats.active.load(Ordering::Relaxed) >= max {
+                            stats.rejected_overload.fetch_add(1, Ordering::Relaxed);
+                            debug!("tunnel rejected: connection limit {max} reached");
+                            continue; // dropping `stream` closes it
+                        }
                     }
-                }
-                // Probe-flood gate: capped separately so a scanner cannot
-                // occupy the session budget for `handshake_timeout` apiece.
-                if let Some(max) = rt.max_handshakes {
-                    if stats.handshaking.load(Ordering::Relaxed) >= max {
-                        stats.rejected_overload.fetch_add(1, Ordering::Relaxed);
-                        debug!("connection rejected: handshake limit {max} reached");
-                        continue;
+                    // Probe-flood gate: capped separately so a scanner
+                    // cannot occupy the tunnel budget for
+                    // `handshake_timeout` apiece.
+                    if let Some(max) = rt.max_handshakes {
+                        if stats.handshaking.load(Ordering::Relaxed) >= max {
+                            stats.rejected_overload.fetch_add(1, Ordering::Relaxed);
+                            debug!("connection rejected: handshake limit {max} reached");
+                            continue;
+                        }
                     }
-                }
-                let rt = rt.clone();
-                let stats = Arc::clone(&stats);
-                let mut sid =
-                    base.wrapping_add(u128::from(counter.fetch_add(1, Ordering::Relaxed)));
-                if sid == 0 {
-                    sid = 1;
-                }
-                let spawned = thread::Builder::new()
-                    .name(format!("nextppp-{sid:016x}"))
-                    // Session threads have shallow call chains (handshake,
-                    // crypto, pump loop; every large buffer is heap-owned);
-                    // 256KiB beats the 2MiB default at 10k+ sessions.
-                    .stack_size(SESSION_STACK)
-                    .spawn(move || handle_conn(stream, &rt, sid, &stats));
-                if let Err(e) = spawned {
-                    error!("session {sid:016x} spawn failed: {e}");
-                }
+                    let mut sid =
+                        base.wrapping_add(u128::from(counter.fetch_add(1, Ordering::Relaxed)));
+                    if sid == 0 {
+                        sid = 1;
+                    }
+                    tokio::spawn(handle_conn(stream, rt.clone(), sid, Arc::clone(stats)));
+                },
+                Err(e) => {
+                    if shutdown::requested() {
+                        break;
+                    }
+                    warn!("accept failed: {e}");
+                    if pump::accept_exhausted(&e) {
+                        pump::log_accept_exhausted(&e);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                },
             },
-            Err(e) => {
-                if shutdown::requested() {
-                    break 'accept;
-                }
-                warn!("accept failed: {e}");
-                pump::accept_backoff(&e);
-            },
+            () = tokio::time::sleep(SHUTDOWN_POLL) => {},
         }
     }
     info!("shutdown signal received; draining sessions");
-    shutdown::drain_sessions(|| stats.active.load(Ordering::Relaxed));
-    Ok(())
 }
 
 /// Periodically logs server health: uptime, session counters and traffic.
 fn spawn_heartbeat(stats: Arc<ServerStats>) {
     let started = Instant::now();
-    let spawned = thread::Builder::new()
-        .name("nextppp-heartbeat".to_owned())
-        .spawn(move || {
-            loop {
-                thread::sleep(HEARTBEAT_INTERVAL);
-                info!(
-                    "heartbeat: uptime {} active {} sessions {} failed_handshakes {} overloaded \
-                     {} to-targets {} to-clients {}",
-                    fmt_duration(started.elapsed()),
-                    stats.active.load(Ordering::Relaxed),
-                    stats.sessions.load(Ordering::Relaxed),
-                    stats.handshake_failures.load(Ordering::Relaxed),
-                    stats.rejected_overload.load(Ordering::Relaxed),
-                    fmt_bytes(stats.bytes_to_targets.load(Ordering::Relaxed)),
-                    fmt_bytes(stats.bytes_to_clients.load(Ordering::Relaxed)),
-                );
-            }
-        });
-    if let Err(e) = spawned {
-        warn!("heartbeat thread spawn failed: {e}");
-    }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+            info!(
+                "heartbeat: uptime {} active {} sessions {} failed_handshakes {} overloaded {} \
+                 to-targets {} to-clients {}",
+                fmt_duration(started.elapsed()),
+                stats.active.load(Ordering::Relaxed),
+                stats.sessions.load(Ordering::Relaxed),
+                stats.handshake_failures.load(Ordering::Relaxed),
+                stats.rejected_overload.load(Ordering::Relaxed),
+                fmt_bytes(stats.bytes_to_targets.load(Ordering::Relaxed)),
+                fmt_bytes(stats.bytes_to_clients.load(Ordering::Relaxed)),
+            );
+        }
+    });
 }
 
 /// Handles one tunneled connection end to end, logging its full lifecycle.
-fn handle_conn(stream: TcpStream, rt: &ServerRuntime, sid: u128, stats: &ServerStats) {
+async fn handle_conn(
+    stream: tokio::net::TcpStream,
+    rt: ServerRuntime,
+    sid: u128,
+    stats: Arc<ServerStats>,
+) {
     stats.active.fetch_add(1, Ordering::Relaxed);
-    let _guard = ActiveGuard(&stats.active);
+    let _guard = ActiveGuard(Arc::clone(&stats));
 
     let peer = stream
         .peer_addr()
         .map_or_else(|_| String::from("?"), |a| a.to_string());
     debug!("session {sid:016x} accepted from {peer}");
 
-    if let Err(e) = handle_conn_inner(stream, rt, sid, &peer, stats) {
+    if let Err(e) = Box::pin(handle_conn_inner(stream, &rt, sid, &peer, &stats)).await {
         debug!("session {sid:016x} ({peer}) ended: {e:#}");
     }
 }
 
-/// Connection body; every failure point logs at its proper level already.
+/// Handshake (blocking pool) + mux tunnel body.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn handle_conn_inner(
-    stream: TcpStream,
+async fn handle_conn_inner(
+    stream: tokio::net::TcpStream,
     rt: &ServerRuntime,
     sid: u128,
     peer: &str,
-    stats: &ServerStats,
+    stats: &Arc<ServerStats>,
 ) -> anyhow::Result<()> {
+    let std_stream = stream.into_std().context("tunnel stream into_std")?;
+    // The handshake runs the synchronous Transmission API with timeouts on
+    // the blocking pool; the event-driven data plane takes over afterwards.
+    std_stream
+        .set_nonblocking(false)
+        .context("blocking mode for handshake")?;
+    let rt2 = rt.clone();
+    let handshaking = Arc::clone(stats);
+    let hs = tokio::task::spawn_blocking(move || {
+        handshake_sync(std_stream, &rt2, sid, &handshaking.handshaking)
+    })
+    .await
+    .context("handshake task join")?;
+    let (session, io) = match hs {
+        Ok(v) => v,
+        Err(e) => {
+            let n = stats.handshake_failures.fetch_add(1, Ordering::Relaxed) + 1;
+            // Probes/scanners with wrong secrets land here (checksum/base94
+            // errors); healthy deployments see almost none of these.
+            if should_log_failure(n) {
+                warn!("session {sid:016x} ({peer}) handshake failed: {e:#} (failure #{n})");
+            } else {
+                debug!("session {sid:016x} ({peer}) handshake failed: {e:#}");
+            }
+            return Err(e).context("handshake");
+        },
+    };
+    info!("session {sid:016x} ({peer}) tunnel established");
+    io.set_nonblocking(true).context("nonblocking mode")?;
+    let stream = tokio::net::TcpStream::from_std(io).context("tunnel stream from_std")?;
+    run_tunnel(session, stream, rt, sid, peer, stats).await;
+    Ok(())
+}
+
+/// Synchronous server handshake (mux advertised) on the blocking pool.
+fn handshake_sync(
+    stream: TcpStream,
+    rt: &ServerRuntime,
+    sid: u128,
+    handshaking: &AtomicU64,
+) -> anyhow::Result<(Session, TcpStream)> {
     pump::nodelay(&stream);
     // The tunnel stream is long-lived and the data plane clears all
     // timeouts; keepalive is the only dead-peer detection it has.
     pump::keepalive(&stream);
     stream.set_read_timeout(Some(rt.handshake_timeout))?;
     stream.set_write_timeout(Some(rt.handshake_timeout))?;
-    let rx_io = stream.try_clone().context("clone stream")?;
-
     let mut tx = Transmission::new(stream, Arc::clone(&rt.key));
     // The handshaking gauge covers exactly the pre-auth phase.
-    let handshake = {
-        let _guard = HandshakingGuard::new(&stats.handshaking);
-        tx.handshake_server(sid, false)
-    };
-    if let Err(e) = handshake {
-        let n = stats.handshake_failures.fetch_add(1, Ordering::Relaxed) + 1;
-        // Probes/scanners with wrong secrets land here (checksum/base94
-        // errors); healthy deployments see almost none of these.
-        if should_log_failure(n) {
-            warn!("session {sid:016x} ({peer}) handshake failed: {e} (failure #{n})");
-        } else {
-            debug!("session {sid:016x} ({peer}) handshake failed: {e}");
-        }
-        return Err(e).context("handshake");
+    {
+        let _guard = HandshakingGuard::new(handshaking);
+        tx.handshake_server(sid, true)?;
     }
+    // Data plane: no timeouts (kernel keepalive covers dead peers).
+    tx.io_mut().set_read_timeout(None)?;
+    tx.io_mut().set_write_timeout(None)?;
+    Ok(tx.into_session())
+}
 
-    let started = Instant::now();
-    let req = match tx.read().context("read request") {
-        Ok(req) => req,
-        Err(e) => {
-            if pump::is_clean_close(&e) {
-                debug!("session {sid:016x} ({peer}) closed before request");
-            } else {
-                warn!("session {sid:016x} ({peer}) read request failed: {e:#}");
+/// Mux tunnel body: one writer task + this demux loop. Per-stream events
+/// are routed through the registry; unknown streams get bounced a CLOSE so
+/// neither side leaks registry entries after a race.
+async fn run_tunnel(
+    session: Session,
+    stream: tokio::net::TcpStream,
+    rt: &ServerRuntime,
+    sid: u128,
+    peer: &str,
+    stats: &Arc<ServerStats>,
+) {
+    let (stx, srx) = session.split();
+    let (rh, wh) = stream.into_split();
+    let (out_tx, out_rx) = mpsc::channel::<OutFrame>(OUTBOUND_BOUND);
+    let mut writer = tokio::spawn(tunnel::run_writer(stx, wh, out_rx));
+    let mut reader = FrameReader::new(srx, rh);
+    let registry = Registry::default();
+    let subject = format!("session {sid:016x} ({peer})");
+    loop {
+        tokio::select! {
+            frame = reader.next() => match frame {
+                Ok(Some(msg)) => match parse_frame(&msg) {
+                    Ok((FrameKind::Open, stream, payload)) => handle_open(
+                        &registry,
+                        rt,
+                        stream,
+                        payload,
+                        &out_tx,
+                        stats,
+                        &subject,
+                    ),
+                    Ok((FrameKind::Data, stream, payload)) => {
+                        route(&registry, stream, StreamEvent::Data(payload.to_vec()), &out_tx)
+                            .await;
+                    },
+                    Ok((FrameKind::Eof, stream, _)) => {
+                        route(&registry, stream, StreamEvent::Eof, &out_tx).await;
+                    },
+                    Ok((FrameKind::Close, stream, _)) => {
+                        registry.lock().unwrap().remove(&stream);
+                    },
+                    Ok((FrameKind::Reply, ..)) => {
+                        warn!("{subject} unexpected REPLY frame (client role violation)");
+                        break;
+                    },
+                    Err(e) => {
+                        warn!("{subject} bad mux frame: {e}");
+                        break;
+                    },
+                },
+                Ok(None) => {
+                    debug!("{subject} tunnel closed (eof)");
+                    break;
+                },
+                Err(e) => {
+                    if pump::is_routine_core(&e) {
+                        debug!("{subject} tunnel read ended: {e}");
+                    } else {
+                        warn!("{subject} tunnel read failed: {e}");
+                    }
+                    break;
+                },
+            },
+            _ = &mut writer => {
+                debug!("{subject} tunnel writer ended");
+                break;
+            },
+        }
+    }
+    writer.abort();
+    // Dropping the registry closes every stream's event channel; the
+    // stream tasks break out of pump_stream and drop their targets.
+}
+
+/// Routes one event to a stream pump, bouncing CLOSE on unknown/dead
+/// streams so the peer's registry cannot leak after a close race.
+async fn route(
+    registry: &Registry,
+    stream: StreamId,
+    ev: StreamEvent,
+    out: &mpsc::Sender<OutFrame>,
+) {
+    let tx = registry.lock().unwrap().get(&stream).cloned();
+    match tx {
+        Some(tx) => {
+            if tx.send(ev).await.is_err() {
+                registry.lock().unwrap().remove(&stream);
+                let _ = out.try_send(OutFrame::bare(FrameKind::Close, stream));
             }
-            return Err(e);
         },
-    };
-    let addr = match ProxyAddr::decode(&req).context("decode request") {
+        None => {
+            let _ = out.try_send(OutFrame::bare(FrameKind::Close, stream));
+        },
+    }
+}
+
+/// Handles one OPEN frame: validates, registers and spawns the stream.
+fn handle_open(
+    registry: &Registry,
+    rt: &ServerRuntime,
+    stream: StreamId,
+    payload: &[u8],
+    out: &mpsc::Sender<OutFrame>,
+    stats: &Arc<ServerStats>,
+    subject: &str,
+) {
+    {
+        let reg = registry.lock().unwrap();
+        if reg.contains_key(&stream) {
+            debug!("{subject} duplicate stream id {stream}");
+            let _ = out.try_send(OutFrame::bare(FrameKind::Close, stream));
+            return;
+        }
+        if let Some(cap) = rt.max_streams_per_conn {
+            if reg.len() as u64 >= cap {
+                debug!("{subject} stream {stream} rejected: per-tunnel stream limit {cap}");
+                let _ = out.try_send(OutFrame::bare(FrameKind::Close, stream));
+                return;
+            }
+        }
+    }
+    let addr = match ProxyAddr::decode(payload) {
         Ok(addr) => addr,
         Err(e) => {
-            warn!("session {sid:016x} ({peer}) bad request frame: {e:#}");
-            return Err(e);
+            warn!("{subject} bad OPEN frame: {e}");
+            let _ = out.try_send(OutFrame::bare(FrameKind::Close, stream));
+            return;
         },
     };
+    let (ev_tx, ev_rx) = mpsc::channel(STREAM_BOUND);
+    registry.lock().unwrap().insert(stream, ev_tx);
+    tokio::spawn(handle_stream(
+        addr,
+        stream,
+        ev_rx,
+        out.clone(),
+        rt.clone(),
+        Arc::clone(registry),
+        Arc::clone(stats),
+        subject.to_owned(),
+    ));
+}
+
+/// One proxied stream: connect the target, REPLY, then pump.
+async fn handle_stream(
+    addr: ProxyAddr,
+    stream: StreamId,
+    mut events: mpsc::Receiver<StreamEvent>,
+    out: mpsc::Sender<OutFrame>,
+    rt: ServerRuntime,
+    registry: Registry,
+    stats: Arc<ServerStats>,
+    subject: String,
+) {
     let target = format!("{}:{}", addr.host.to_display(), addr.port);
-    stats.sessions.fetch_add(1, Ordering::Relaxed);
-    info!("session {sid:016x} ({peer}) -> {target}");
-
-    let outgoing = pump::tcp_connect(&addr.host, addr.port, rt.connect_timeout, &rt.dns);
-    match outgoing {
-        Ok(target_stream) => {
-            pump::nodelay(&target_stream);
-            if let Err(e) = tx.write(&[proto::STATUS_OK]).context("reply ok") {
-                warn!("session {sid:016x} ({peer}) reply failed: {e:#}");
-                return Err(e);
-            }
-            // Handshake done: the data plane must not time out.
-            tx.io_mut().set_read_timeout(None)?;
-            rx_io.set_read_timeout(None)?;
-            tx.io_mut().set_write_timeout(None)?;
-
-            let (txh, rxh) = tx.split_with(rx_io);
-            let s = pump::pump_tunnel(txh, rxh, target_stream);
-            // `local` is the target stream here, so `s.up` is target->client
-            // (downlink) and `s.down` is client->target (uplink).
-            stats.bytes_to_clients.fetch_add(s.up, Ordering::Relaxed);
-            stats.bytes_to_targets.fetch_add(s.down, Ordering::Relaxed);
-            pump::log_close(
-                &format!("session {sid:016x} ({peer})"),
-                &target,
-                &s,
-                started,
-            );
-            Ok(())
-        },
+    let started = Instant::now();
+    let sock = match tunnel::tcp_connect(
+        addr.host.clone(),
+        addr.port,
+        rt.connect_timeout,
+        Arc::clone(&rt.dns),
+    )
+    .await
+    {
+        Ok(sock) => sock,
         Err(e) => {
             // Refused targets are client-side routing issues, not server
             // faults: info, not warn.
-            info!("session {sid:016x} ({peer}) connect {target} failed: {e}");
-            let _ = tx.write(&[proto::STATUS_REFUSED]);
-            Ok(())
+            info!("{subject} stream {stream} connect {target} failed: {e}");
+            let _ = out
+                .send(OutFrame::new(FrameKind::Reply, stream, vec![REPLY_REFUSED]))
+                .await;
+            registry.lock().unwrap().remove(&stream);
+            return;
         },
+    };
+    let _ = sock.set_nodelay(true);
+    if out
+        .send(OutFrame::new(FrameKind::Reply, stream, vec![REPLY_OK]))
+        .await
+        .is_err()
+    {
+        registry.lock().unwrap().remove(&stream);
+        return;
     }
+    stats.sessions.fetch_add(1, Ordering::Relaxed);
+    info!("{subject} stream {stream} -> {target}");
+
+    let outcome = tunnel::pump_stream(sock, stream, &mut events, &out).await;
+    // `local` is the target stream here, so `up` is target->client.
+    stats
+        .bytes_to_clients
+        .fetch_add(outcome.up, Ordering::Relaxed);
+    stats
+        .bytes_to_targets
+        .fetch_add(outcome.down, Ordering::Relaxed);
+    tunnel::log_stream_close(
+        &format!("{subject} stream {stream}"),
+        &target,
+        &outcome,
+        started,
+    );
+    registry.lock().unwrap().remove(&stream);
 }
 
 #[cfg(test)]

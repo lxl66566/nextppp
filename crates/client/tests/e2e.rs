@@ -1,12 +1,14 @@
 //! End-to-end tests: real sockets through
-//! socks5 inbound -> nextppp tunnel -> server -> echo target, covering
-//! IP/domain targets, connect failures and half-close propagation.
+//! socks5 inbound -> mux tunnel pool -> server -> echo target, covering
+//! IP/domain targets, connect failures, half-close propagation, pool
+//! sharing and pool recovery after tunnel death.
 
 use std::{
+    collections::HashMap,
     io::{Read, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     thread,
@@ -16,12 +18,13 @@ use std::{
 use nextppp_client::ClientRuntime;
 use nextppp_common::{
     addr::{Host, ProxyAddr},
-    config::{ClientConfig, ObfuscationConfig, ServerConfig, ServerSection},
+    config::{ClientConfig, MuxSection, ObfuscationConfig, ServerConfig, ServerSection},
     dns::DnsCache,
+    mux::{FrameHeader, FrameKind, parse_frame},
     proto::{STATUS_OK, STATUS_REFUSED},
     pump,
 };
-use nextppp_core::{ObfuscationKey, Transmission};
+use nextppp_core::{ObfuscationKey, SessionRx, SessionTx, Transmission};
 use nextppp_server::ServerRuntime;
 
 // ---------------------------------------------------------------------------
@@ -67,6 +70,7 @@ fn start_server() -> SocketAddr {
         handshake_timeout: 10,
         max_connections: None,
         max_handshakes: None,
+        max_streams_per_conn: None,
         obfuscation: ObfuscationConfig::default(),
     };
     let rt = ServerRuntime::from_config(&cfg).unwrap();
@@ -77,10 +81,10 @@ fn start_server() -> SocketAddr {
 }
 
 fn start_client(server: SocketAddr) -> SocketAddr {
-    start_client_with(server, 0)
+    start_client_with(server, 0, 4)
 }
 
-fn start_client_with(server: SocketAddr, connect_retries: u32) -> SocketAddr {
+fn start_client_with(server: SocketAddr, connect_retries: u32, pool_size: u32) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let cfg = ClientConfig {
@@ -91,6 +95,11 @@ fn start_client_with(server: SocketAddr, connect_retries: u32) -> SocketAddr {
             address: server.to_string(),
             connect_timeout: 5,
             connect_retries,
+            mux: MuxSection {
+                enabled: true,
+                pool_size,
+                max_streams: 64,
+            },
             obfuscation: ObfuscationConfig::default(),
         },
     };
@@ -101,11 +110,70 @@ fn start_client_with(server: SocketAddr, connect_retries: u32) -> SocketAddr {
     addr
 }
 
-/// Minimal in-test nextppp server speaking the real protocol (handshake,
-/// request, target connect, STATUS, pump) and counting completed handshakes.
-/// With `rst_first`, the very first accepted connection is killed with a RST
-/// (linger-0 close) to simulate a handshake cut mid-flight.
-fn start_mini_server(rst_first: bool) -> (SocketAddr, Arc<AtomicUsize>) {
+/// Waits until `cond` holds, panicking after a generous timeout.
+fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+    for _ in 0..100 {
+        if cond() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+// ---------------------------------------------------------------------------
+// Minimal in-test mux server: an independent, synchronous implementation of
+// the mux wire protocol (handshake -> demux -> target pumps), used to prove
+// interop and to inject tunnel-level failures the real server never causes.
+// ---------------------------------------------------------------------------
+
+/// Shared mux writer: encrypts `kind || sid || payload` frames on demand.
+/// The mutex serializes the tx cipher across per-stream pump threads.
+struct SyncWriter(Mutex<(SessionTx, TcpStream)>);
+
+impl SyncWriter {
+    fn send(&self, kind: FrameKind, sid: u32, payload: &[u8]) -> std::io::Result<()> {
+        let mut guard = self.0.lock().unwrap();
+        let (session, io) = &mut *guard;
+        let mut out = Vec::new();
+        session
+            .encrypt_into_prefixed(&mut out, FrameHeader::new(kind, sid).as_slice(), payload)
+            .map_err(std::io::Error::other)?;
+        io.write_all(&out)
+    }
+}
+
+/// Blocking variant of the async FrameReader: one complete mux message per
+/// call, `None` on EOF/error.
+fn next_frame(srx: &mut SessionRx, io: &mut TcpStream, buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    loop {
+        match srx.poll_frame(buf) {
+            Ok(Some(msg)) => {
+                let frame = msg.to_vec();
+                let used = srx.take_consumed();
+                buf.drain(..used);
+                return Some(frame);
+            },
+            Ok(None) => {},
+            Err(_) => return None,
+        }
+        let mut tmp = [0u8; 8192];
+        match io.read(&mut tmp) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MiniServer {
+    rst_first: bool,
+    drop_on_first_data: bool,
+}
+
+/// Starts the mini mux server, returning its address and the completed-
+/// handshake counter.
+fn start_mini_server(opts: MiniServer) -> (SocketAddr, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let handshakes = Arc::new(AtomicUsize::new(0));
@@ -113,7 +181,7 @@ fn start_mini_server(rst_first: bool) -> (SocketAddr, Arc<AtomicUsize>) {
     thread::spawn(move || {
         for (i, conn) in listener.incoming().enumerate() {
             let conn = conn.unwrap();
-            if rst_first && i == 0 {
+            if opts.rst_first && i == 0 {
                 // linger(0) turns the close into a RST: the client's
                 // in-flight handshake attempt dies with ECONNRESET.
                 // (`TcpStream::set_linger` is unstable; socket2 it is.)
@@ -124,35 +192,131 @@ fn start_mini_server(rst_first: bool) -> (SocketAddr, Arc<AtomicUsize>) {
                 continue;
             }
             let hs = Arc::clone(&hs);
-            thread::spawn(move || serve_protocol(conn, &hs));
+            let drop_on_first_data = opts.drop_on_first_data;
+            thread::spawn(move || serve_mux(conn, &hs, drop_on_first_data));
         }
     });
     (addr, handshakes)
 }
 
-fn serve_protocol(conn: TcpStream, handshakes: &Arc<AtomicUsize>) {
-    let rx_io = conn.try_clone().unwrap();
+/// Serves one mux tunnel against live targets (the loopback echo in
+/// practice). With `drop_on_first_data` the tunnel dies on the first DATA
+/// frame, simulating a mid-stream tunnel reset.
+fn serve_mux(conn: TcpStream, handshakes: &Arc<AtomicUsize>, drop_on_first_data: bool) {
     let mut t = Transmission::new(conn, ObfuscationKey::default());
-    t.handshake_server(7, false).unwrap();
+    if t.handshake_server(7, true).is_err() {
+        return;
+    }
     handshakes.fetch_add(1, Ordering::Relaxed);
-    let req = t.read().unwrap();
-    let addr = ProxyAddr::decode(&req).unwrap();
-    match pump::tcp_connect(
-        &addr.host,
-        addr.port,
-        Duration::from_secs(5),
-        &DnsCache::new(),
-    ) {
-        Ok(target) => {
-            t.write(&[STATUS_OK]).unwrap();
-            let (txh, rxh) = t.split_with(rx_io);
-            let _stats = pump::pump_tunnel(txh, rxh, target);
-        },
-        Err(_) => {
-            let _ = t.write(&[STATUS_REFUSED]);
-        },
+    let (session, io) = t.into_session();
+    let (stx, mut srx) = session.split();
+    let writer = Arc::new(SyncWriter(Mutex::new((
+        stx,
+        io.try_clone().expect("clone tunnel stream"),
+    ))));
+    let targets: Arc<Mutex<HashMap<u32, Arc<TcpStream>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mut io = io;
+    run_mux(&mut io, &mut srx, &writer, &targets, drop_on_first_data);
+    // The writer's cloned handle keeps the socket alive in target-pump
+    // threads; kill the socket explicitly so the client observes the
+    // tunnel death.
+    let _ = io.shutdown(Shutdown::Both);
+}
+
+/// The demux loop of [`serve_mux`].
+fn run_mux(
+    io: &mut TcpStream,
+    srx: &mut SessionRx,
+    writer: &Arc<SyncWriter>,
+    targets: &Arc<Mutex<HashMap<u32, Arc<TcpStream>>>>,
+    drop_on_first_data: bool,
+) {
+    let mut buf = Vec::new();
+    while let Some(msg) = next_frame(srx, io, &mut buf) {
+        let Ok((kind, sid, payload)) = parse_frame(&msg) else {
+            return;
+        };
+        match kind {
+            FrameKind::Open => {
+                let addr = ProxyAddr::decode(payload).expect("mini server: valid OPEN");
+                match pump::tcp_connect(
+                    &addr.host,
+                    addr.port,
+                    Duration::from_secs(5),
+                    &DnsCache::new(),
+                ) {
+                    Ok(target) => {
+                        if writer.send(FrameKind::Reply, sid, &[STATUS_OK]).is_err() {
+                            return;
+                        }
+                        let target = Arc::new(target);
+                        targets.lock().unwrap().insert(sid, Arc::clone(&target));
+                        // Target -> tunnel pump.
+                        let writer = Arc::clone(writer);
+                        let targets = Arc::clone(targets);
+                        thread::spawn(move || {
+                            let mut buf = [0u8; 8192];
+                            loop {
+                                match target.as_ref().read(&mut buf) {
+                                    Ok(0) => {
+                                        let _ = writer.send(FrameKind::Eof, sid, &[]);
+                                        break;
+                                    },
+                                    Ok(n) => {
+                                        if writer.send(FrameKind::Data, sid, &buf[..n]).is_err() {
+                                            break;
+                                        }
+                                    },
+                                    Err(_) => {
+                                        let _ = writer.send(FrameKind::Close, sid, &[]);
+                                        break;
+                                    },
+                                }
+                            }
+                            targets.lock().unwrap().remove(&sid);
+                        });
+                    },
+                    Err(_) => {
+                        if writer
+                            .send(FrameKind::Reply, sid, &[STATUS_REFUSED])
+                            .is_err()
+                        {
+                            return;
+                        }
+                    },
+                }
+            },
+            FrameKind::Data => {
+                if drop_on_first_data {
+                    return; // tunnel dies mid-stream
+                }
+                let target = targets.lock().unwrap().get(&sid).cloned();
+                if let Some(target) = target {
+                    if target.as_ref().write_all(payload).is_err() {
+                        targets.lock().unwrap().remove(&sid);
+                    }
+                }
+            },
+            FrameKind::Eof => {
+                let target = targets.lock().unwrap().get(&sid).cloned();
+                if let Some(target) = target {
+                    let _ = target.shutdown(Shutdown::Write);
+                }
+            },
+            FrameKind::Close => {
+                let target = targets.lock().unwrap().remove(&sid);
+                if let Some(target) = target {
+                    let _ = target.shutdown(Shutdown::Both);
+                }
+            },
+            FrameKind::Reply => return, // role violation
+        }
     }
 }
+
+// ---------------------------------------------------------------------------
+// SOCKS5 client-side helpers
+// ---------------------------------------------------------------------------
 
 fn timed(stream: TcpStream) -> TcpStream {
     stream
@@ -166,6 +330,18 @@ fn timed(stream: TcpStream) -> TcpStream {
 
 /// Performs the SOCKS5 no-auth + CONNECT handshake, asserting success.
 fn socks5_connect(client: SocketAddr, host: &Host, port: u16) -> TcpStream {
+    let rep = socks5_connect_raw(client, host, port);
+    assert_eq!(rep.1, 0x00, "connect not accepted: rep={:#04x}", rep.1);
+    rep.0
+}
+
+/// Same as [`socks5_connect`] but returns the reply code instead of
+/// asserting on it.
+fn socks5_connect_rep(client: SocketAddr, host: &Host, port: u16) -> u8 {
+    socks5_connect_raw(client, host, port).1
+}
+
+fn socks5_connect_raw(client: SocketAddr, host: &Host, port: u16) -> (TcpStream, u8) {
     let mut s = timed(TcpStream::connect(client).unwrap());
     s.write_all(&[0x05, 1, 0x00]).unwrap();
     let mut method = [0u8; 2];
@@ -196,32 +372,7 @@ fn socks5_connect(client: SocketAddr, host: &Host, port: u16) -> TcpStream {
     let mut reply = [0u8; 10];
     s.read_exact(&mut reply).unwrap();
     assert_eq!(reply[0], 0x05, "bad reply version");
-    assert_eq!(
-        reply[1], 0x00,
-        "connect not accepted: rep={:#04x}",
-        reply[1]
-    );
-    s
-}
-
-fn socks5_connect_rep(client: SocketAddr, host: &Host, port: u16) -> u8 {
-    // Same as socks5_connect but without the success assert; returns REP.
-    let mut s = timed(TcpStream::connect(client).unwrap());
-    s.write_all(&[0x05, 1, 0x00]).unwrap();
-    let mut method = [0u8; 2];
-    s.read_exact(&mut method).unwrap();
-    let mut req = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
-    if let Host::Domain(d) = host {
-        req[3] = 0x03;
-        req.truncate(4);
-        req.push(u8::try_from(d.len()).unwrap());
-        req.extend_from_slice(d.as_bytes());
-    }
-    req.extend_from_slice(&port.to_be_bytes());
-    s.write_all(&req).unwrap();
-    let mut reply = [0u8; 10];
-    s.read_exact(&mut reply).unwrap();
-    reply[1]
+    (s, reply[1])
 }
 
 fn echo_roundtrip(s: &mut TcpStream, payload: &[u8]) {
@@ -276,9 +427,12 @@ fn socks5_unreachable_target_reports_failure() {
 #[test]
 fn retry_recovers_from_rst_during_handshake() {
     let echo = start_echo();
-    // First TCP connection is RST mid-handshake; only a retry can succeed.
-    let (server, handshakes) = start_mini_server(true);
-    let client = start_client_with(server, 1);
+    // First pool dial is RST mid-handshake; only a retry can succeed.
+    let (server, handshakes) = start_mini_server(MiniServer {
+        rst_first: true,
+        drop_on_first_data: false,
+    });
+    let client = start_client_with(server, 1, 1);
 
     let mut s = socks5_connect(client, &Host::Ip("127.0.0.1".parse().unwrap()), echo.port());
     echo_roundtrip(&mut s, b"second attempt wins");
@@ -297,14 +451,17 @@ fn refused_target_is_not_retried() {
         drop(l);
         a
     };
-    let (server, handshakes) = start_mini_server(false);
-    let client = start_client_with(server, 2);
+    let (server, handshakes) = start_mini_server(MiniServer {
+        rst_first: false,
+        drop_on_first_data: false,
+    });
+    let client = start_client_with(server, 2, 1);
     let rep = socks5_connect_rep(client, &Host::Ip("127.0.0.1".parse().unwrap()), dead.port());
     assert_eq!(rep, 0x01, "expected general failure for refused target");
     assert_eq!(
         handshakes.load(Ordering::Relaxed),
         1,
-        "STATUS_REFUSED is a deterministic verdict; retries must not fire"
+        "REPLY REFUSED is a per-stream verdict; no redial must fire"
     );
 }
 
@@ -316,10 +473,71 @@ fn half_close_propagates_through_tunnel() {
 
     let mut s = socks5_connect(client, &Host::Ip("127.0.0.1".parse().unwrap()), echo.port());
     s.write_all(b"ping").unwrap();
-    // Half-close the client side; the FRAME_EOF must reach the echo target,
+    // Half-close the client side; the EOF frame must reach the echo target,
     // which echoes back "ping" and its own FIN.
     s.shutdown(Shutdown::Write).unwrap();
     let mut got = Vec::new();
     s.read_to_end(&mut got).unwrap();
     assert_eq!(got, b"ping");
+}
+
+#[test]
+fn pool_tunnels_are_shared_across_socks_connections() {
+    let echo = start_echo();
+    let (server, handshakes) = start_mini_server(MiniServer {
+        rst_first: false,
+        drop_on_first_data: false,
+    });
+    let client = start_client_with(server, 0, 2);
+
+    // The pool warms up to its configured size without any traffic.
+    wait_until("pool warmup", || handshakes.load(Ordering::Relaxed) >= 2);
+
+    // Eight concurrent proxied connections must all work while the tunnel
+    // count stays at the pool size: streams share tunnels.
+    let mut threads = Vec::new();
+    for i in 0..8u8 {
+        threads.push(thread::spawn(move || {
+            let mut s =
+                socks5_connect(client, &Host::Ip("127.0.0.1".parse().unwrap()), echo.port());
+            echo_roundtrip(&mut s, &[i; 1024]);
+        }));
+    }
+    for t in threads {
+        t.join().unwrap();
+    }
+    // No tunnel may have been dialed for the burst.
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        handshakes.load(Ordering::Relaxed),
+        2,
+        "streams must share pool tunnels; no per-CONNECT dials"
+    );
+}
+
+#[test]
+fn tunnel_death_fails_streams_and_pool_recovers() {
+    let echo = start_echo();
+    let (server, handshakes) = start_mini_server(MiniServer {
+        rst_first: false,
+        drop_on_first_data: true,
+    });
+    let client = start_client_with(server, 0, 1);
+
+    // First connection: opens fine, then the tunnel dies on the first DATA
+    // frame — the in-flight stream must fail instead of hanging.
+    let mut s = socks5_connect(client, &Host::Ip("127.0.0.1".parse().unwrap()), echo.port());
+    s.write_all(b"trigger the drop").unwrap();
+    let mut buf = [0u8; 16];
+    let result = s.read(&mut buf);
+    assert!(
+        matches!(result, Ok(0) | Err(_)),
+        "dead tunnel must surface as a closed socks connection, got {result:?}"
+    );
+    drop(s);
+
+    // The maintainer dials a replacement; new connections work again.
+    wait_until("pool recovery", || handshakes.load(Ordering::Relaxed) >= 2);
+    let rep = socks5_connect_rep(client, &Host::Ip("127.0.0.1".parse().unwrap()), echo.port());
+    assert_eq!(rep, 0x00, "recovered pool must accept new streams");
 }

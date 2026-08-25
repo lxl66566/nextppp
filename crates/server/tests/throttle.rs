@@ -22,6 +22,7 @@ fn start_server(max_handshakes: Option<u64>) -> SocketAddr {
         handshake_timeout: 10,
         max_connections: None,
         max_handshakes,
+        max_streams_per_conn: None,
         obfuscation: ObfuscationConfig::default(),
     };
     let rt = ServerRuntime::from_config(&cfg).unwrap();

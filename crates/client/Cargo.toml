@@ -18,6 +18,7 @@ nextppp-common = { workspace = true }
 nextppp-core   = { workspace = true }
 spdlog-rs      = { workspace = true }
 thiserror      = { workspace = true }
+tokio          = { workspace = true }
 
 [dev-dependencies]
 hotpath        = { workspace = true }

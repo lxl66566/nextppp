@@ -18,6 +18,10 @@
   // thread for the full handshake_timeout.
   // "max_handshakes": 256,
 
+  // Maximum mux streams per tunnel connection; excess OPENs are answered
+  // with CLOSE. Bounds the memory one client can pin on this server.
+  // "max_streams_per_conn": 1024,
+
   // Obfuscation parameters; every field except the passwords feeds the
   // handshake flag-canary, so they must match the client configuration.
   // Per-layer key overrides (seldom needed):

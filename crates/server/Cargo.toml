@@ -18,6 +18,7 @@ nextppp-common = { workspace = true }
 nextppp-core   = { workspace = true }
 rand           = { workspace = true }
 spdlog-rs      = { workspace = true }
+tokio          = { workspace = true }
 
 [features]
 # Profiling instrumentation; see nextppp-core's feature docs.

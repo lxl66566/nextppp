@@ -2,33 +2,38 @@
 //! CONNECT through the nextppp tunnel. No local routing — chain it
 //! behind a front-end proxy (e.g. sing-box) via its socks outbound.
 //!
+//! Connection model: event-driven on a fixed tokio worker pool. SOCKS
+//! CONNECTs open mux streams on the shared tunnel pool (see [`pool`]);
+//! one task per inbound connection, one reader + one writer task per
+//! tunnel.
+//!
 //! Logging contract: `info` for proxied connection open/close (with byte
 //! counts and duration), `warn` for tunnel setup failures and protocol
 //! faults, `debug` for negotiation detail.
 
 use std::{
-    net::TcpListener,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::Context;
-use nextppp_common::{addr::Host, config::ClientConfig, pump};
+use nextppp_common::{addr::Host, config::ClientConfig, pump, shutdown};
 use nextppp_core::ObfuscationKey;
 use spdlog::prelude::*;
 
-pub mod outbound;
+pub mod pool;
 pub mod socks5;
 
-/// Stack size for per-connection handler threads (see `serve`).
-const SESSION_STACK: usize = 256 * 1024;
+/// Heartbeat interval for the health/stats log line.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How often the accept loop polls the shutdown flag.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(200);
 
 /// Immutable runtime parameters derived from the configuration.
-#[derive(Clone)]
 pub struct ClientRuntime {
     /// Remote nextppp server endpoint, parsed once at startup (per-CONNECT
     /// re-parsing cost a lowercase alloc and a split every time).
@@ -38,12 +43,16 @@ pub struct ClientRuntime {
     pub server_key: Arc<ObfuscationKey>,
     /// Connect + handshake timeout toward the server.
     pub connect_timeout: Duration,
-    /// Extra connect attempts after a routine transport failure.
+    /// Extra dial attempts after a routine transport failure.
     pub connect_retries: u32,
     /// Maximum concurrently active inbound connections (`None` = unlimited).
     pub max_connections: Option<u64>,
-    /// Server-address DNS cache: without it every SOCKS CONNECT re-resolves
-    /// the server domain on its own resolver thread.
+    /// Mux pool size (`0` = dedicated tunnel per CONNECT).
+    pub pool_size: u32,
+    /// Streams a pool tunnel may carry before another is preferred.
+    pub max_streams: u32,
+    /// Server-address DNS cache: without it every pool dial re-resolves the
+    /// server domain on its own resolver thread.
     pub dns: Arc<nextppp_common::dns::DnsCache>,
 }
 
@@ -70,6 +79,8 @@ impl ClientRuntime {
             connect_timeout: Duration::from_secs(cfg.server.connect_timeout),
             connect_retries: cfg.server.connect_retries,
             max_connections: cfg.max_connections,
+            pool_size: cfg.server.mux.effective_pool_size(),
+            max_streams: cfg.server.mux.max_streams.max(1),
             dns: Arc::new(nextppp_common::dns::DnsCache::new()),
         })
     }
@@ -121,9 +132,9 @@ pub struct ClientStats {
     active: AtomicU64,
     /// Total accepted inbound connections.
     connections: AtomicU64,
-    /// Tunnels established (handshake + server OK).
+    /// Streams established on pool tunnels (server REPLY OK).
     tunnels: AtomicU64,
-    /// Tunnel setup failures (connect, handshake, refused).
+    /// Tunnel/stream setup failures (connect, handshake, refused).
     tunnel_failures: AtomicU64,
     /// Bytes pumped from local apps into tunnels.
     bytes_up: AtomicU64,
@@ -131,33 +142,25 @@ pub struct ClientStats {
     bytes_down: AtomicU64,
 }
 
-/// Heartbeat interval for the health/stats log line.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
-
 /// Periodically logs client health (see [`ClientStats`]).
 fn spawn_heartbeat(stats: Arc<ClientStats>) {
-    let spawned = thread::Builder::new()
-        .name("nextppp-heartbeat".to_owned())
-        .spawn(move || {
-            let started = Instant::now();
-            loop {
-                thread::sleep(HEARTBEAT_INTERVAL);
-                info!(
-                    "heartbeat: uptime {} active {} connections {} tunnels {} failed_tunnels {} \
-                     up {} down {}",
-                    nextppp_common::fmt_duration(started.elapsed()),
-                    stats.active.load(Ordering::Relaxed),
-                    stats.connections.load(Ordering::Relaxed),
-                    stats.tunnels.load(Ordering::Relaxed),
-                    stats.tunnel_failures.load(Ordering::Relaxed),
-                    nextppp_common::fmt_bytes(stats.bytes_up.load(Ordering::Relaxed)),
-                    nextppp_common::fmt_bytes(stats.bytes_down.load(Ordering::Relaxed)),
-                );
-            }
-        });
-    if let Err(e) = spawned {
-        warn!("heartbeat thread spawn failed: {e}");
-    }
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+            info!(
+                "heartbeat: uptime {} active {} connections {} tunnels {} failed_tunnels {} up {} \
+                 down {}",
+                nextppp_common::fmt_duration(started.elapsed()),
+                stats.active.load(Ordering::Relaxed),
+                stats.connections.load(Ordering::Relaxed),
+                stats.tunnels.load(Ordering::Relaxed),
+                stats.tunnel_failures.load(Ordering::Relaxed),
+                nextppp_common::fmt_bytes(stats.bytes_up.load(Ordering::Relaxed)),
+                nextppp_common::fmt_bytes(stats.bytes_down.load(Ordering::Relaxed)),
+            );
+        }
+    });
 }
 
 /// Accept loop; blocks the calling thread forever.
@@ -167,73 +170,87 @@ fn spawn_heartbeat(stats: Arc<ClientStats>) {
 /// Fatal listener failure.
 // `serve` owns the listener: it lives exactly as long as the accept loop.
 #[allow(clippy::needless_pass_by_value)]
-pub fn serve(listener: TcpListener, rt: Arc<ClientRuntime>) -> anyhow::Result<()> {
+pub fn serve(listener: std::net::TcpListener, rt: Arc<ClientRuntime>) -> anyhow::Result<()> {
     info!(
         "nextppp client socks5 inbound on {}",
         listener.local_addr()?.to_string()
     );
     let stats: Arc<ClientStats> = Arc::new(ClientStats::default());
-    spawn_heartbeat(Arc::clone(&stats));
-    nextppp_common::shutdown::install(listener.local_addr()?);
-    'accept: for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                // Wake-up connect from the signal handler: shut down, not
-                // a real inbound session.
-                if nextppp_common::shutdown::requested() {
-                    break 'accept;
-                }
-                // Best-effort gate against local apps wedging the process
-                // with half-open socks sessions (load/increment not atomic).
-                if let Some(max) = rt.max_connections {
-                    if stats.active.load(Ordering::Relaxed) >= max {
-                        debug!("inbound rejected: connection limit {max} reached");
-                        continue; // dropping `stream` closes it
-                    }
-                }
-                stats.connections.fetch_add(1, Ordering::Relaxed);
-                stats.active.fetch_add(1, Ordering::Relaxed);
-                // Name threads per peer so stacks of stuck inbound sessions
-                // are distinguishable in logs/debuggers.
-                let name = stream.peer_addr().map_or_else(
-                    |_| String::from("nextppp-in-?"),
-                    |a| format!("nextppp-in-{a}"),
-                );
-                let rt = rt.clone();
-                let stats = Arc::clone(&stats);
-                let spawned = thread::Builder::new()
-                    .name(name)
-                    // Shallow call chain (negotiation, tunnel, pump loop;
-                    // large buffers are heap-owned); see also the server.
-                    .stack_size(SESSION_STACK)
-                    .spawn(move || {
-                        let _guard = ActiveGuard(&stats.active);
-                        socks5::handle(stream, &rt, &stats);
-                    });
-                if let Err(e) = spawned {
-                    error!("inbound spawn failed: {e}");
-                }
-            },
-            Err(e) => {
-                if nextppp_common::shutdown::requested() {
-                    break 'accept;
-                }
-                warn!("accept failed: {e}");
-                pump::accept_backoff(&e);
-            },
+    listener.set_nonblocking(true)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("nextppp-worker")
+        .build()
+        .context("build tokio runtime")?;
+    runtime.block_on(async move {
+        let listener =
+            tokio::net::TcpListener::from_std(listener).context("convert listener to tokio")?;
+        shutdown::install(listener.local_addr()?);
+        spawn_heartbeat(Arc::clone(&stats));
+        let pool = pool::Pool::new(&rt);
+        loop {
+            if shutdown::requested() {
+                break;
+            }
+            tokio::select! {
+                r = listener.accept() => match r {
+                    Ok((stream, _)) => {
+                        // Best-effort gate against local apps wedging the
+                        // process with half-open socks sessions.
+                        if let Some(max) = rt.max_connections {
+                            if stats.active.load(Ordering::Relaxed) >= max {
+                                debug!("inbound rejected: connection limit {max} reached");
+                                continue; // dropping `stream` closes it
+                            }
+                        }
+                        stats.connections.fetch_add(1, Ordering::Relaxed);
+                        stats.active.fetch_add(1, Ordering::Relaxed);
+                        tokio::spawn({
+                            let stats = Arc::clone(&stats);
+                            let pool = pool.clone();
+                            async move {
+                                let _guard = ActiveGuard(Arc::clone(&stats));
+                                socks5::handle(stream, stats, pool).await;
+                            }
+                        });
+                    },
+                    Err(e) => {
+                        if shutdown::requested() {
+                            break;
+                        }
+                        warn!("accept failed: {e}");
+                        if pump::accept_exhausted(&e) {
+                            pump::log_accept_exhausted(&e);
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    },
+                },
+                () = tokio::time::sleep(SHUTDOWN_POLL) => {},
+            }
         }
-    }
-    info!("shutdown signal received; draining sessions");
-    nextppp_common::shutdown::drain_sessions(|| stats.active.load(Ordering::Relaxed));
-    Ok(())
+        info!("shutdown signal received; draining sessions");
+        // Drain with the runtime alive (the sleep loop must not block a
+        // worker, hence spawn_blocking).
+        let drained = {
+            let stats = Arc::clone(&stats);
+            tokio::task::spawn_blocking(move || {
+                shutdown::drain_sessions(move || stats.active.load(Ordering::Relaxed));
+            })
+            .await
+        };
+        if let Err(e) = drained {
+            warn!("drain task failed: {e}");
+        }
+        Ok(())
+    })
 }
 
 /// Decrements the active-inbound counter when a connection ends.
-struct ActiveGuard<'a>(&'a AtomicU64);
+struct ActiveGuard(Arc<ClientStats>);
 
-impl Drop for ActiveGuard<'_> {
+impl Drop for ActiveGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

@@ -205,10 +205,15 @@ pub struct ServerConfig {
     /// `max_connections`: probe floods would otherwise occupy the session
     /// budget for the full `handshake_timeout` each and squeeze out real
     /// users. Over the cap the connection is dropped at accept time, so a
-    /// probe costs one table slot instead of one thread + 15s. `null`
+    /// probe costs one table slot instead of one task + 15s. `null`
     /// disables the cap (not recommended on a hostile network).
     #[serde(default = "default_max_handshakes")]
     pub max_handshakes: Option<u64>,
+    /// Maximum mux streams per tunnel connection. Bounds the memory a
+    /// single client can pin on this server; excess OPENs are answered
+    /// with CLOSE. `null` disables the cap.
+    #[serde(default = "default_max_streams_per_conn")]
+    pub max_streams_per_conn: Option<u64>,
     /// Obfuscation parameters, shared with clients.
     #[serde(default)]
     pub obfuscation: ObfuscationConfig,
@@ -251,9 +256,54 @@ pub struct ServerSection {
     /// connect-attempt cadence to a censor, so this is opt-in.
     #[serde(default = "default_connect_retries")]
     pub connect_retries: u32,
+    /// Mux tunnel pool. Streams from many SOCKS CONNECTs share a few
+    /// long-lived tunnels, cutting the per-connect cost to ~0 RTT.
+    #[serde(default)]
+    pub mux: MuxSection,
     /// Obfuscation parameters, must match the server.
     #[serde(default)]
     pub obfuscation: ObfuscationConfig,
+}
+
+/// Mux tunnel pool section of the client configuration.
+///
+/// The tradeoff (see `docs/extreme-network-optimization.md` B8): pooling
+/// removes the per-CONNECT handshake and scales to connection bursts, but
+/// streams on one tunnel share its TCP loss/congestion fate (head-of-line).
+/// `pool_size` tunnels with least-loaded assignment bound the blast radius.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MuxSection {
+    /// Master switch. `false` dials a dedicated tunnel per SOCKS CONNECT
+    /// (full loss isolation, at one tunnel + handshake per connect).
+    pub enabled: bool,
+    /// Long-lived tunnels kept hot; new streams pick the least-loaded one.
+    /// `0` behaves like `enabled: false`.
+    pub pool_size: u32,
+    /// Streams a tunnel may carry before the pool prefers another one.
+    pub max_streams: u32,
+}
+
+impl Default for MuxSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            pool_size: 4,
+            max_streams: 64,
+        }
+    }
+}
+
+impl MuxSection {
+    /// Effective pool size; `0` means dedicated tunnel per connect.
+    #[must_use]
+    pub fn effective_pool_size(&self) -> u32 {
+        if self.enabled {
+            self.pool_size
+        } else {
+            0
+        }
+    }
 }
 
 fn default_connect_timeout() -> u64 {
@@ -273,6 +323,11 @@ fn default_handshake_timeout() -> u64 {
 #[allow(clippy::unnecessary_wraps)]
 fn default_max_handshakes() -> Option<u64> {
     Some(256)
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn default_max_streams_per_conn() -> Option<u64> {
+    Some(1024)
 }
 
 /// Loads and validates a jsonc configuration file.

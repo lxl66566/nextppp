@@ -1,23 +1,9 @@
 //! Application layer tunneled above the nextppp transmission.
 //!
-//! Once the nextppp handshake completes, the connection carries a tiny
-//! proxy protocol:
-//!
-//! ```text
-//! client -> server : [ATYP][addr][port BE16]     connect request
-//! server -> client : [STATUS]                    1-byte connect result
-//! both          : [FRAME_DATA][payload...]       data frame (payload non-empty)
-//! both          : [FRAME_EOF]                    half-close (forward TCP FIN)
-//! ```
-//!
-//! `FRAME_EOF` propagates half-closes across the tunnel: without it a local
-//! `shutdown(write)` could never reach the far end, since the nextppp
-//! framing has no in-band EOF.
-
-/// Data frame marker: the rest of the message is payload.
-pub const FRAME_DATA: u8 = 0x00;
-/// Half-close frame marker: forward a TCP write-side shutdown.
-pub const FRAME_EOF: u8 = 0x01;
+//! Post-handshake the connection speaks the mux protocol (see
+//! [`crate::mux`]): every message is `[kind][stream_id varint][payload]`.
+//! This module keeps the connect-verdict statuses carried in `REPLY`
+//! frames, shared by both protocol generations.
 
 /// Connect response: target connected, tunnel established.
 pub const STATUS_OK: u8 = 0x00;
