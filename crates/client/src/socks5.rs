@@ -82,7 +82,7 @@ async fn negotiate_and_forward(
             let started = Instant::now();
             let sid = tun.sid();
             let out = tun.out().clone();
-            let o = tunnel::pump_stream(stream, sid, &mut tun.events, &out).await;
+            let o = tunnel::pump_stream(stream, sid, tun.take_events(), out).await;
             stats.bytes_up.fetch_add(o.up, Ordering::Relaxed);
             stats.bytes_down.fetch_add(o.down, Ordering::Relaxed);
             if o.end.is_graceful() {

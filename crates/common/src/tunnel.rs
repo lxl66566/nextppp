@@ -9,7 +9,13 @@
 //! may carry several frames or half of one, which the incremental
 //! [`SessionRx::poll_frame`] absorbs.
 
-use std::io;
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use nextppp_core::{BASE94_MAX_FRAME, Error, SessionRx, SessionTx};
 use spdlog::prelude::*;
@@ -186,7 +192,7 @@ pub async fn tcp_connect(
     host: crate::addr::Host,
     port: u16,
     timeout: std::time::Duration,
-    dns: std::sync::Arc<crate::dns::DnsCache>,
+    dns: Arc<crate::dns::DnsCache>,
 ) -> io::Result<TcpStream> {
     let stream =
         tokio::task::spawn_blocking(move || crate::pump::tcp_connect(&host, port, timeout, &dns))
@@ -247,81 +253,165 @@ pub struct PumpOutcome {
     pub end: StreamEnd,
 }
 
-fn classify_io_end(err: &io::Error) -> StreamEnd {
+fn classify_io_end(err: &io::Error) -> DirEnd {
     match routine_cause(err.kind()) {
-        Some(cause) => StreamEnd::Closed(cause),
-        None => StreamEnd::Fault(err.to_string()),
+        Some(cause) => DirEnd::Closed(cause),
+        None => DirEnd::Fault(err.to_string()),
+    }
+}
+
+/// How one pump direction terminated.
+#[derive(Debug)]
+enum DirEnd {
+    /// Graceful in-band half-close (EOF sent/received): the sibling may
+    /// still be legitimately active, so it is left running.
+    Eof,
+    /// Routine teardown (reset, broken pipe, tunnel loss); aborts the
+    /// sibling — it can never make progress again.
+    Closed(&'static str),
+    /// Unexpected I/O failure worth a warning; aborts the sibling.
+    Fault(String),
+}
+
+impl DirEnd {
+    /// Whether the sibling direction may legitimately continue.
+    fn graceful(&self) -> bool {
+        matches!(self, Self::Eof)
+    }
+}
+
+/// Local -> tunnel direction: wraps chunks in DATA frames, emits EOF on
+/// local half-close, CLOSE on local faults. Byte count goes into `bytes`
+/// so an aborted task's progress is not lost.
+async fn pump_up(
+    mut rd: tokio::net::tcp::OwnedReadHalf,
+    stream: StreamId,
+    out: mpsc::Sender<OutFrame>,
+    bytes: Arc<AtomicU64>,
+) -> DirEnd {
+    let mut buf = vec![0u8; STREAM_CHUNK];
+    loop {
+        match rd.read(&mut buf).await {
+            Ok(0) => {
+                return match out.send(OutFrame::bare(FrameKind::Eof, stream)).await {
+                    Ok(()) => DirEnd::Eof,
+                    Err(_) => DirEnd::Closed("tunnel closed"),
+                };
+            },
+            Ok(n) => {
+                if out
+                    .send(OutFrame::new(FrameKind::Data, stream, buf[..n].to_vec()))
+                    .await
+                    .is_err()
+                {
+                    return DirEnd::Closed("tunnel closed");
+                }
+                bytes.fetch_add(n as u64, Ordering::Relaxed);
+            },
+            Err(e) => {
+                let _ = out.try_send(OutFrame::bare(FrameKind::Close, stream));
+                return classify_io_end(&e);
+            },
+        }
+    }
+}
+
+/// Tunnel -> local direction: unwraps DATA, forwards EOF as a local
+/// write-side shutdown, ends on CLOSE or a dead tunnel (channel closed).
+async fn pump_down(
+    mut wr: tokio::net::tcp::OwnedWriteHalf,
+    stream: StreamId,
+    mut events: mpsc::Receiver<StreamEvent>,
+    out: mpsc::Sender<OutFrame>,
+    bytes: Arc<AtomicU64>,
+) -> DirEnd {
+    loop {
+        match events.recv().await {
+            // The demux dropped the sender: tunnel death or an abortive
+            // close it already logged.
+            None => return DirEnd::Closed("tunnel closed"),
+            Some(StreamEvent::Data(data)) => {
+                if let Err(e) = wr.write_all(&data).await {
+                    let _ = out.try_send(OutFrame::bare(FrameKind::Close, stream));
+                    return classify_io_end(&e);
+                }
+                bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+            },
+            Some(StreamEvent::Eof) => {
+                let _ = wr.shutdown().await;
+                return DirEnd::Eof;
+            },
+            Some(StreamEvent::Close) => return DirEnd::Closed("peer reset"),
+        }
+    }
+}
+
+fn join_dir(r: Result<DirEnd, tokio::task::JoinError>) -> DirEnd {
+    match r {
+        Ok(end) => end,
+        Err(e) if e.is_cancelled() => DirEnd::Closed("aborted"),
+        Err(_) => DirEnd::Fault(String::from("stream pump panicked")),
     }
 }
 
 /// Pumps one local socket against a mux stream until either side closes.
-/// One task per stream: a `select!` over the local read half and the
-/// stream's event channel, so no cross-task wake-ups are ever needed — a
-/// dead tunnel closes the channel and the loop breaks, dropping the local
-/// socket.
 ///
-/// Half-close contract: a local EOF sends `EOF` and stops reading; an
-/// `EOF` event shuts the local write side down. When both happened the
-/// stream is [`StreamEnd::Graceful`] and the caller must not send `CLOSE`.
+/// Two independent direction tasks (the old two-thread pump's async
+/// shape). They MUST be independent: a single task that blocks inside a
+/// bounded-channel `send().await` cannot drain the inbound direction
+/// meanwhile, which closes a backpressure cycle across both tunnel ends
+/// and deadlocks bulk transfers. Coordination mirrors the old
+/// `kill_session` contract: a graceful in-band half-close (EOF) leaves
+/// the sibling running; any other end aborts it.
+///
+/// [`StreamEnd::Graceful`] means EOF went both ways; the caller must not
+/// send CLOSE afterwards.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub async fn pump_stream(
     local: TcpStream,
     stream: StreamId,
-    events: &mut mpsc::Receiver<StreamEvent>,
-    out: &mpsc::Sender<OutFrame>,
+    events: mpsc::Receiver<StreamEvent>,
+    out: mpsc::Sender<OutFrame>,
 ) -> PumpOutcome {
-    let (mut rd, mut wr) = local.into_split();
-    let mut buf = vec![0u8; STREAM_CHUNK];
-    let (mut up, mut down) = (0u64, 0u64);
-    let mut reading = true;
-    let mut writing = true;
-    let end = loop {
-        if !reading && !writing {
-            break StreamEnd::Graceful;
-        }
-        tokio::select! {
-            n = rd.read(&mut buf), if reading => match n {
-                Ok(0) => {
-                    reading = false;
-                    if out.send(OutFrame::bare(FrameKind::Eof, stream)).await.is_err() {
-                        break StreamEnd::Closed("tunnel closed");
-                    }
-                },
-                Ok(n) => {
-                    if out
-                        .send(OutFrame::new(FrameKind::Data, stream, buf[..n].to_vec()))
-                        .await
-                        .is_err()
-                    {
-                        break StreamEnd::Closed("tunnel closed");
-                    }
-                    up += n as u64;
-                },
-                Err(e) => {
-                    let _ = out.try_send(OutFrame::bare(FrameKind::Close, stream));
-                    break classify_io_end(&e);
-                },
-            },
-            ev = events.recv() => match ev {
-                // The demux dropped the sender: tunnel death or an
-                // abortive close it already logged.
-                None => break StreamEnd::Closed("tunnel closed"),
-                Some(StreamEvent::Data(data)) => {
-                    if let Err(e) = wr.write_all(&data).await {
-                        let _ = out.try_send(OutFrame::bare(FrameKind::Close, stream));
-                        break classify_io_end(&e);
-                    }
-                    down += data.len() as u64;
-                },
-                Some(StreamEvent::Eof) => {
-                    writing = false;
-                    let _ = wr.shutdown().await;
-                },
-                Some(StreamEvent::Close) => break StreamEnd::Closed("peer reset"),
-            },
-        }
+    let (rd, wr) = local.into_split();
+    let up_bytes = Arc::new(AtomicU64::new(0));
+    let down_bytes = Arc::new(AtomicU64::new(0));
+    let mut up = tokio::spawn(pump_up(rd, stream, out.clone(), Arc::clone(&up_bytes)));
+    let mut down = tokio::spawn(pump_down(wr, stream, events, out, Arc::clone(&down_bytes)));
+    let (up_end, down_end) = tokio::select! {
+        r = &mut up => {
+            let up_end = join_dir(r);
+            if up_end.graceful() {
+                let down_end = join_dir(down.await);
+                (up_end, down_end)
+            } else {
+                down.abort();
+                (up_end, join_dir(down.await))
+            }
+        },
+        r = &mut down => {
+            let down_end = join_dir(r);
+            if down_end.graceful() {
+                let up_end = join_dir(up.await);
+                (up_end, down_end)
+            } else {
+                up.abort();
+                (join_dir(up.await), down_end)
+            }
+        },
     };
-    PumpOutcome { up, down, end }
+    let end = match (up_end, down_end) {
+        (DirEnd::Eof, DirEnd::Eof) => StreamEnd::Graceful,
+        // The first non-graceful end decides; abort-related seconds are
+        // consequences, not causes.
+        (DirEnd::Fault(e), _) | (_, DirEnd::Fault(e)) => StreamEnd::Fault(e),
+        (DirEnd::Closed(c), _) | (_, DirEnd::Closed(c)) => StreamEnd::Closed(c),
+    };
+    PumpOutcome {
+        up: up_bytes.load(Ordering::Relaxed),
+        down: down_bytes.load(Ordering::Relaxed),
+        end,
+    }
 }
 
 /// Logs a pumped stream's teardown at `info`, escalating to `warn` on a

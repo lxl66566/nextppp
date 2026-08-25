@@ -298,6 +298,15 @@ impl Stream {
         &self.tunnel.out
     }
 
+    /// Moves the event receiver out for the pump (the stream handle stays
+    /// in charge of deregistration).
+    #[must_use]
+    pub fn take_events(&mut self) -> mpsc::Receiver<StreamEvent> {
+        // The placeholder channel is never used: the pump owns the real
+        // receiver for the rest of the stream's life.
+        std::mem::replace(&mut self.events, mpsc::channel(1).1)
+    }
+
     /// Marks a clean both-directions close; suppresses the drop-time CLOSE.
     pub fn mark_graceful(&mut self) {
         self.graceful = true;

@@ -516,7 +516,7 @@ fn handle_open(
 async fn handle_stream(
     addr: ProxyAddr,
     stream: StreamId,
-    mut events: mpsc::Receiver<StreamEvent>,
+    events: mpsc::Receiver<StreamEvent>,
     out: mpsc::Sender<OutFrame>,
     rt: ServerRuntime,
     registry: Registry,
@@ -557,7 +557,7 @@ async fn handle_stream(
     stats.sessions.fetch_add(1, Ordering::Relaxed);
     info!("{subject} stream {stream} -> {target}");
 
-    let outcome = tunnel::pump_stream(sock, stream, &mut events, &out).await;
+    let outcome = tunnel::pump_stream(sock, stream, events, out).await;
     // `local` is the target stream here, so `up` is target->client.
     stats
         .bytes_to_clients
