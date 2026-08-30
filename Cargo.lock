@@ -607,6 +607,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "flexible-string"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a05d366c427aa6f9edde6b18a6ec9e4e20b24ada3db91200421dd9e31a5c8f9"
+
+[[package]]
 name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -942,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "nextppp"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -955,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "nextppp-client"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "hotpath",
@@ -971,7 +977,7 @@ dependencies = [
 
 [[package]]
 name = "nextppp-common"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "ctrlc",
@@ -988,7 +994,7 @@ dependencies = [
 
 [[package]]
 name = "nextppp-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "aes",
  "base94-simd",
@@ -1005,7 +1011,7 @@ dependencies = [
 
 [[package]]
 name = "nextppp-server"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "hotpath",
@@ -1489,6 +1495,7 @@ dependencies = [
  "bytemuck",
  "chrono",
  "dyn-clone",
+ "flexible-string",
  "libc",
  "once_cell",
  "parking_lot",

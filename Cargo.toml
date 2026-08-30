@@ -36,7 +36,7 @@ nextppp-core   = { path = "crates/core" }
 nextppp-server = { path = "crates/server" }
 serde          = { version = "1", features = ["derive"] }
 socket2        = { version = "0.6", features = ["all"] }
-spdlog-rs      = "0.5"
+spdlog-rs      = { version = "0.5", features = ["flexible-string"] }
 tokio          = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [workspace.lints.clippy]
