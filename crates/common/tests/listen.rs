@@ -1,11 +1,16 @@
 //! Listener construction tests: burst-sized backlog and, on Linux,
 //! `TCP_DEFER_ACCEPT` semantics (accept wakes on first data, not on SYN).
 
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "linux")]
 use std::{
-    io::{ErrorKind, Write},
-    net::{SocketAddr, TcpStream},
-    os::unix::io::AsRawFd,
+    io::ErrorKind,
     time::{Duration, Instant},
+};
+use std::{
+    io::Write,
+    net::{SocketAddr, TcpStream},
 };
 
 use nextppp_common::listen::bind_listen;

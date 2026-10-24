@@ -1,9 +1,8 @@
 //! Regression tests for socket-level helpers over real loopback sockets.
 
-use std::{
-    net::{TcpListener, TcpStream},
-    time::Duration,
-};
+use std::net::{TcpListener, TcpStream};
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 
 use nextppp_common::pump;
 
