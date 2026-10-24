@@ -15,6 +15,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use nextppp_core::{BASE94_MAX_FRAME, Error, SessionRx, SessionTx};
@@ -49,6 +50,11 @@ pub const PREFIX_MAX_FRAME: usize = BASE94_MAX_FRAME;
 /// backlog (busy tunnels only; idle latency is unaffected because the
 /// first frame never waits for batching).
 const WRITE_BATCH: usize = 32;
+
+/// A consumer that has not drained one frame of its 32-frame event channel
+/// in 60 s is wedged; dropping its sender closes that stream while the
+/// tunnel keeps serving the rest.
+pub const STREAM_SEND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One outbound mux frame queued for the tunnel writer task. The payload
 /// is moved, not copied; encryption prepends the header in place.
@@ -288,7 +294,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
 pub async fn tcp_connect(
     host: crate::addr::Host,
     port: u16,
-    timeout: std::time::Duration,
+    timeout: Duration,
     dns: Arc<crate::dns::DnsCache>,
 ) -> io::Result<TcpStream> {
     let stream =

@@ -26,7 +26,7 @@ use anyhow::Context;
 use nextppp_common::{
     addr::Host,
     config::ClientConfig,
-    pump::{accept_exhausted, log_accept_exhausted},
+    pump::{accept_exhausted, accept_routine, log_accept_exhausted},
     shutdown,
 };
 use nextppp_core::ObfuscationKey;
@@ -317,7 +317,11 @@ async fn accept_inbound<D: TunnelDialer>(
                     if shutdown::requested() {
                         break;
                     }
-                    warn!("accept failed: {e}");
+                    if accept_routine(&e) {
+                        debug!("accept failed: {e}");
+                    } else {
+                        warn!("accept failed: {e}");
+                    }
                     if accept_exhausted(&e) {
                         log_accept_exhausted(&e);
                         tokio::time::sleep(Duration::from_millis(100)).await;

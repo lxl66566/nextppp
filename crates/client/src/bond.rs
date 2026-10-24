@@ -10,7 +10,7 @@
 //! `no_link_timeout` kills the channel, after which the pool redials a
 //! fresh tunnel.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use aggligator::{
     alc::{ReceiverStream, SenderSink},
@@ -18,7 +18,6 @@ use aggligator::{
     control::Control,
     io::{IoRx, IoTx},
 };
-use anyhow::Context;
 use nextppp_common::{
     link::{LinkReadHalf, LinkWriteHalf, bond_cfg, split_link},
     tunnel::{FrameReader, TxWire},
@@ -69,7 +68,13 @@ impl TunnelDialer for BondDialer {
         }
         let mut live = 0u32;
         for task in link_tasks {
-            let link = task.await.context("link dial task join")?;
+            let link = match task.await {
+                Ok(link) => link,
+                Err(e) => {
+                    control.terminate();
+                    return Err(anyhow::Error::new(e).context("link dial task join"));
+                },
+            };
             match link {
                 Ok((read, write, tag)) => {
                     match Box::pin(control.add_io(read, write, tag, &[], None)).await {
@@ -84,10 +89,26 @@ impl TunnelDialer for BondDialer {
             control.terminate();
             anyhow::bail!("all {} bond links failed to {}", bond.links, bond.target);
         }
-        let channel = tokio::time::timeout(rt.connect_timeout, outgoing.connect())
-            .await
-            .map_err(|_| anyhow::anyhow!("bond channel connect timeout to {}", bond.target))?
-            .map_err(|e| anyhow::anyhow!("bond channel connect to {}: {e}", bond.target))?;
+        // Every failure path below must terminate the aggregator: links
+        // already added would otherwise linger on both ends until the
+        // aggregator's default 300 s termination timeout fires.
+        let channel = match tokio::time::timeout(rt.connect_timeout, outgoing.connect()).await {
+            Ok(Ok(channel)) => channel,
+            Ok(Err(e)) => {
+                control.terminate();
+                return Err(anyhow::anyhow!(
+                    "bond channel connect to {}: {e}",
+                    bond.target
+                ));
+            },
+            Err(_) => {
+                control.terminate();
+                return Err(anyhow::anyhow!(
+                    "bond channel connect timeout to {}",
+                    bond.target
+                ));
+            },
+        };
 
         let id = channel.id().0;
         let (rh, wh) = channel.into_stream().into_split();
@@ -107,6 +128,11 @@ impl TunnelDialer for BondDialer {
     }
 
     async fn maintain_tunnel(&self, rt: &Arc<ClientRuntime>, tunnel: &Arc<Tunnel>) {
+        // A tunnel that died mid-round must not be topped up: its links
+        // dial into a channel nothing will ever use again.
+        if !tunnel.alive() {
+            return;
+        }
         let bond = rt
             .bond
             .as_ref()
@@ -149,7 +175,10 @@ async fn dial_link(rt: &Arc<ClientRuntime>) -> anyhow::Result<(LinkRead, LinkWri
         .bond
         .as_ref()
         .expect("bond dialer requires bond runtime params");
-    let (session, io) = dial_endpoint(rt, &bond.host, bond.port).await?;
+    // Per-link whole-dial-phase cap; each attempt keeps a full
+    // `connect_timeout` budget (see `PlainDialer::dial`).
+    let deadline = Instant::now() + rt.connect_timeout * (rt.connect_retries + 1);
+    let (session, io) = dial_endpoint(rt, &bond.host, bond.port, deadline).await?;
     let tag = io
         .peer_addr()
         .map_or_else(|_| String::from("?"), |a| a.to_string());

@@ -34,7 +34,7 @@ use nextppp_common::{
     fmt::{fmt_bytes, fmt_duration},
     mux::{FrameKind, REPLY_OK, REPLY_REFUSED, StreamId, parse_frame},
     pump, shutdown,
-    tunnel::{self, FrameReader, OutFrame, StreamEvent, TxWire},
+    tunnel::{self, FrameReader, OutFrame, STREAM_SEND_TIMEOUT, StreamEvent, TxWire},
 };
 use nextppp_core::{ObfuscationKey, Session, Transmission};
 use rand::Rng;
@@ -263,7 +263,11 @@ async fn accept_loop(
                     if shutdown::requested() {
                         break;
                     }
-                    warn!("accept failed: {e}");
+                    if pump::accept_routine(&e) {
+                        debug!("accept failed: {e}");
+                    } else {
+                        warn!("accept failed: {e}");
+                    }
                     if pump::accept_exhausted(&e) {
                         pump::log_accept_exhausted(&e);
                         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -479,7 +483,9 @@ async fn run_demux<R: AsyncRead + Unpin>(
 }
 
 /// Routes one event to a stream pump, bouncing CLOSE on unknown/dead
-/// streams so the peer's registry cannot leak after a close race.
+/// streams so the peer's registry cannot leak after a close race. A
+/// consumer that stops draining its channel closes only its own stream
+/// (see [`STREAM_SEND_TIMEOUT`]) instead of parking the demux.
 async fn route(
     registry: &Registry,
     stream: StreamId,
@@ -489,9 +495,15 @@ async fn route(
     let tx = registry.lock().unwrap().get(&stream).cloned();
     match tx {
         Some(tx) => {
-            if tx.send(ev).await.is_err() {
+            if let Ok(res) = tokio::time::timeout(STREAM_SEND_TIMEOUT, tx.send(ev)).await {
+                if res.is_err() {
+                    registry.lock().unwrap().remove(&stream);
+                    let _ = out.try_send(OutFrame::bare(FrameKind::Close, stream));
+                }
+            } else {
                 registry.lock().unwrap().remove(&stream);
                 let _ = out.try_send(OutFrame::bare(FrameKind::Close, stream));
+                debug!("stream {stream} stalled, closed");
             }
         },
         None => {

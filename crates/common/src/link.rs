@@ -106,7 +106,12 @@ impl<R: AsyncRead + Unpin> AsyncRead for LinkReadHalf<R> {
                         Poll::Ready(Ok(())) => {
                             let n = rb.filled().len();
                             if n == 0 {
-                                return if this.wire.is_empty() {
+                                // A parsed-but-undelivered binary frame
+                                // leaves `wire` empty (the codec drained
+                                // the 3 header bytes), so the mid-frame
+                                // state must also gate the clean-EOF
+                                // decision.
+                                return if this.wire.is_empty() && !this.session.is_frame_pending() {
                                     Poll::Ready(Ok(()))
                                 } else {
                                     Poll::Ready(Err(io::Error::new(
@@ -348,6 +353,22 @@ mod tests {
         let cut = frame.len() - 1;
         let mut cio = cio;
         cio.write_all(&frame[..cut]).unwrap();
+        drop(cio);
+        let mut buf = [0u8; 8];
+        let res = sread.read(&mut buf).await;
+        assert!(matches!(&res, Err(e) if e.kind() == io::ErrorKind::UnexpectedEof));
+
+        // Header only: the codec drains the 3 header bytes, so `wire` is
+        // empty and the pending-frame state alone must flag the
+        // eof-inside-frame.
+        let (cs, cio, ss, sio) = session_pair();
+        let (mut sread, _swrite) = split_link(ss, sio).unwrap();
+        let (mut stx, _srx) = cs.split();
+        let mut frame = Vec::new();
+        stx.encrypt_into(&mut frame, b"hello").unwrap();
+        let mut cio = cio;
+        cio.write_all(&frame[..nextppp_core::frame::binary::HEADER_SIZE])
+            .unwrap();
         drop(cio);
         let mut buf = [0u8; 8];
         let res = sread.read(&mut buf).await;

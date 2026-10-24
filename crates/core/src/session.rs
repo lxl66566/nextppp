@@ -182,6 +182,13 @@ impl SessionRx {
     pub fn take_consumed(&mut self) -> usize {
         std::mem::take(&mut self.consumed)
     }
+
+    /// Whether a binary frame header was parsed but its body has not
+    /// fully arrived (mid-frame state).
+    #[must_use]
+    pub fn is_frame_pending(&self) -> bool {
+        self.pending_binary.is_some()
+    }
 }
 
 /// Shared incremental-decode body behind [`Session::poll_frame`] and

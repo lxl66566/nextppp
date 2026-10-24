@@ -131,6 +131,16 @@ pub fn log_accept_exhausted(err: &io::Error) {
     warn!("accept exhausted ({err}); backing off 100ms for sessions to drain");
 }
 
+/// Whether an accept(2) error is routine peer misbehavior (aborted
+/// handshakes under scans) that must not spam the log at `warn`.
+#[must_use]
+pub fn accept_routine(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset | ErrorKind::Interrupted
+    )
+}
+
 /// Connects to `host:port` under one overall `timeout` deadline: DNS
 /// resolution (served by `dns`, see [`crate::dns`]) and every
 /// resolved-address attempt share it (previously each address got a full

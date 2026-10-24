@@ -43,7 +43,7 @@ use nextppp_common::{
     fmt_duration,
     mux::{FrameKind, REPLY_OK, StreamId, parse_frame},
     pump,
-    tunnel::{FrameReader, OutFrame, StreamEvent, TxWire, run_writer},
+    tunnel::{FrameReader, OutFrame, STREAM_SEND_TIMEOUT, StreamEvent, TxWire, run_writer},
 };
 use nextppp_core::{Session, Transmission};
 use spdlog::prelude::*;
@@ -65,6 +65,9 @@ const DIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Idle sweep interval: re-checks pool liveness when nothing notified.
 const MAINTAIN_IDLE_SLEEP: Duration = Duration::from_secs(30);
+
+/// Empty-pool wait re-check tick (see [`Pool::open_stream`]).
+const POOL_RECHECK: Duration = Duration::from_millis(200);
 
 /// The server answered REPLY REFUSED: the target itself is unreachable
 /// from the server — a deterministic verdict that redialing cannot change.
@@ -249,16 +252,19 @@ impl<D: TunnelDialer> Pool<D> {
                 // wait for a tunnel to arrive.
                 self.inner.died.notify_one();
                 let remaining = wait_deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero()
-                    || tokio::time::timeout(remaining, self.inner.added.notified())
-                        .await
-                        .is_err()
-                {
+                if remaining.is_zero() {
                     anyhow::bail!(
                         "no pool tunnel to {} within {}",
                         self.params.target,
                         fmt_duration(self.rt.connect_timeout),
                     );
+                }
+                // notified() can miss a push between pick() and its first
+                // poll (notify_waiters stores no permit); the tick
+                // re-checks the pool so the wait is bounded-correct.
+                tokio::select! {
+                    () = self.inner.added.notified() => {},
+                    () = tokio::time::sleep(POOL_RECHECK.min(remaining)) => {},
                 }
                 continue;
             };
@@ -342,7 +348,8 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
-    fn alive(&self) -> bool {
+    /// Whether the tunnel still serves streams (set false by `mark_dead`).
+    pub(crate) fn alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
     }
 
@@ -505,31 +512,43 @@ impl Drop for Stream {
 }
 
 /// Dials one tunnel with `connect_retries` attempts on routine transport
-/// failures (each attempt a fresh TCP connection; DNS hits the cache).
+/// failures (each attempt a fresh TCP connection; DNS hits the cache). The
+/// whole dial phase is capped at `connect_timeout * (connect_retries + 1)`
+/// so the dialing task and its slot are never pinned indefinitely; each
+/// attempt still carries a full `connect_timeout` budget of its own (see
+/// [`Pool::open_stream`] on per-phase budgets).
 async fn dial(rt: &Arc<ClientRuntime>) -> anyhow::Result<(Session, TcpStream)> {
     let host = rt.server_host.clone();
     let port = rt.server_port;
-    dial_endpoint(rt, &host, port).await
+    let deadline = Instant::now() + rt.connect_timeout * (rt.connect_retries + 1);
+    dial_endpoint(rt, &host, port, deadline).await
 }
 
 /// Shared dial body: retries routine failures toward any endpoint (plain
-/// server or bond link listener).
+/// server or bond link listener) under one whole-phase `deadline`.
 pub(crate) async fn dial_endpoint(
     rt: &Arc<ClientRuntime>,
     host: &Host,
     port: u16,
+    deadline: Instant,
 ) -> anyhow::Result<(Session, TcpStream)> {
     let rt = Arc::clone(rt);
     let host = host.clone();
-    tokio::task::spawn_blocking(move || dial_sync(&rt, &host, port))
+    tokio::task::spawn_blocking(move || dial_sync(&rt, &host, port, deadline))
         .await
         .context("dial task join")?
 }
 
-fn dial_sync(rt: &ClientRuntime, host: &Host, port: u16) -> anyhow::Result<(Session, TcpStream)> {
+fn dial_sync(
+    rt: &ClientRuntime,
+    host: &Host,
+    port: u16,
+    deadline: Instant,
+) -> anyhow::Result<(Session, TcpStream)> {
     let mut attempt = 0u32;
-    loop {
-        match dial_once(rt, host, port) {
+    let mut last: Option<anyhow::Error> = None;
+    while Instant::now() < deadline {
+        match dial_once(rt, host, port, deadline) {
             Ok(v) => return Ok(v),
             Err(e) => {
                 if attempt >= rt.connect_retries || !retryable(&e) {
@@ -542,19 +561,40 @@ fn dial_sync(rt: &ClientRuntime, host: &Host, port: u16) -> anyhow::Result<(Sess
                     port,
                     rt.connect_retries,
                 );
+                last = Some(e);
             },
         }
     }
+    // The deadline passed before another attempt fits.
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("dial deadline exceeded")))
+        .context("dial deadline exceeded")
 }
 
-fn dial_once(rt: &ClientRuntime, host: &Host, port: u16) -> anyhow::Result<(Session, TcpStream)> {
+fn dial_once(
+    rt: &ClientRuntime,
+    host: &Host,
+    port: u16,
+    deadline: Instant,
+) -> anyhow::Result<(Session, TcpStream)> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(anyhow::anyhow!(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "dial deadline exceeded",
+        )));
+    }
+    // One full `connect_timeout` per attempt, clamped to the remaining
+    // whole-phase budget: a blackholed first attempt must leave room for
+    // its retries (per-phase budgets, see [`Pool::open_stream`]), and the
+    // clamp bounds the whole dial phase.
+    let budget = remaining.min(rt.connect_timeout);
     let started = Instant::now();
-    let stream = pump::tcp_connect(host, port, rt.connect_timeout, &rt.dns)
+    let stream = pump::tcp_connect(host, port, budget, &rt.dns)
         .with_context(|| format!("connect server {}:{}", host.to_display(), port))?;
     pump::nodelay(&stream);
-    // Bound the whole handshake exchange by the connect timeout.
-    stream.set_read_timeout(Some(rt.connect_timeout))?;
-    stream.set_write_timeout(Some(rt.connect_timeout))?;
+    // Bound the whole handshake exchange by the per-attempt budget.
+    stream.set_read_timeout(Some(budget))?;
+    stream.set_write_timeout(Some(budget))?;
     let mut tx = Transmission::new(stream, Arc::clone(&rt.server_key));
     tx.handshake_client().context("nextppp handshake")?;
     // Data plane: no timeouts (kernel keepalive, set by `tcp_connect`,
@@ -674,14 +714,22 @@ async fn run_reader<R: AsyncRead + Unpin>(
 }
 
 /// Routes one event to a stream pump, bouncing CLOSE on unknown/dead
-/// streams so the server's registry cannot leak after a close race.
+/// streams so the server's registry cannot leak after a close race. A
+/// consumer that stops draining its channel closes only its own stream
+/// (see [`STREAM_SEND_TIMEOUT`]) instead of parking the demux.
 async fn route_event(tunnel: &Tunnel, sid: StreamId, ev: StreamEvent) {
     let tx = tunnel.registry.lock().unwrap().get(&sid).cloned();
     match tx {
         Some(tx) => {
-            if tx.send(ev).await.is_err() {
+            if let Ok(res) = tokio::time::timeout(STREAM_SEND_TIMEOUT, tx.send(ev)).await {
+                if res.is_err() {
+                    tunnel.registry.lock().unwrap().remove(&sid);
+                    let _ = tunnel.out.try_send(OutFrame::bare(FrameKind::Close, sid));
+                }
+            } else {
                 tunnel.registry.lock().unwrap().remove(&sid);
                 let _ = tunnel.out.try_send(OutFrame::bare(FrameKind::Close, sid));
+                debug!("stream {sid} stalled, closed");
             }
         },
         None => {
@@ -712,7 +760,14 @@ async fn maintain<D: TunnelDialer>(
         for t in &live {
             dialer.maintain_tunnel(&rt, t).await;
         }
-        let live = u32::try_from(live.len()).unwrap_or(u32::MAX);
+        // Recount under a second lock: the upkeep awaits above can span a
+        // whole dial round, and a stale live-count undercounts a dial that
+        // completed meanwhile, overshooting `pool_size` by one.
+        let live = {
+            let mut tunnels = inner.tunnels.lock().unwrap();
+            tunnels.retain(|t| t.alive());
+            u32::try_from(tunnels.len()).unwrap_or(u32::MAX)
+        };
         // In-flight dials count towards the target: without this, a dial
         // completing mid-round makes the next round spawn one too many.
         let dialing = inner.dialing.load(Ordering::Relaxed);
