@@ -19,7 +19,10 @@ use nextppp_common::{
 use spdlog::prelude::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::{ClientStats, pool::Pool};
+use crate::{
+    ClientStats,
+    pool::{Pool, TunnelDialer},
+};
 
 const VER: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
@@ -41,7 +44,11 @@ const REP_ATYP_UNSUPPORTED: u8 = 0x08;
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Handles one SOCKS5 connection end to end, logging its full lifecycle.
-pub async fn handle(stream: tokio::net::TcpStream, stats: Arc<ClientStats>, pool: Pool) {
+pub async fn handle<D: TunnelDialer>(
+    stream: tokio::net::TcpStream,
+    stats: Arc<ClientStats>,
+    pool: Pool<D>,
+) {
     let _ = stream.set_nodelay(true);
     pump::keepalive(&stream);
     let peer = stream
@@ -62,11 +69,11 @@ pub async fn handle(stream: tokio::net::TcpStream, stats: Arc<ClientStats>, pool
 /// Negotiation + CONNECT + tunnel forwarding. Failure points log at their
 /// proper levels before returning the error for the routine/fault split.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-async fn negotiate_and_forward(
+async fn negotiate_and_forward<D: TunnelDialer>(
     mut stream: tokio::net::TcpStream,
     peer: &str,
     stats: &ClientStats,
-    pool: Pool,
+    pool: Pool<D>,
 ) -> anyhow::Result<()> {
     let addr = tokio::time::timeout(NEGOTIATION_TIMEOUT, read_connect(&mut stream))
         .await

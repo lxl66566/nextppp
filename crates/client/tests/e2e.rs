@@ -18,7 +18,10 @@ use std::{
 use nextppp_client::ClientRuntime;
 use nextppp_common::{
     addr::{Host, ProxyAddr},
-    config::{ClientConfig, MuxSection, ObfuscationConfig, ServerConfig, ServerSection},
+    config::{
+        BondClientSection, BondServerSection, ClientConfig, MuxSection, ObfuscationConfig,
+        ServerConfig, ServerSection,
+    },
     dns::DnsCache,
     mux::{FrameHeader, FrameKind, parse_frame},
     proto::{STATUS_OK, STATUS_REFUSED},
@@ -65,6 +68,7 @@ fn start_server() -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     let cfg = ServerConfig {
         listen: addr.to_string(),
+        bond: None,
         password: None,
         connect_timeout: 5,
         handshake_timeout: 10,
@@ -75,7 +79,7 @@ fn start_server() -> SocketAddr {
     };
     let rt = ServerRuntime::from_config(&cfg).unwrap();
     thread::spawn(move || {
-        nextppp_server::serve(listener, rt).unwrap();
+        nextppp_server::serve(listener, None, rt).unwrap();
     });
     addr
 }
@@ -101,10 +105,12 @@ fn start_client_full(
     let addr = listener.local_addr().unwrap();
     let cfg = ClientConfig {
         listen: addr.to_string(),
+        bond: None,
         password: None,
         max_connections: None,
         server: ServerSection {
             address: server.to_string(),
+            bond_address: None,
             connect_timeout,
             connect_retries,
             mux: MuxSection {
@@ -117,7 +123,7 @@ fn start_client_full(
     };
     let rt = Arc::new(ClientRuntime::from_config(&cfg).unwrap());
     thread::spawn(move || {
-        nextppp_client::serve(listener, rt).unwrap();
+        nextppp_client::serve(listener, None, rt).unwrap();
     });
     addr
 }
@@ -398,10 +404,10 @@ fn run_mux(
                     return; // tunnel dies mid-stream
                 }
                 let target = targets.lock().unwrap().get(&sid).cloned();
-                if let Some(target) = target {
-                    if target.as_ref().write_all(payload).is_err() {
-                        targets.lock().unwrap().remove(&sid);
-                    }
+                if let Some(target) = target
+                    && target.as_ref().write_all(payload).is_err()
+                {
+                    targets.lock().unwrap().remove(&sid);
                 }
             },
             FrameKind::Eof => {
@@ -487,6 +493,116 @@ fn echo_roundtrip(s: &mut TcpStream, payload: &[u8]) {
     let mut got = vec![0u8; payload.len()];
     s.read_exact(&mut got).unwrap();
     assert_eq!(got, payload);
+}
+
+// ---------------------------------------------------------------------------
+// Bonded tunnels
+// ---------------------------------------------------------------------------
+
+/// Server with a bond link listener; returns (plain, bond) addresses.
+fn start_bond_server() -> (SocketAddr, SocketAddr) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let bond_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let bond_addr = bond_listener.local_addr().unwrap();
+    let cfg = ServerConfig {
+        listen: addr.to_string(),
+        bond: Some(BondServerSection {
+            listen: bond_addr.to_string(),
+        }),
+        password: None,
+        connect_timeout: 5,
+        handshake_timeout: 10,
+        max_connections: None,
+        max_handshakes: None,
+        max_streams_per_conn: None,
+        obfuscation: ObfuscationConfig::default(),
+    };
+    let rt = ServerRuntime::from_config(&cfg).unwrap();
+    thread::spawn(move || {
+        nextppp_server::serve(listener, Some(bond_listener), rt).unwrap();
+    });
+    (addr, bond_addr)
+}
+
+/// Client with both inbounds; returns (plain inbound, bond inbound).
+fn start_bond_client(server: SocketAddr, bond_listener: SocketAddr) -> (SocketAddr, SocketAddr) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let bond_in = TcpListener::bind("127.0.0.1:0").unwrap();
+    let bond_in_addr = bond_in.local_addr().unwrap();
+    let cfg = ClientConfig {
+        listen: addr.to_string(),
+        bond: Some(BondClientSection {
+            listen: bond_in_addr.to_string(),
+            links: 3,
+            pool_size: 1,
+            max_streams: 64,
+        }),
+        password: None,
+        max_connections: None,
+        server: ServerSection {
+            address: server.to_string(),
+            bond_address: Some(bond_listener.to_string()),
+            connect_timeout: 5,
+            connect_retries: 1,
+            mux: MuxSection {
+                enabled: true,
+                pool_size: 1,
+                max_streams: 64,
+            },
+            obfuscation: ObfuscationConfig::default(),
+        },
+    };
+    let rt = Arc::new(ClientRuntime::from_config(&cfg).unwrap());
+    thread::spawn(move || {
+        nextppp_client::serve(listener, Some(bond_in), rt).unwrap();
+    });
+    (addr, bond_in_addr)
+}
+
+/// Bonded tunnels carry streams like plain ones, and both inbounds work
+/// concurrently against the same server.
+#[test]
+fn bond_inbound_roundtrip_alongside_plain() {
+    let echo = start_echo();
+    let (server, bond_listener) = start_bond_server();
+    let (plain_in, bond_in) = start_bond_client(server, bond_listener);
+    let target = Host::Ip("127.0.0.1".parse().unwrap());
+
+    // Bond inbound: several streams over one aggregated channel of 3 links.
+    let mut streams = Vec::new();
+    for _ in 0..4 {
+        streams.push(socks5_connect(bond_in, &target, echo.port()));
+    }
+    for (i, s) in streams.iter_mut().enumerate() {
+        echo_roundtrip(s, format!("bond stream {i}").as_bytes());
+    }
+    // Larger payload crossing the 64 KiB chunk path.
+    let bulk: Vec<u8> = (0..200_000u32)
+        .map(|i| u8::try_from(i & 0xff).unwrap())
+        .collect();
+    echo_roundtrip(&mut streams[0], &bulk);
+
+    // Plain inbound works at the same time (latency path untouched).
+    let mut plain = socks5_connect(plain_in, &target, echo.port());
+    echo_roundtrip(&mut plain, b"plain alongside bond");
+}
+
+/// Bond config validation: an inbound without `server.bond_address` is
+/// rejected at load time.
+#[test]
+fn bond_inbound_requires_bond_address() {
+    let cfg = r#"{
+        "listen": "127.0.0.1:1080",
+        "bond": { "listen": "127.0.0.1:1081", "links": 2 },
+        "server": { "address": "example.com:6666" },
+    }"#;
+    let tmp = std::env::temp_dir().join("nextppp-bond-cfg-test.jsonc");
+    std::fs::write(&tmp, cfg).unwrap();
+    let err = ClientConfig::load(&tmp).unwrap_err();
+    let _ = std::fs::remove_file(&tmp);
+    assert!(err.to_string().contains("bond_address"));
 }
 
 // ---------------------------------------------------------------------------

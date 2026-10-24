@@ -186,6 +186,11 @@ impl ObfuscationConfig {
 pub struct ServerConfig {
     /// Listen address, e.g. `"0.0.0.0:6666"`.
     pub listen: String,
+    /// Bonded-tunnel link listener, e.g. `"0.0.0.0:6667"`. Links are
+    /// ordinary nextppp sessions indistinguishable from plain tunnels on
+    /// the wire. Absent disables bonded tunnels.
+    #[serde(default)]
+    pub bond: Option<BondServerSection>,
     /// Shared tunnel password; backs any obfuscation cipher key left unset.
     /// Prefer this over writing `protocol_key`/`transport_key` twice —
     /// sharing is safe (the core KDF separates the two cipher roles).
@@ -219,6 +224,14 @@ pub struct ServerConfig {
     pub obfuscation: ObfuscationConfig,
 }
 
+/// Server bond section: only the link listener address.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BondServerSection {
+    /// Listen address for bonded-tunnel link connections.
+    pub listen: String,
+}
+
 /// Client configuration (`nextppp-client.jsonc`).
 ///
 /// Intentionally minimal: the client is a plain SOCKS5-to-tunnel forwarder;
@@ -227,8 +240,16 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
-    /// Local SOCKS5 inbound listen address.
+    /// Local SOCKS5 inbound listen address (latency path: plain tunnels).
     pub listen: String,
+    /// Optional second SOCKS5 inbound served by bonded (multi-link
+    /// aggregated) tunnels — the bandwidth path. Route bulk traffic here
+    /// and interactive traffic to `listen`; aggregation trades a little
+    /// per-message scheduling variance for multiplied throughput and
+    /// link-loss resilience, which is the wrong tradeoff for interactive
+    /// streams.
+    #[serde(default)]
+    pub bond: Option<BondClientSection>,
     /// Shared tunnel password; backs any obfuscation cipher key left unset.
     /// Must match the server.
     #[serde(default)]
@@ -241,12 +262,43 @@ pub struct ClientConfig {
     pub server: ServerSection,
 }
 
+/// Client bond section: the bandwidth inbound and its link pool.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BondClientSection {
+    /// Local SOCKS5 inbound served by bonded tunnels.
+    pub listen: String,
+    /// Nextppp link sessions per bonded tunnel. Each link is a full
+    /// nextppp connection striped by the aggregator; 1 degenerates to a
+    /// single-link channel.
+    pub links: u32,
+    /// Bonded tunnels kept hot by the pool.
+    pub pool_size: u32,
+    /// Streams a bonded tunnel may carry before another is preferred.
+    pub max_streams: u32,
+}
+
+impl Default for BondClientSection {
+    fn default() -> Self {
+        Self {
+            listen: String::new(),
+            links: 3,
+            pool_size: 1,
+            max_streams: 64,
+        }
+    }
+}
+
 /// Remote server section of the client configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerSection {
     /// Server address (`host:port`).
     pub address: String,
+    /// Link-listener address of the server's bond section (`host:port`);
+    /// required iff `bond` is configured.
+    #[serde(default)]
+    pub bond_address: Option<String>,
     /// Connect + handshake timeout in seconds.
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout: u64,
@@ -363,6 +415,17 @@ impl ClientConfig {
             .obfuscation
             .to_key(cfg.password.as_deref())
             .map_err(|e| validate(&path_str, e))?;
+        if let Some(bond) = &cfg.bond {
+            if cfg.server.bond_address.is_none() {
+                return Err(validate(
+                    &path_str,
+                    String::from("bond inbound requires server.bond_address"),
+                ));
+            }
+            if bond.links == 0 {
+                return Err(validate(&path_str, String::from("bond.links must be >= 1")));
+            }
+        }
         Ok(cfg)
     }
 }

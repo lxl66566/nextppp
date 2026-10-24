@@ -27,7 +27,7 @@ use tokio::{
 
 use crate::{
     fmt::{fmt_bytes, fmt_duration},
-    mux::{FrameHeader, FrameKind, StreamId},
+    mux::{FrameHeader, FrameKind, StreamId, decode_varint, encode_varint},
     pump::routine_cause,
 };
 
@@ -41,6 +41,9 @@ const STREAM_CHUNK: usize = 16 * 1024;
 /// exceed `BASE94_MAX_FRAME` (+ the small headers); more buffered bytes
 /// without a completed frame means a desynced or hostile peer.
 const BUF_CAP: usize = BASE94_MAX_FRAME + 64;
+
+/// Largest mux message accepted in prefix framing (see [`TxWire::Prefix`]).
+pub const PREFIX_MAX_FRAME: usize = BASE94_MAX_FRAME;
 
 /// Frames coalesced into one write(2) when the outbound channel has a
 /// backlog (busy tunnels only; idle latency is unaffected because the
@@ -84,32 +87,67 @@ pub enum StreamEvent {
     Close,
 }
 
-/// Tunnel writer task: drains the outbound channel, encrypts and writes.
-/// Returns when the channel closes (all senders dropped) or the socket
+/// Per-frame wire encoding of a mux tunnel carrier.
+pub enum TxWire {
+    /// nextppp session frames: every mux message becomes one encrypted
+    /// wire packet (plain single-socket tunnels).
+    Session(Box<SessionTx>),
+    /// `varint(len) || mux frame` length-prefixed messages (bonded
+    /// carriers, where an aggregated channel replaces the session
+    /// transport). The nextppp encryption lives in the links underneath.
+    Prefix,
+}
+
+impl TxWire {
+    /// Appends one complete wire message (header + payload) to `out`.
+    fn encode(&mut self, out: &mut Vec<u8>, header: &[u8], payload: &[u8]) -> Result<(), Error> {
+        match self {
+            Self::Session(tx) => tx.encrypt_into_prefixed(out, header, payload),
+            Self::Prefix => {
+                let total = header.len() + payload.len();
+                if total == 0 {
+                    return Err(Error::ZeroLength);
+                }
+                if total > PREFIX_MAX_FRAME {
+                    return Err(Error::FrameTooLarge { len: total });
+                }
+                let mut len = [0u8; 5];
+                let n = encode_varint(u32::try_from(total).expect("bounded"), &mut len);
+                out.extend_from_slice(&len[..n]);
+                out.extend_from_slice(header);
+                out.extend_from_slice(payload);
+                Ok(())
+            },
+        }
+    }
+}
+
+/// Tunnel writer task: drains the outbound channel, encodes and writes.
+/// Returns when the channel closes (all senders dropped) or the carrier
 /// fails; the write half is shut down either way so the peer sees a clean
 /// end instead of a half-open tunnel.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub async fn run_writer<W: AsyncWrite + Unpin>(
-    mut session: SessionTx,
+    mut wire: TxWire,
     mut sock: W,
     mut rx: mpsc::Receiver<OutFrame>,
 ) {
     let mut out = Vec::new();
     'outer: while let Some(first) = rx.recv().await {
         out.clear();
-        if session
-            .encrypt_into_prefixed(&mut out, first.header.as_slice(), &first.payload)
+        if wire
+            .encode(&mut out, first.header.as_slice(), &first.payload)
             .is_err()
         {
             break;
         }
-        // Coalesce a backlog into one write(2); try_recv never awaits, so
+        // Coalesce a backlog into one write; try_recv never awaits, so
         // the first frame's latency is untouched.
         for _ in 1..WRITE_BATCH {
             match rx.try_recv() {
                 Ok(frame) => {
-                    if session
-                        .encrypt_into_prefixed(&mut out, frame.header.as_slice(), &frame.payload)
+                    if wire
+                        .encode(&mut out, frame.header.as_slice(), &frame.payload)
                         .is_err()
                     {
                         break 'outer;
@@ -121,24 +159,67 @@ pub async fn run_writer<W: AsyncWrite + Unpin>(
         if sock.write_all(&out).await.is_err() {
             break;
         }
+        // Aggregated carriers hold unwritten bytes until an explicit flush
+        // or their own flush delay; TCP flush is a no-op, so always flush
+        // and keep both carriers at the same latency.
+        if sock.flush().await.is_err() {
+            break;
+        }
     }
     let _ = sock.shutdown().await;
 }
 
-/// Incremental frame reader over an async byte stream: owns the rx cipher
-/// and the reassembly buffer.
+/// Per-frame wire decoding of a mux tunnel carrier (see [`TxWire`]).
+enum RxWire {
+    Session(Box<SessionRx>),
+    Prefix,
+}
+
+/// Length prefix of the message at the front of `buf`, if fully readable:
+/// `(message length, varint bytes)`.
+fn peek_prefix(buf: &[u8]) -> Result<Option<(usize, usize)>, Error> {
+    match decode_varint(buf) {
+        Some((len, vlen)) => {
+            if len == 0 {
+                return Err(Error::ZeroLength);
+            }
+            if len as usize > PREFIX_MAX_FRAME {
+                return Err(Error::FrameTooLarge { len: len as usize });
+            }
+            Ok(Some((len as usize, vlen)))
+        },
+        // An unterminated varint only needs more bytes when fewer than 5
+        // are buffered; beyond that it can never decode.
+        None if buf.len() >= 5 => Err(Error::InvalidFrame),
+        None => Ok(None),
+    }
+}
+
+/// Incremental frame reader over an async byte stream: owns the rx codec
+/// (session framing) or the prefix parser and the reassembly buffer.
 pub struct FrameReader<R> {
-    session: SessionRx,
+    wire: RxWire,
     sock: R,
     buf: Vec<u8>,
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
-    /// Wraps a session rx half and a socket read half.
+    /// Wraps a session rx half and a carrier read half (nextppp framing).
     #[must_use]
     pub fn new(session: SessionRx, sock: R) -> Self {
         Self {
-            session,
+            wire: RxWire::Session(Box::new(session)),
+            sock,
+            buf: Vec::new(),
+        }
+    }
+
+    /// Length-prefix framing over an already decrypted carrier (bonded
+    /// tunnels).
+    #[must_use]
+    pub fn prefix(sock: R) -> Self {
+        Self {
+            wire: RxWire::Prefix,
             sock,
             buf: Vec::new(),
         }
@@ -154,19 +235,35 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn next(&mut self) -> Result<Option<Vec<u8>>, Error> {
         loop {
-            {
-                // The borrow ends inside this scope: poll_frame borrows
-                // both the session and the buffer.
-                match self.session.poll_frame(&mut self.buf) {
-                    Ok(Some(msg)) => {
-                        let frame = msg.to_vec();
-                        let used = self.session.take_consumed();
-                        self.buf.drain(..used);
+            match self.wire {
+                RxWire::Session(ref mut session) => {
+                    // The block ends the borrow: poll_frame borrows both
+                    // the session and the buffer.
+                    let decoded = {
+                        match session.poll_frame(&mut self.buf) {
+                            Ok(Some(msg)) => {
+                                let frame = msg.to_vec();
+                                let used = session.take_consumed();
+                                self.buf.drain(..used);
+                                Some(frame)
+                            },
+                            Ok(None) => None,
+                            Err(e) => return Err(e),
+                        }
+                    };
+                    if let Some(frame) = decoded {
                         return Ok(Some(frame));
-                    },
-                    Ok(None) => {},
-                    Err(e) => return Err(e),
-                }
+                    }
+                },
+                RxWire::Prefix => {
+                    if let Some((total, vlen)) = peek_prefix(&self.buf)?
+                        && self.buf.len() >= vlen + total
+                    {
+                        let frame = self.buf[vlen..vlen + total].to_vec();
+                        self.buf.drain(..vlen + total);
+                        return Ok(Some(frame));
+                    }
+                },
             }
             if self.buf.len() > BUF_CAP {
                 return Err(Error::InvalidFrame);

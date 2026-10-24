@@ -34,12 +34,14 @@ use nextppp_common::{
     fmt::{fmt_bytes, fmt_duration},
     mux::{FrameKind, REPLY_OK, REPLY_REFUSED, StreamId, parse_frame},
     pump, shutdown,
-    tunnel::{self, FrameReader, OutFrame, StreamEvent},
+    tunnel::{self, FrameReader, OutFrame, StreamEvent, TxWire},
 };
 use nextppp_core::{ObfuscationKey, Session, Transmission};
 use rand::Rng;
 use spdlog::prelude::*;
-use tokio::sync::mpsc;
+use tokio::{io::AsyncRead, sync::mpsc};
+
+mod bond;
 
 /// Heartbeat interval for the health/stats log line.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
@@ -152,7 +154,7 @@ impl Drop for HandshakingGuard<'_> {
 /// turn the log into the actual DoS. The first failure and every 64th are
 /// logged; the heartbeat counter still carries the exact total.
 fn should_log_failure(n: u64) -> bool {
-    n == 1 || n % 64 == 0
+    n == 1 || n.is_multiple_of(64)
 }
 
 /// Per-tunnel stream registry: the demux loop routes events to stream
@@ -160,14 +162,20 @@ fn should_log_failure(n: u64) -> bool {
 /// every channel, which breaks every pump out of its `select!`.
 type Registry = Arc<Mutex<HashMap<StreamId, mpsc::Sender<StreamEvent>>>>;
 
-/// Accept loop; blocks the calling thread forever.
+/// Accept loop; blocks the calling thread forever. `bond_listener`, when
+/// present, additionally accepts link connections of bonded tunnels (see
+/// [`bond`]).
 ///
 /// # Errors
 ///
 /// Fatal listener failure.
 // `serve` owns the listener: it lives exactly as long as the accept loop.
 #[allow(clippy::needless_pass_by_value)]
-pub fn serve(listener: std::net::TcpListener, rt: ServerRuntime) -> anyhow::Result<()> {
+pub fn serve(
+    listener: std::net::TcpListener,
+    bond_listener: Option<std::net::TcpListener>,
+    rt: ServerRuntime,
+) -> anyhow::Result<()> {
     info!(
         "nextppp server listening on {}",
         listener.local_addr()?.to_string()
@@ -184,6 +192,14 @@ pub fn serve(listener: std::net::TcpListener, rt: ServerRuntime) -> anyhow::Resu
             tokio::net::TcpListener::from_std(listener).context("convert listener to tokio")?;
         shutdown::install(listener.local_addr()?);
         spawn_heartbeat(Arc::clone(&stats));
+        if let Some(bond) = bond_listener {
+            bond.set_nonblocking(true)
+                .context("bond listener nonblocking")?;
+            let bond = tokio::net::TcpListener::from_std(bond)
+                .context("convert bond listener to tokio")?;
+            info!("nextppp server bond listener on {}", bond.local_addr()?);
+            tokio::spawn(bond::accept_loop(bond, rt.clone(), Arc::clone(&stats)));
+        }
         accept_loop(&listener, &rt, &stats).await;
         // Drain with the runtime alive (the sleep loop must not block a
         // worker, hence spawn_blocking).
@@ -219,22 +235,22 @@ async fn accept_loop(
                     // Best-effort tunnel gate: the load/increment below is
                     // not atomic, so a burst can overshoot by a few; good
                     // enough against slowloris-style exhaustion.
-                    if let Some(max) = rt.max_connections {
-                        if stats.active.load(Ordering::Relaxed) >= max {
-                            stats.rejected_overload.fetch_add(1, Ordering::Relaxed);
-                            debug!("tunnel rejected: connection limit {max} reached");
-                            continue; // dropping `stream` closes it
-                        }
+                    if let Some(max) = rt.max_connections
+                        && stats.active.load(Ordering::Relaxed) >= max
+                    {
+                        stats.rejected_overload.fetch_add(1, Ordering::Relaxed);
+                        debug!("tunnel rejected: connection limit {max} reached");
+                        continue; // dropping `stream` closes it
                     }
                     // Probe-flood gate: capped separately so a scanner
                     // cannot occupy the tunnel budget for
                     // `handshake_timeout` apiece.
-                    if let Some(max) = rt.max_handshakes {
-                        if stats.handshaking.load(Ordering::Relaxed) >= max {
-                            stats.rejected_overload.fetch_add(1, Ordering::Relaxed);
-                            debug!("connection rejected: handshake limit {max} reached");
-                            continue;
-                        }
+                    if let Some(max) = rt.max_handshakes
+                        && stats.handshaking.load(Ordering::Relaxed) >= max
+                    {
+                        stats.rejected_overload.fetch_add(1, Ordering::Relaxed);
+                        debug!("connection rejected: handshake limit {max} reached");
+                        continue;
                     }
                     let mut sid =
                         base.wrapping_add(u128::from(counter.fetch_add(1, Ordering::Relaxed)));
@@ -319,7 +335,7 @@ async fn handle_conn_inner(
     let rt2 = rt.clone();
     let handshaking = Arc::clone(stats);
     let hs = tokio::task::spawn_blocking(move || {
-        handshake_sync(std_stream, &rt2, sid, &handshaking.handshaking)
+        handshake_sync(std_stream, &rt2, sid, &handshaking.handshaking, true)
     })
     .await
     .context("handshake task join")?;
@@ -344,12 +360,14 @@ async fn handle_conn_inner(
     Ok(())
 }
 
-/// Synchronous server handshake (mux advertised) on the blocking pool.
+/// Synchronous server handshake on the blocking pool. `mux` advertises mux
+/// support in the negotiated flag (tunnels yes, bond links no).
 fn handshake_sync(
     stream: TcpStream,
     rt: &ServerRuntime,
     sid: u128,
     handshaking: &AtomicU64,
+    mux: bool,
 ) -> anyhow::Result<(Session, TcpStream)> {
     pump::nodelay(&stream);
     // The tunnel stream is long-lived and the data plane clears all
@@ -361,7 +379,7 @@ fn handshake_sync(
     // The handshaking gauge covers exactly the pre-auth phase.
     {
         let _guard = HandshakingGuard::new(handshaking);
-        tx.handshake_server(sid, true)?;
+        tx.handshake_server(sid, mux)?;
     }
     // Data plane: no timeouts (kernel keepalive covers dead peers).
     tx.io_mut().set_read_timeout(None)?;
@@ -383,10 +401,27 @@ async fn run_tunnel(
     let (stx, srx) = session.split();
     let (rh, wh) = stream.into_split();
     let (out_tx, out_rx) = mpsc::channel::<OutFrame>(OUTBOUND_BOUND);
-    let mut writer = tokio::spawn(tunnel::run_writer(stx, wh, out_rx));
-    let mut reader = FrameReader::new(srx, rh);
-    let registry = Registry::default();
+    let mut writer = tokio::spawn(tunnel::run_writer(
+        TxWire::Session(Box::new(stx)),
+        wh,
+        out_rx,
+    ));
+    let reader = FrameReader::new(srx, rh);
     let subject = format!("session {sid:016x} ({peer})");
+    run_demux(reader, &mut writer, out_tx, rt, &subject, stats).await;
+}
+
+/// Shared demux loop of plain and bonded tunnels: routes frames from any
+/// mux carrier to per-stream pumps until the carrier or writer ends.
+async fn run_demux<R: AsyncRead + Unpin>(
+    mut reader: FrameReader<R>,
+    writer: &mut tokio::task::JoinHandle<()>,
+    out_tx: mpsc::Sender<OutFrame>,
+    rt: &ServerRuntime,
+    subject: &str,
+    stats: &Arc<ServerStats>,
+) {
+    let registry = Registry::default();
     loop {
         tokio::select! {
             frame = reader.next() => match frame {
@@ -398,7 +433,7 @@ async fn run_tunnel(
                         payload,
                         &out_tx,
                         stats,
-                        &subject,
+                        subject,
                     ),
                     Ok((FrameKind::Data, stream, payload)) => {
                         route(&registry, stream, StreamEvent::Data(payload.to_vec()), &out_tx)
@@ -432,7 +467,7 @@ async fn run_tunnel(
                     break;
                 },
             },
-            _ = &mut writer => {
+            _ = &mut *writer => {
                 debug!("{subject} tunnel writer ended");
                 break;
             },
@@ -482,12 +517,12 @@ fn handle_open(
             let _ = out.try_send(OutFrame::bare(FrameKind::Close, stream));
             return;
         }
-        if let Some(cap) = rt.max_streams_per_conn {
-            if reg.len() as u64 >= cap {
-                debug!("{subject} stream {stream} rejected: per-tunnel stream limit {cap}");
-                let _ = out.try_send(OutFrame::bare(FrameKind::Close, stream));
-                return;
-            }
+        if let Some(cap) = rt.max_streams_per_conn
+            && reg.len() as u64 >= cap
+        {
+            debug!("{subject} stream {stream} rejected: per-tunnel stream limit {cap}");
+            let _ = out.try_send(OutFrame::bare(FrameKind::Close, stream));
+            return;
         }
     }
     let addr = match ProxyAddr::decode(payload) {

@@ -68,8 +68,12 @@ fn run_server(config: &Path, init: Option<PathBuf>) -> anyhow::Result<()> {
     }
     let cfg = nextppp_common::ServerConfig::load(config)?;
     let listener = bind_listen(&cfg.listen)?;
+    let bond_listener = match &cfg.bond {
+        Some(bond) => Some(bind_listen(&bond.listen)?),
+        None => None,
+    };
     let rt = nextppp_server::ServerRuntime::from_config(&cfg)?;
-    nextppp_server::serve(listener, rt)
+    nextppp_server::serve(listener, bond_listener, rt)
 }
 
 fn run_client(config: &Path, init: Option<PathBuf>) -> anyhow::Result<()> {
@@ -78,8 +82,12 @@ fn run_client(config: &Path, init: Option<PathBuf>) -> anyhow::Result<()> {
     }
     let cfg = nextppp_common::ClientConfig::load(config)?;
     let listener = bind_listen(&cfg.listen)?;
+    let bond_listener = match &cfg.bond {
+        Some(bond) => Some(bind_listen(&bond.listen)?),
+        None => None,
+    };
     let rt = Arc::new(nextppp_client::ClientRuntime::from_config(&cfg)?);
-    nextppp_client::serve(listener, rt)
+    nextppp_client::serve(listener, bond_listener, rt)
 }
 
 fn bind_listen(spec: &str) -> anyhow::Result<TcpListener> {

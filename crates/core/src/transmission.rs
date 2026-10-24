@@ -100,10 +100,10 @@ pub(crate) fn parse_binary_header(
     if !(1..=PPP_BUFFER_SIZE).contains(&len) {
         return Err(Error::FrameTooLarge { len });
     }
-    if let Some(total) = declared_total {
-        if len + HEADER_SIZE != total {
-            return Err(Error::InvalidFrame);
-        }
+    if let Some(total) = declared_total
+        && len + HEADER_SIZE != total
+    {
+        return Err(Error::InvalidFrame);
     }
     Ok((len, header_kf))
 }

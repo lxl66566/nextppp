@@ -5,7 +5,10 @@
 //! Connection model: event-driven on a fixed tokio worker pool. SOCKS
 //! CONNECTs open mux streams on the shared tunnel pool (see [`pool`]);
 //! one task per inbound connection, one reader + one writer task per
-//! tunnel.
+//! tunnel. With the optional `bond` inbound configured, a second SOCKS5
+//! listener serves streams over link-aggregated tunnels (see [`bond`]):
+//! the default listener stays the latency path, the bond listener is the
+//! bandwidth path, and the front-end proxy routes traffic per rule.
 //!
 //! Logging contract: `info` for proxied connection open/close (with byte
 //! counts and duration), `warn` for tunnel setup failures and protocol
@@ -20,18 +23,42 @@ use std::{
 };
 
 use anyhow::Context;
-use nextppp_common::{addr::Host, config::ClientConfig, pump, shutdown};
+use nextppp_common::{
+    addr::Host,
+    config::ClientConfig,
+    pump::{accept_exhausted, log_accept_exhausted},
+    shutdown,
+};
 use nextppp_core::ObfuscationKey;
 use spdlog::prelude::*;
 
+pub mod bond;
 pub mod pool;
 pub mod socks5;
+
+use pool::{Pool, PoolParams, TunnelDialer};
 
 /// Heartbeat interval for the health/stats log line.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How often the accept loop polls the shutdown flag.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(200);
+
+/// Bonded-tunnel runtime parameters (bandwidth inbound).
+#[derive(Debug, Clone)]
+pub struct BondParams {
+    /// Server bond-listener endpoint (parsed once at startup).
+    pub host: Host,
+    pub port: u16,
+    /// Link sessions per bonded tunnel.
+    pub links: u32,
+    /// Bonded tunnels kept hot by the pool.
+    pub pool_size: u32,
+    /// Streams a bonded tunnel may carry before another is preferred.
+    pub max_streams: u32,
+    /// Endpoint string for dial-failure messages.
+    pub target: String,
+}
 
 /// Immutable runtime parameters derived from the configuration.
 pub struct ClientRuntime {
@@ -51,6 +78,8 @@ pub struct ClientRuntime {
     pub pool_size: u32,
     /// Streams a pool tunnel may carry before another is preferred.
     pub max_streams: u32,
+    /// Bonded-tunnel parameters; `None` disables the bond inbound.
+    pub bond: Option<BondParams>,
     /// Server-address DNS cache: without it every pool dial re-resolves the
     /// server domain on its own resolver thread.
     pub dns: Arc<nextppp_common::dns::DnsCache>,
@@ -72,6 +101,23 @@ impl ClientRuntime {
         nextppp_common::ObfuscationConfig::warn_placeholder(&key);
         let (server_host, server_port) = parse_host_port(&cfg.server.address)
             .with_context(|| format!("invalid server address {:?}", cfg.server.address))?;
+        let bond = match (&cfg.bond, &cfg.server.bond_address) {
+            (Some(bond), Some(address)) => {
+                let (host, port) = parse_host_port(address)
+                    .with_context(|| format!("invalid server bond address {address:?}"))?;
+                Some(BondParams {
+                    host,
+                    port,
+                    links: bond.links,
+                    pool_size: bond.pool_size,
+                    max_streams: bond.max_streams.max(1),
+                    target: address.clone(),
+                })
+            },
+            // Bond without an address is rejected by config validation.
+            (Some(_), None) => anyhow::bail!("bond inbound requires server.bond_address"),
+            (None, _) => None,
+        };
         Ok(Self {
             server_host,
             server_port,
@@ -81,6 +127,7 @@ impl ClientRuntime {
             max_connections: cfg.max_connections,
             pool_size: cfg.server.mux.effective_pool_size(),
             max_streams: cfg.server.mux.max_streams.max(1),
+            bond,
             dns: Arc::new(nextppp_common::dns::DnsCache::new()),
         })
     }
@@ -163,14 +210,19 @@ fn spawn_heartbeat(stats: Arc<ClientStats>) {
     });
 }
 
-/// Accept loop; blocks the calling thread forever.
+/// Accept loop; blocks the calling thread forever. `bond_listener`, when
+/// present, additionally serves the bond (bandwidth) inbound.
 ///
 /// # Errors
 ///
 /// Fatal listener failure.
 // `serve` owns the listener: it lives exactly as long as the accept loop.
 #[allow(clippy::needless_pass_by_value)]
-pub fn serve(listener: std::net::TcpListener, rt: Arc<ClientRuntime>) -> anyhow::Result<()> {
+pub fn serve(
+    listener: std::net::TcpListener,
+    bond_listener: Option<std::net::TcpListener>,
+    rt: Arc<ClientRuntime>,
+) -> anyhow::Result<()> {
     info!(
         "nextppp client socks5 inbound on {}",
         listener.local_addr()?.to_string()
@@ -187,48 +239,31 @@ pub fn serve(listener: std::net::TcpListener, rt: Arc<ClientRuntime>) -> anyhow:
             tokio::net::TcpListener::from_std(listener).context("convert listener to tokio")?;
         shutdown::install(listener.local_addr()?);
         spawn_heartbeat(Arc::clone(&stats));
-        let pool = pool::Pool::new(&rt);
-        loop {
-            if shutdown::requested() {
-                break;
-            }
-            tokio::select! {
-                r = listener.accept() => match r {
-                    Ok((stream, _)) => {
-                        // Best-effort gate against local apps wedging the
-                        // process with half-open socks sessions.
-                        if let Some(max) = rt.max_connections {
-                            if stats.active.load(Ordering::Relaxed) >= max {
-                                debug!("inbound rejected: connection limit {max} reached");
-                                continue; // dropping `stream` closes it
-                            }
-                        }
-                        stats.connections.fetch_add(1, Ordering::Relaxed);
-                        stats.active.fetch_add(1, Ordering::Relaxed);
-                        tokio::spawn({
-                            let stats = Arc::clone(&stats);
-                            let pool = pool.clone();
-                            async move {
-                                let _guard = ActiveGuard(Arc::clone(&stats));
-                                socks5::handle(stream, stats, pool).await;
-                            }
-                        });
-                    },
-                    Err(e) => {
-                        if shutdown::requested() {
-                            break;
-                        }
-                        warn!("accept failed: {e}");
-                        if pump::accept_exhausted(&e) {
-                            pump::log_accept_exhausted(&e);
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
-                    },
-                },
-                () = tokio::time::sleep(SHUTDOWN_POLL) => {},
-            }
+        let pool = Pool::new(&rt, pool::PlainDialer, PoolParams {
+            pool_size: rt.pool_size,
+            max_streams: rt.max_streams,
+            target: format!("{}:{}", rt.server_host.to_display(), rt.server_port),
+        });
+        if let Some(bond) = bond_listener {
+            bond.set_nonblocking(true)
+                .context("bond listener nonblocking")?;
+            let bond = tokio::net::TcpListener::from_std(bond)
+                .context("convert bond listener to tokio")?;
+            let params = rt.bond.as_ref().expect("bond listener implies bond params");
+            info!("nextppp client bond inbound on {}", bond.local_addr()?);
+            let bond_pool = Pool::new(&rt, bond::BondDialer, PoolParams {
+                pool_size: params.pool_size,
+                max_streams: params.max_streams,
+                target: params.target.clone(),
+            });
+            tokio::spawn(accept_inbound(
+                bond,
+                Arc::clone(&rt),
+                Arc::clone(&stats),
+                bond_pool,
+            ));
         }
-        info!("shutdown signal received; draining sessions");
+        accept_inbound(listener, Arc::clone(&rt), Arc::clone(&stats), pool).await;
         // Drain with the runtime alive (the sleep loop must not block a
         // worker, hence spawn_blocking).
         let drained = {
@@ -243,6 +278,56 @@ pub fn serve(listener: std::net::TcpListener, rt: Arc<ClientRuntime>) -> anyhow:
         }
         Ok(())
     })
+}
+
+/// One SOCKS5 inbound accept loop over one tunnel pool.
+async fn accept_inbound<D: TunnelDialer>(
+    listener: tokio::net::TcpListener,
+    rt: Arc<ClientRuntime>,
+    stats: Arc<ClientStats>,
+    pool: Pool<D>,
+) {
+    loop {
+        if shutdown::requested() {
+            break;
+        }
+        tokio::select! {
+            r = listener.accept() => match r {
+                Ok((stream, _)) => {
+                    // Best-effort gate against local apps wedging the
+                    // process with half-open socks sessions.
+                    if let Some(max) = rt.max_connections
+                        && stats.active.load(Ordering::Relaxed) >= max
+                    {
+                        debug!("inbound rejected: connection limit {max} reached");
+                        continue; // dropping `stream` closes it
+                    }
+                    stats.connections.fetch_add(1, Ordering::Relaxed);
+                    stats.active.fetch_add(1, Ordering::Relaxed);
+                    tokio::spawn({
+                        let stats = Arc::clone(&stats);
+                        let pool = pool.clone();
+                        async move {
+                            let _guard = ActiveGuard(Arc::clone(&stats));
+                            socks5::handle(stream, stats, pool).await;
+                        }
+                    });
+                },
+                Err(e) => {
+                    if shutdown::requested() {
+                        break;
+                    }
+                    warn!("accept failed: {e}");
+                    if accept_exhausted(&e) {
+                        log_accept_exhausted(&e);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                },
+            },
+            () = tokio::time::sleep(SHUTDOWN_POLL) => {},
+        }
+    }
+    info!("shutdown signal received; draining sessions");
 }
 
 /// Decrements the active-inbound counter when a connection ends.

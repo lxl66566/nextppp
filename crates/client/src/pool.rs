@@ -3,9 +3,15 @@
 //! the least-loaded tunnel instead of paying a TCP connect + handshake
 //! per request.
 //!
+//! The pool is carrier-agnostic: a [`TunnelDialer`] produces the carrier
+//! halves of one tunnel. [`PlainDialer`] dials single-socket nextppp
+//! tunnels (the latency path); [`crate::bond::BondDialer`] builds
+//! link-aggregated channels (the bandwidth path). Pool lifecycle and
+//! assignment logic are identical for both.
+//!
 //! Tradeoff (see `docs/extreme-network-optimization.md`): pooling removes
 //! the per-connect ~3 RTT setup tax and the thread/fd cost of bursty
-//! connects, but streams on one tunnel share its TCP loss fate (HOL).
+//! connects, but streams on one tunnel share its loss fate (HOL).
 //! `pool_size` + least-loaded assignment bounds the blast radius, and a
 //! dead tunnel fails only its own streams while the maintainer dials a
 //! replacement. When every pool tunnel sits at `max_streams`, new streams
@@ -20,7 +26,9 @@
 //! maintainer to refill. All of it is idempotent via `AtomicBool::swap`.
 
 use std::{
+    any::Any,
     collections::HashMap,
+    future::Future,
     net::TcpStream,
     sync::{
         Arc, Mutex, Weak,
@@ -31,15 +39,18 @@ use std::{
 
 use anyhow::Context;
 use nextppp_common::{
-    addr::ProxyAddr,
+    addr::{Host, ProxyAddr},
     fmt_duration,
     mux::{FrameKind, REPLY_OK, StreamId, parse_frame},
     pump,
-    tunnel::{self, FrameReader, OutFrame, StreamEvent},
+    tunnel::{FrameReader, OutFrame, StreamEvent, TxWire, run_writer},
 };
 use nextppp_core::{Session, Transmission};
 use spdlog::prelude::*;
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::{Notify, mpsc, oneshot},
+};
 
 use crate::ClientRuntime;
 
@@ -61,10 +72,90 @@ const MAINTAIN_IDLE_SLEEP: Duration = Duration::from_secs(30);
 #[error("server refused connection to {0}")]
 struct RefusedTarget(String);
 
-/// Pool of mux tunnels plus the notifications that coordinate waiters.
+/// One dialed tunnel: the carrier halves, the mux wire framing and the
+/// lifecycle hooks the pool cannot know about.
+pub struct TunnelEnds<R, W> {
+    /// Carrier read half wrapped in its mux frame reader.
+    pub reader: FrameReader<R>,
+    /// Mux wire framing of the carrier (session or length-prefix).
+    pub writer: TxWire,
+    /// Carrier write half.
+    pub write: W,
+    /// Tunnel identity for logs (session id or aggregated connection id).
+    pub id: u128,
+    /// Runs once when the tunnel is killed (e.g. aggregator termination).
+    pub teardown: Option<Box<dyn FnOnce() + Send>>,
+    /// Dialer-private state kept for the tunnel's lifetime (e.g. the bond
+    /// link controller used by link top-up).
+    pub ctx: Option<Box<dyn Any + Send + Sync>>,
+}
+
+/// Pool parameters that differ per inbound (plain vs bond).
 #[derive(Clone)]
-pub struct Pool {
+pub struct PoolParams {
+    /// Long-lived tunnels kept hot.
+    pub pool_size: u32,
+    /// Streams a tunnel may carry before another is preferred.
+    pub max_streams: u32,
+    /// Server endpoint shown in dial-failure messages.
+    pub target: String,
+}
+
+/// Produces the carrier of one mux tunnel; the pool owns the lifecycle
+/// around it.
+pub trait TunnelDialer: Send + Sync + 'static {
+    /// Carrier read half.
+    type R: AsyncRead + Unpin + Send + 'static;
+    /// Carrier write half.
+    type W: AsyncWrite + Unpin + Send + 'static;
+
+    /// Dials one tunnel, including any per-tunnel retries.
+    fn dial(
+        &self,
+        rt: &Arc<ClientRuntime>,
+    ) -> impl Future<Output = anyhow::Result<TunnelEnds<Self::R, Self::W>>> + Send;
+
+    /// Best-effort upkeep of one live tunnel (bond links topped up toward
+    /// the configured count). Called by the maintainer on its rounds.
+    fn maintain_tunnel(
+        &self,
+        _rt: &Arc<ClientRuntime>,
+        _tunnel: &Arc<Tunnel>,
+    ) -> impl Future<Output = ()> + Send {
+        async {}
+    }
+}
+
+/// Plain single-socket tunnel dialer (latency path).
+pub struct PlainDialer;
+
+impl TunnelDialer for PlainDialer {
+    type R = tokio::net::tcp::OwnedReadHalf;
+    type W = tokio::net::tcp::OwnedWriteHalf;
+
+    async fn dial(&self, rt: &Arc<ClientRuntime>) -> anyhow::Result<TunnelEnds<Self::R, Self::W>> {
+        let (session, io) = dial(rt).await?;
+        let id = session.session_id();
+        io.set_nonblocking(true).context("nonblocking mode")?;
+        let sock = tokio::net::TcpStream::from_std(io).context("tunnel stream from_std")?;
+        let (stx, srx) = session.split();
+        let (rh, wh) = sock.into_split();
+        Ok(TunnelEnds {
+            reader: FrameReader::new(srx, rh),
+            writer: TxWire::Session(Box::new(stx)),
+            write: wh,
+            id,
+            teardown: None,
+            ctx: None,
+        })
+    }
+}
+
+/// Pool of mux tunnels plus the notifications that coordinate waiters.
+pub struct Pool<D: TunnelDialer> {
     rt: Arc<ClientRuntime>,
+    dialer: Arc<D>,
+    params: PoolParams,
     inner: Arc<PoolInner>,
 }
 
@@ -82,13 +173,26 @@ struct PoolInner {
     died: Notify,
 }
 
-impl Pool {
+impl<D: TunnelDialer> Clone for Pool<D> {
+    fn clone(&self) -> Self {
+        Self {
+            rt: Arc::clone(&self.rt),
+            dialer: Arc::clone(&self.dialer),
+            params: self.params.clone(),
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<D: TunnelDialer> Pool<D> {
     /// Creates the pool and spawns its maintainer (unless pooling is
     /// disabled with `pool_size = 0`). Must be called on the runtime.
     #[must_use]
-    pub fn new(rt: &Arc<ClientRuntime>) -> Self {
+    pub fn new(rt: &Arc<ClientRuntime>, dialer: D, params: PoolParams) -> Self {
         let pool = Self {
             rt: Arc::clone(rt),
+            dialer: Arc::new(dialer),
+            params,
             inner: Arc::new(PoolInner {
                 tunnels: Mutex::new(Vec::new()),
                 dialing: AtomicU32::new(0),
@@ -96,8 +200,13 @@ impl Pool {
                 died: Notify::new(),
             }),
         };
-        if rt.pool_size > 0 {
-            tokio::spawn(maintain(Arc::clone(&pool.inner), Arc::clone(rt)));
+        if pool.params.pool_size > 0 {
+            tokio::spawn(maintain(
+                Arc::clone(&pool.inner),
+                Arc::clone(rt),
+                Arc::clone(&pool.dialer),
+                pool.params.clone(),
+            ));
         }
         pool
     }
@@ -119,7 +228,7 @@ impl Pool {
     /// `connect_timeout`.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn open_stream(&self, addr: &ProxyAddr) -> anyhow::Result<Stream> {
-        if self.rt.pool_size == 0 {
+        if self.params.pool_size == 0 {
             return self.open_dedicated(addr).await;
         }
         // The pool-wait phase is bounded once, from entry; every dial and
@@ -146,9 +255,8 @@ impl Pool {
                         .is_err()
                 {
                     anyhow::bail!(
-                        "no pool tunnel to {}:{} within {}",
-                        self.rt.server_host.to_display(),
-                        self.rt.server_port,
+                        "no pool tunnel to {} within {}",
+                        self.params.target,
                         fmt_duration(self.rt.connect_timeout),
                     );
                 }
@@ -173,8 +281,8 @@ impl Pool {
     /// Dials a tunnel dedicated to this one stream (pooling disabled) and
     /// runs the OPEN on it. Dedicated tunnels die with their single stream.
     async fn open_dedicated(&self, addr: &ProxyAddr) -> anyhow::Result<Stream> {
-        let (session, io) = dial(&self.rt).await?;
-        let tunnel = spawn_tunnel(session, io, Weak::new())?;
+        let ends = self.dialer.dial(&self.rt).await?;
+        let tunnel = spawn_tunnel(ends, Weak::new());
         match tunnel.open(addr, self.rt.connect_timeout).await {
             Ok(stream) => Ok(stream),
             Err(e) => {
@@ -195,7 +303,7 @@ impl Pool {
             .lock()
             .unwrap()
             .iter()
-            .filter(|t| t.alive() && t.streams.load(Ordering::Relaxed) < self.rt.max_streams)
+            .filter(|t| t.alive() && t.streams.load(Ordering::Relaxed) < self.params.max_streams)
             .min_by_key(|t| t.streams.load(Ordering::Relaxed))
             .cloned()
     }
@@ -224,6 +332,10 @@ pub struct Tunnel {
     /// Reader task handle; dedicated tunnels abort it when their stream
     /// ends. Pooled tunnels are reaped by the maintainer instead.
     reader: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Runs when the tunnel is killed (aggregator teardown).
+    teardown: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Dialer-private state (see [`TunnelEnds::ctx`]).
+    pub ctx: Mutex<Option<Box<dyn Any + Send + Sync>>>,
     /// Back-reference for death notification (`Weak::new()` on dedicated
     /// tunnels, which are never pooled).
     pool: Weak<PoolInner>,
@@ -248,12 +360,16 @@ impl Tunnel {
     }
 
     /// Immediate teardown for tunnels that must not outlive their purpose:
-    /// [`Self::mark_dead`], then abort the reader task. The tunnel struct
-    /// dies with its last Arc; dropping it drops the outbound channel,
-    /// which ends the writer with a socket shutdown — so the connection
-    /// closes without any further help. Idempotent.
+    /// [`Self::mark_dead`], the dialer teardown hook, then abort the
+    /// reader task. The tunnel struct dies with its last Arc; dropping it
+    /// drops the outbound channel, which ends the writer with a socket
+    /// shutdown — so the connection closes without any further help.
+    /// Idempotent.
     fn kill(&self) {
         self.mark_dead();
+        if let Some(teardown) = self.teardown.lock().unwrap().take() {
+            teardown();
+        }
         if let Some(reader) = self.reader.lock().unwrap().take() {
             reader.abort();
         }
@@ -391,16 +507,29 @@ impl Drop for Stream {
 /// Dials one tunnel with `connect_retries` attempts on routine transport
 /// failures (each attempt a fresh TCP connection; DNS hits the cache).
 async fn dial(rt: &Arc<ClientRuntime>) -> anyhow::Result<(Session, TcpStream)> {
+    let host = rt.server_host.clone();
+    let port = rt.server_port;
+    dial_endpoint(rt, &host, port).await
+}
+
+/// Shared dial body: retries routine failures toward any endpoint (plain
+/// server or bond link listener).
+pub(crate) async fn dial_endpoint(
+    rt: &Arc<ClientRuntime>,
+    host: &Host,
+    port: u16,
+) -> anyhow::Result<(Session, TcpStream)> {
     let rt = Arc::clone(rt);
-    tokio::task::spawn_blocking(move || dial_sync(&rt))
+    let host = host.clone();
+    tokio::task::spawn_blocking(move || dial_sync(&rt, &host, port))
         .await
         .context("dial task join")?
 }
 
-fn dial_sync(rt: &ClientRuntime) -> anyhow::Result<(Session, TcpStream)> {
+fn dial_sync(rt: &ClientRuntime, host: &Host, port: u16) -> anyhow::Result<(Session, TcpStream)> {
     let mut attempt = 0u32;
     loop {
-        match dial_once(rt) {
+        match dial_once(rt, host, port) {
             Ok(v) => return Ok(v),
             Err(e) => {
                 if attempt >= rt.connect_retries || !retryable(&e) {
@@ -409,8 +538,8 @@ fn dial_sync(rt: &ClientRuntime) -> anyhow::Result<(Session, TcpStream)> {
                 attempt += 1;
                 debug!(
                     "tunnel dial to {}:{} failed ({e:#}); retry {attempt}/{}",
-                    rt.server_host.to_display(),
-                    rt.server_port,
+                    host.to_display(),
+                    port,
                     rt.connect_retries,
                 );
             },
@@ -418,16 +547,10 @@ fn dial_sync(rt: &ClientRuntime) -> anyhow::Result<(Session, TcpStream)> {
     }
 }
 
-fn dial_once(rt: &ClientRuntime) -> anyhow::Result<(Session, TcpStream)> {
+fn dial_once(rt: &ClientRuntime, host: &Host, port: u16) -> anyhow::Result<(Session, TcpStream)> {
     let started = Instant::now();
-    let stream = pump::tcp_connect(&rt.server_host, rt.server_port, rt.connect_timeout, &rt.dns)
-        .with_context(|| {
-            format!(
-                "connect server {}:{}",
-                rt.server_host.to_display(),
-                rt.server_port
-            )
-        })?;
+    let stream = pump::tcp_connect(host, port, rt.connect_timeout, &rt.dns)
+        .with_context(|| format!("connect server {}:{}", host.to_display(), port))?;
     pump::nodelay(&stream);
     // Bound the whole handshake exchange by the connect timeout.
     stream.set_read_timeout(Some(rt.connect_timeout))?;
@@ -441,8 +564,8 @@ fn dial_once(rt: &ClientRuntime) -> anyhow::Result<(Session, TcpStream)> {
     let sid = tx.session_id();
     debug!(
         "pool tunnel {sid:016x} to {}:{} handshaked in {}",
-        rt.server_host.to_display(),
-        rt.server_port,
+        host.to_display(),
+        port,
         fmt_duration(started.elapsed()),
     );
     Ok(tx.into_session())
@@ -464,21 +587,16 @@ fn retryable(err: &anyhow::Error) -> bool {
     })
 }
 
-/// Splits a dialed session into the writer/reader task pair of a tunnel.
-fn spawn_tunnel(
-    session: Session,
-    io: TcpStream,
-    pool: Weak<PoolInner>,
-) -> anyhow::Result<Arc<Tunnel>> {
-    io.set_nonblocking(true).context("nonblocking mode")?;
-    let sock = tokio::net::TcpStream::from_std(io).context("tunnel stream from_std")?;
-    let id = session.session_id();
-    let (stx, srx) = session.split();
-    let (rh, wh) = sock.into_split();
+/// Splits dialed tunnel ends into the writer/reader task pair of a tunnel.
+fn spawn_tunnel<R, W>(ends: TunnelEnds<R, W>, pool: Weak<PoolInner>) -> Arc<Tunnel>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let (out_tx, out_rx) = mpsc::channel(OUTBOUND_BOUND);
-    let writer = tokio::spawn(tunnel::run_writer(stx, wh, out_rx));
+    let writer = tokio::spawn(run_writer(ends.writer, ends.write, out_rx));
     let tunnel = Arc::new(Tunnel {
-        id,
+        id: ends.id,
         out: out_tx,
         registry: Mutex::new(HashMap::new()),
         pending: Mutex::new(HashMap::new()),
@@ -486,22 +604,20 @@ fn spawn_tunnel(
         streams: AtomicU32::new(0),
         alive: AtomicBool::new(true),
         reader: Mutex::new(None),
+        teardown: Mutex::new(ends.teardown),
+        ctx: Mutex::new(ends.ctx),
         pool,
     });
-    let reader = tokio::spawn(run_reader(
-        Arc::clone(&tunnel),
-        FrameReader::new(srx, rh),
-        writer,
-    ));
+    let reader = tokio::spawn(run_reader(Arc::clone(&tunnel), ends.reader, writer));
     *tunnel.reader.lock().unwrap() = Some(reader);
-    Ok(tunnel)
+    tunnel
 }
 
 /// Tunnel reader task: demultiplexes frames into OPEN replies and
 /// per-stream events.
-async fn run_reader(
+async fn run_reader<R: AsyncRead + Unpin>(
     tunnel: Arc<Tunnel>,
-    mut reader: FrameReader<tokio::net::tcp::OwnedReadHalf>,
+    mut reader: FrameReader<R>,
     mut writer: tokio::task::JoinHandle<()>,
 ) {
     let subject = format!("tunnel {:016x}", tunnel.id);
@@ -576,18 +692,31 @@ async fn route_event(tunnel: &Tunnel, sid: StreamId, ev: StreamEvent) {
 
 /// Pool maintainer: keeps `pool_size` live tunnels. Refill rounds are
 /// paced by DIAL_RETRY_DELAY so a dead server cannot spin the dial loop;
-/// a tunnel death wakes the maintainer immediately.
-async fn maintain(inner: Arc<PoolInner>, rt: Arc<ClientRuntime>) {
+/// a tunnel death wakes the maintainer immediately. Each round also lets
+/// the dialer upkeep live tunnels (bond link top-up), so a lost link is
+/// replaced within at most MAINTAIN_IDLE_SLEEP.
+async fn maintain<D: TunnelDialer>(
+    inner: Arc<PoolInner>,
+    rt: Arc<ClientRuntime>,
+    dialer: Arc<D>,
+    params: PoolParams,
+) {
     loop {
-        let live = {
+        // Upkeep outside the lock: a top-up dial can await for seconds and
+        // must not stall pool readers.
+        let live: Vec<Arc<Tunnel>> = {
             let mut tunnels = inner.tunnels.lock().unwrap();
             tunnels.retain(|t| t.alive());
-            u32::try_from(tunnels.len()).unwrap_or(u32::MAX)
+            tunnels.clone()
         };
+        for t in &live {
+            dialer.maintain_tunnel(&rt, t).await;
+        }
+        let live = u32::try_from(live.len()).unwrap_or(u32::MAX);
         // In-flight dials count towards the target: without this, a dial
         // completing mid-round makes the next round spawn one too many.
         let dialing = inner.dialing.load(Ordering::Relaxed);
-        let short = rt.pool_size.saturating_sub(live + dialing);
+        let short = params.pool_size.saturating_sub(live + dialing);
         if short == 0 {
             tokio::select! {
                 () = inner.died.notified() => {},
@@ -598,16 +727,15 @@ async fn maintain(inner: Arc<PoolInner>, rt: Arc<ClientRuntime>) {
         for _ in 0..short {
             let inner = Arc::clone(&inner);
             let rt = Arc::clone(&rt);
+            let dialer = Arc::clone(&dialer);
             inner.dialing.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(async move {
                 let _dialing = DialingGuard(&inner);
-                match dial(&rt).await {
-                    Ok((session, io)) => match spawn_tunnel(session, io, Arc::downgrade(&inner)) {
-                        Ok(tunnel) => {
-                            inner.tunnels.lock().unwrap().push(tunnel);
-                            inner.added.notify_waiters();
-                        },
-                        Err(e) => debug!("pool tunnel setup failed: {e:#}"),
+                match dialer.dial(&rt).await {
+                    Ok(ends) => {
+                        let tunnel = spawn_tunnel(ends, Arc::downgrade(&inner));
+                        inner.tunnels.lock().unwrap().push(tunnel);
+                        inner.added.notify_waiters();
                     },
                     Err(e) => debug!("pool dial failed: {e:#}"),
                 }

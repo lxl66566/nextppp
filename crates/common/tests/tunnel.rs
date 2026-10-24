@@ -11,10 +11,10 @@
 use std::{net::TcpListener, thread};
 
 use nextppp_common::{
-    mux::{FrameKind, parse_frame},
-    tunnel::{FrameReader, OutFrame, run_writer},
+    mux::{FrameKind, encode_varint, parse_frame},
+    tunnel::{FrameReader, OutFrame, TxWire, run_writer},
 };
-use nextppp_core::{ObfuscationKey, SessionRx, SessionTx, Transmission};
+use nextppp_core::{Error, ObfuscationKey, SessionRx, SessionTx, Transmission};
 use tokio::sync::mpsc;
 
 /// Handshakes a loopback pair and returns both ends as split async
@@ -56,7 +56,7 @@ async fn writer_reader_roundtrip_mixed_sizes() {
     drop(c_rd);
 
     let (out_tx, out_rx) = mpsc::channel::<OutFrame>(256);
-    let writer = tokio::spawn(run_writer(c_txs, c_wr, out_rx));
+    let writer = tokio::spawn(run_writer(TxWire::Session(Box::new(c_txs)), c_wr, out_rx));
     let mut reader = FrameReader::new(s_rxs, s_rd);
 
     let payloads: Vec<Vec<u8>> = vec![
@@ -98,7 +98,7 @@ async fn backlog_is_batched_but_order_preserved() {
     const N: u32 = 500;
 
     let (out_tx, out_rx) = mpsc::channel::<OutFrame>(4096);
-    tokio::spawn(run_writer(c_txs, c_wr, out_rx));
+    tokio::spawn(run_writer(TxWire::Session(Box::new(c_txs)), c_wr, out_rx));
     let mut reader = FrameReader::new(s_rxs, s_rd);
 
     for i in 0..N {
@@ -128,8 +128,8 @@ async fn bidirectional_simultaneous() {
 
     let (c_tx, c_rx) = mpsc::channel::<OutFrame>(256);
     let (s_tx, s_rx) = mpsc::channel::<OutFrame>(256);
-    tokio::spawn(run_writer(c_txs, c_wr, c_rx));
-    tokio::spawn(run_writer(s_txs, s_wr, s_rx));
+    tokio::spawn(run_writer(TxWire::Session(Box::new(c_txs)), c_wr, c_rx));
+    tokio::spawn(run_writer(TxWire::Session(Box::new(s_txs)), s_wr, s_rx));
     let mut client_reader = FrameReader::new(c_rxs, c_rd);
     let mut server_reader = FrameReader::new(s_rxs, s_rd);
 
@@ -156,4 +156,75 @@ async fn bidirectional_simultaneous() {
     });
     up.await.unwrap();
     down.await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Prefix framing (bonded carriers): mux messages with a varint length
+// prefix over an already decrypted byte stream.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn prefix_framing_roundtrip_and_clean_eof() {
+    let (a, b) = tokio::io::duplex(4096);
+    let (a_r, a_w) = tokio::io::split(a);
+    let (b_r, _b_w) = tokio::io::split(b);
+    drop(a_r);
+
+    let (out_tx, out_rx) = mpsc::channel::<OutFrame>(256);
+    let writer = tokio::spawn(run_writer(TxWire::Prefix, a_w, out_rx));
+    let mut reader = FrameReader::prefix(b_r);
+
+    let payloads: Vec<Vec<u8>> = vec![
+        b"one".to_vec(),
+        vec![0x55; 16 * 1024],
+        b"three".to_vec(),
+        vec![0xaa; 60_000],
+    ];
+    for (i, p) in (1u32..).zip(payloads.iter()) {
+        out_tx
+            .send(OutFrame::new(FrameKind::Data, i, p.clone()))
+            .await
+            .unwrap();
+    }
+    for (i, p) in payloads.iter().enumerate() {
+        let msg = reader.next().await.unwrap().expect("frame");
+        let (kind, sid, payload) = parse_frame(&msg).unwrap();
+        assert_eq!(
+            (kind, sid, payload),
+            (FrameKind::Data, i as u32 + 1, &p[..])
+        );
+    }
+
+    drop(out_tx);
+    writer.await.unwrap();
+    assert_eq!(reader.next().await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn prefix_rejects_malformed_lengths() {
+    use tokio::io::AsyncWriteExt;
+
+    async fn first_error(bytes: &[u8]) -> Error {
+        let (a, b) = tokio::io::duplex(64);
+        let (_a_r, mut a_w) = tokio::io::split(a);
+        let (b_r, _b_w) = tokio::io::split(b);
+        let mut reader = FrameReader::prefix(b_r);
+        a_w.write_all(bytes).await.unwrap();
+        reader.next().await.unwrap_err()
+    }
+
+    // Zero-length message.
+    assert!(matches!(first_error(&[0x00]).await, Error::ZeroLength));
+    // Varint that can never decode into u32.
+    assert!(matches!(
+        first_error(&[0xff, 0xff, 0xff, 0xff, 0x1f]).await,
+        Error::InvalidFrame
+    ));
+    // Length beyond the frame cap.
+    let mut oversize = [0u8; 5];
+    let n = encode_varint(200_000, &mut oversize);
+    assert!(matches!(
+        first_error(&oversize[..n]).await,
+        Error::FrameTooLarge { .. }
+    ));
 }

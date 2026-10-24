@@ -309,13 +309,13 @@ where
     E: BlockCipherEncrypt + BlockSizeUser<BlockSize = U16>,
 {
     let mut fb: Block = (*iv).into();
-    let mut chunks = data.chunks_exact_mut(16);
-    for chunk in &mut chunks {
+    let (chunks, tail) = data.as_chunks_mut::<16>();
+    for chunk in chunks {
         cipher.encrypt_block(&mut fb);
         let ct = xor16_store(chunk, &fb);
         fb.copy_from_slice(&ct);
     }
-    xor_tail(cipher, &fb, chunks.into_remainder());
+    xor_tail(cipher, &fb, tail);
 }
 
 /// XORs `ks` into the 16-byte `chunk` in place and returns the result (the

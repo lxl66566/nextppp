@@ -150,13 +150,12 @@ pub fn delta_decode(data: &mut [u8], kf: u32) {
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn masked_xor_random_next(data: &mut [u8], kf: u32) {
     let mut kf = lcg_next(&mut { kf });
-    let mut chunks = data.chunks_exact_mut(4);
-    for word in &mut chunks {
-        let v = u32::from_le_bytes(word.try_into().expect("chunk is 4 bytes")) ^ kf;
-        word.copy_from_slice(&v.to_le_bytes());
+    let (chunks, rest) = data.as_chunks_mut::<4>();
+    for word in chunks {
+        let v = u32::from_le_bytes(*word) ^ kf;
+        *word = v.to_le_bytes();
         kf = lcg_next(&mut kf);
     }
-    let rest = chunks.into_remainder();
     if rest.len() >= 2 {
         let v = u16::from_le_bytes([rest[0], rest[1]]) ^ kf as u16;
         rest[0..2].copy_from_slice(&v.to_le_bytes());

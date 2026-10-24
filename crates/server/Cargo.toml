@@ -12,6 +12,7 @@ repository.workspace   = true
 license.workspace      = true
 
 [dependencies]
+aggligator     = { workspace = true }
 anyhow         = { workspace = true }
 hotpath        = { workspace = true, optional = true }
 nextppp-common = { workspace = true }

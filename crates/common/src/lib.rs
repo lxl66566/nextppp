@@ -10,6 +10,7 @@ pub mod addr;
 pub mod config;
 pub mod dns;
 pub mod fmt;
+pub mod link;
 pub mod listen;
 pub mod mux;
 pub mod proto;
@@ -18,6 +19,9 @@ pub mod shutdown;
 pub mod tunnel;
 
 pub use addr::{Host, ProxyAddr};
-pub use config::{ClientConfig, ConfigError, ObfuscationConfig, ServerConfig};
+pub use config::{
+    BondClientSection, BondServerSection, ClientConfig, ConfigError, ObfuscationConfig,
+    ServerConfig,
+};
 pub use fmt::{fmt_bytes, fmt_duration};
 pub use proto::{STATUS_OK, STATUS_REFUSED};

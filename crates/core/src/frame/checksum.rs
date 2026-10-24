@@ -10,11 +10,11 @@
 #[must_use]
 pub fn inet_chksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
-    let mut words = data.chunks_exact(2);
-    for w in &mut words {
-        sum += u32::from(u16::from_be_bytes([w[0], w[1]]));
+    let (words, tail) = data.as_chunks::<2>();
+    for w in words {
+        sum += u32::from(u16::from_be_bytes(*w));
     }
-    if let [b] = words.remainder() {
+    if let [b] = tail {
         sum += u32::from(*b) << 8;
     }
     while sum >> 16 != 0 {

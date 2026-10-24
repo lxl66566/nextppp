@@ -114,6 +114,7 @@ fn start_server(cpu: usize) -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     let cfg = ServerConfig {
         listen: addr.to_string(),
+        bond: None,
         password: None,
         connect_timeout: 5,
         handshake_timeout: 10,
@@ -127,7 +128,7 @@ fn start_server(cpu: usize) -> SocketAddr {
         .name(format!("throughput-server@{cpu}"))
         .spawn(move || {
             pin_thread(cpu);
-            nextppp_server::serve(listener, rt).unwrap();
+            nextppp_server::serve(listener, None, rt).unwrap();
         })
         .unwrap();
     addr
@@ -139,10 +140,12 @@ fn start_client(cpu: usize, server: SocketAddr) -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     let cfg = ClientConfig {
         listen: addr.to_string(),
+        bond: None,
         password: None,
         max_connections: None,
         server: ServerSection {
             address: server.to_string(),
+            bond_address: None,
             connect_timeout: 5,
             connect_retries: 0,
             // One stream in flight; a single tunnel keeps the measurement
@@ -160,7 +163,7 @@ fn start_client(cpu: usize, server: SocketAddr) -> SocketAddr {
         .name(format!("throughput-client@{cpu}"))
         .spawn(move || {
             pin_thread(cpu);
-            nextppp_client::serve(listener, rt).unwrap();
+            nextppp_client::serve(listener, None, rt).unwrap();
         })
         .unwrap();
     addr

@@ -53,6 +53,24 @@ nextppp client -c nextppp-client.jsonc
 - `password` 部署时必须修改（仍为内置占位符时启动会告警）。
 - 配置文件为 jsonc，支持注释与尾逗号。
 
+## 多链路聚合（bond）
+
+服务端配置可选的 `bond` 监听（如 `"bond": { "listen": "0.0.0.0:6667" }`），
+客户端再配置可选的 `bond` 入站与 `server.bond_address`，即得到**两个本地 SOCKS5 入站**：
+
+- `listen`（延迟路径）：普通单连接隧道。聚合会引入跨链路的调度与重组开销，
+  交互流量（网页、游戏、ssh）留在这一路最优。
+- `bond.listen`（带宽路径）：每条隧道由 `links` 条 nextppp 链路聚合而成
+  （[aggligator](https://github.com/remoc-rs/aggligator)，运行在 nextppp 加密流内部）。
+  单流 TCP 受丢包/RTT 限制时，多链路条带化可成倍提升吞吐，且单条链路断开
+  时未确认数据自动经其余链路重发，隧道不中断。
+
+链路本身就是普通的 nextppp 会话，线上流量与普通隧道无法区分，聚合协议
+全部运行在链路加密之内，不引入新的 DPI 特征。
+
+在 sing-box 里配置两个 socks outbound（分别指向两个入站），按规则把大带宽
+流量（下载、测速、视频）路由到 bond 入站，其余走默认入站即可。
+
 ## 其他
 
 - 日志级别通过 `SPDLOG_RS_LEVEL` 环境变量控制（`debug` / `trace` / `off`），默认 `info`。

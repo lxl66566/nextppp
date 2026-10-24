@@ -74,9 +74,9 @@ mod arch {
         // vectorizable with a one-byte cross-block shift.
         let keep15 = unsafe { _mm_loadu_si128(KEEP15.as_ptr().cast()) };
         let lane0 = unsafe { _mm_loadu_si128(LANE0.as_ptr().cast()) };
-        let mut chunks = data[1..].chunks_exact_mut(16);
+        let (chunks, tail) = data[1..].as_chunks_mut::<16>();
         let mut prev = orig0;
-        for c in &mut chunks {
+        for c in chunks {
             // SAFETY: chunk length is exactly 16 bytes.
             let v = unsafe { _mm_loadu_si128(c.as_ptr().cast()) };
             let shifted = unsafe {
@@ -89,7 +89,7 @@ mod arch {
             prev = (unsafe { _mm_extract_epi16(v, 7) } >> 8) as u8;
         }
         let mut p = prev;
-        for b in chunks.into_remainder() {
+        for b in tail {
             let cur = *b;
             *b = cur.wrapping_sub(p);
             p = cur;
@@ -109,9 +109,9 @@ mod arch {
         // Steele, 4 shift-add steps per 16 lanes) with a cross-block carry
         // folded into lane 0.
         let lane0 = unsafe { _mm_loadu_si128(LANE0.as_ptr().cast()) };
-        let mut chunks = data[1..].chunks_exact_mut(16);
+        let (chunks, tail) = data[1..].as_chunks_mut::<16>();
         let mut carry = d0;
-        for c in &mut chunks {
+        for c in chunks {
             // SAFETY: chunk length is exactly 16 bytes.
             let mut v = unsafe { _mm_loadu_si128(c.as_ptr().cast()) };
             v = unsafe { _mm_add_epi8(v, _mm_and_si128(_mm_set1_epi8(carry as i8), lane0)) };
@@ -123,7 +123,7 @@ mod arch {
             carry = (unsafe { _mm_extract_epi16(v, 7) } >> 8) as u8;
         }
         let mut acc = carry;
-        for b in chunks.into_remainder() {
+        for b in tail {
             acc = acc.wrapping_add(*b);
             *b = acc;
         }
@@ -162,9 +162,9 @@ mod arch {
         if data.len() < 2 {
             return;
         }
-        let mut chunks = data[1..].chunks_exact_mut(16);
+        let (chunks, tail) = data[1..].as_chunks_mut::<16>();
         let mut prev = orig0;
-        for c in &mut chunks {
+        for c in chunks {
             // SAFETY: chunk length is exactly 16 bytes.
             let v = unsafe { vld1q_u8(c.as_ptr()) };
             let mut shifted = unsafe { shl1(v) };
@@ -173,7 +173,7 @@ mod arch {
             prev = unsafe { vgetq_lane_u8(v, 15) };
         }
         let mut p = prev;
-        for b in chunks.into_remainder() {
+        for b in tail {
             let cur = *b;
             *b = cur.wrapping_sub(p);
             p = cur;
@@ -195,9 +195,9 @@ mod arch {
         // from every output lane — this backend never compiled before, so
         // that bug had gone unnoticed).
         let lane0 = unsafe { vld1q_u8(LANE0.as_ptr()) };
-        let mut chunks = data[1..].chunks_exact_mut(16);
+        let (chunks, tail) = data[1..].as_chunks_mut::<16>();
         let mut carry = d0;
-        for c in &mut chunks {
+        for c in chunks {
             // SAFETY: chunk length is exactly 16 bytes.
             let mut v = unsafe { vld1q_u8(c.as_ptr()) };
             v = unsafe { vaddq_u8(v, vandq_u8(vdupq_n_u8(carry), lane0)) };

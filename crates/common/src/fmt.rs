@@ -43,6 +43,8 @@ mod tests {
     use super::*;
 
     #[test]
+    // from_days is not stable; day-scale seconds are the clearest form here.
+    #[allow(clippy::duration_suboptimal_units)]
     fn bytes_and_durations_render() {
         assert_eq!(fmt_bytes(0), "0 B");
         assert_eq!(fmt_bytes(512), "512 B");

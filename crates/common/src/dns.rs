@@ -72,10 +72,10 @@ impl DnsCache {
         let now = Instant::now();
         {
             let map = self.map.read().expect("dns cache poisoned");
-            if let Some(entry) = map.get(domain) {
-                if entry.expires > now {
-                    return clone_result(&entry.result);
-                }
+            if let Some(entry) = map.get(domain)
+                && entry.expires > now
+            {
+                return clone_result(&entry.result);
             }
         }
 
