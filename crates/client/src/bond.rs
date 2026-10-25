@@ -10,7 +10,10 @@
 //! `no_link_timeout` kills the channel, after which the pool redials a
 //! fresh tunnel.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use aggligator::{
     alc::{ReceiverStream, SenderSink},
@@ -89,6 +92,17 @@ impl TunnelDialer for BondDialer {
             control.terminate();
             anyhow::bail!("all {} bond links failed to {}", bond.links, bond.target);
         }
+        // The aggregator registers links with `Control::links` only
+        // eventually: wait until every freshly added link is visible
+        // (bounded) before the tunnel enters the pool, so a maintainer
+        // round firing right after this dial cannot undercount the links
+        // and top up past `bond.links`.
+        let settled = Instant::now() + Duration::from_millis(250);
+        while u32::try_from(control.links().len()).unwrap_or(u32::MAX) < live
+            && Instant::now() < settled
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         // Every failure path below must terminate the aggregator: links
         // already added would otherwise linger on both ends until the
         // aggregator's default 300 s termination timeout fires.
@@ -139,9 +153,21 @@ impl TunnelDialer for BondDialer {
             .expect("bond dialer requires bond runtime params");
         let control = tunnel_link_control(tunnel);
         let Some(control) = control else { return };
-        let missing = bond
+        let mut missing = bond
             .links
             .saturating_sub(u32::try_from(control.links().len()).unwrap_or(0));
+        if missing > 0 {
+            // Second look after a grace period: `Control::links` is
+            // eventually consistent, so a round racing a fresh dial would
+            // undercount and overshoot `bond.links`.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if !tunnel.alive() {
+                return;
+            }
+            missing = bond
+                .links
+                .saturating_sub(u32::try_from(control.links().len()).unwrap_or(0));
+        }
         for _ in 0..missing {
             match dial_link(rt).await {
                 Ok((read, write, tag)) => {
