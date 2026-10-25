@@ -142,6 +142,12 @@ mod arch {
     /// constant, hence one monomorphization per shift distance.
     macro_rules! shl_bytes {
         ($name:ident, $k:literal) => {
+            /// Byte-shifts the vector up by this monomorphization's shift
+            /// distance.
+            ///
+            /// # Safety
+            ///
+            /// No contract: pure lane arithmetic, dereferences no memory.
             #[inline]
             unsafe fn $name(v: uint8x16_t) -> uint8x16_t {
                 unsafe { vextq_u8(vdupq_n_u8(0), v, 16 - $k) }
@@ -209,7 +215,7 @@ mod arch {
             carry = unsafe { vgetq_lane_u8(v, 15) };
         }
         let mut acc = carry;
-        for b in chunks.into_remainder() {
+        for b in tail {
             acc = acc.wrapping_add(*b);
             *b = acc;
         }
