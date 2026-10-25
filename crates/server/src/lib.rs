@@ -36,7 +36,7 @@ use nextppp_common::{
     pump, shutdown,
     tunnel::{self, FrameReader, OutFrame, STREAM_SEND_TIMEOUT, StreamEvent, TxWire},
 };
-use nextppp_core::{ObfuscationKey, Session, Transmission};
+use nextppp_core::{ObfuscationKey, Session, SessionRole, Transmission};
 use rand::Rng;
 use spdlog::prelude::*;
 use tokio::{io::AsyncRead, sync::mpsc};
@@ -72,6 +72,8 @@ pub struct ServerRuntime {
     pub max_handshakes: Option<u64>,
     /// Maximum mux streams per tunnel (`None` = unlimited).
     pub max_streams_per_conn: Option<u64>,
+    /// Accept bond-link sessions declared in the handshake (`bond_enabled`).
+    pub allow_bond: bool,
     /// Target DNS cache: collapses per-stream `getaddrinfo` bursts into a
     /// single lookup per TTL window.
     pub dns: Arc<nextppp_common::dns::DnsCache>,
@@ -97,6 +99,7 @@ impl ServerRuntime {
             max_connections: cfg.max_connections,
             max_handshakes: cfg.max_handshakes,
             max_streams_per_conn: cfg.max_streams_per_conn,
+            allow_bond: cfg.bond_enabled,
             dns: Arc::new(nextppp_common::dns::DnsCache::new()),
         })
     }
@@ -162,23 +165,25 @@ fn should_log_failure(n: u64) -> bool {
 /// every channel, which breaks every pump out of its `select!`.
 type Registry = Arc<Mutex<HashMap<StreamId, mpsc::Sender<StreamEvent>>>>;
 
-/// Accept loop; blocks the calling thread forever. `bond_listener`, when
-/// present, additionally accepts link connections of bonded tunnels (see
-/// [`bond`]).
+/// Accept loop; blocks the calling thread forever. One listen port serves
+/// both session roles: plain mux tunnels and bond links (aggregated-tunnel
+/// members), declared by the client in the handshake and routed after it
+/// (see [`bond`]).
 ///
 /// # Errors
 ///
 /// Fatal listener failure.
 // `serve` owns the listener: it lives exactly as long as the accept loop.
 #[allow(clippy::needless_pass_by_value)]
-pub fn serve(
-    listener: std::net::TcpListener,
-    bond_listener: Option<std::net::TcpListener>,
-    rt: ServerRuntime,
-) -> anyhow::Result<()> {
+pub fn serve(listener: std::net::TcpListener, rt: ServerRuntime) -> anyhow::Result<()> {
     info!(
-        "nextppp server listening on {}",
-        listener.local_addr()?.to_string()
+        "nextppp server listening on {} (bond links {})",
+        listener.local_addr()?.to_string(),
+        if rt.allow_bond {
+            "enabled"
+        } else {
+            "disabled"
+        },
     );
     let stats: Arc<ServerStats> = Arc::new(ServerStats::default());
     listener.set_nonblocking(true)?;
@@ -192,14 +197,6 @@ pub fn serve(
             tokio::net::TcpListener::from_std(listener).context("convert listener to tokio")?;
         shutdown::install(listener.local_addr()?);
         spawn_heartbeat(Arc::clone(&stats));
-        if let Some(bond) = bond_listener {
-            bond.set_nonblocking(true)
-                .context("bond listener nonblocking")?;
-            let bond = tokio::net::TcpListener::from_std(bond)
-                .context("convert bond listener to tokio")?;
-            info!("nextppp server bond listener on {}", bond.local_addr()?);
-            tokio::spawn(bond::accept_loop(bond, rt.clone(), Arc::clone(&stats)));
-        }
         accept_loop(&listener, &rt, &stats).await;
         // Drain with the runtime alive (the sleep loop must not block a
         // worker, hence spawn_blocking).
@@ -223,6 +220,14 @@ async fn accept_loop(
     rt: &ServerRuntime,
     stats: &Arc<ServerStats>,
 ) {
+    let agg = bond::new_aggregator();
+    let mut agg_listen = match agg.listen() {
+        Ok(l) => l,
+        Err(e) => {
+            warn!("bond aggregator setup failed: {e}");
+            return;
+        },
+    };
     let base = u128::from(rand::rng().next_u64()); // session ids only need uniqueness
     let counter = AtomicU64::new(0);
     loop {
@@ -257,7 +262,13 @@ async fn accept_loop(
                     if sid == 0 {
                         sid = 1;
                     }
-                    tokio::spawn(handle_conn(stream, rt.clone(), sid, Arc::clone(stats)));
+                    tokio::spawn(handle_conn(
+                        stream,
+                        rt.clone(),
+                        sid,
+                        Arc::clone(stats),
+                        agg.clone(),
+                    ));
                 },
                 Err(e) => {
                     if shutdown::requested() {
@@ -272,6 +283,15 @@ async fn accept_loop(
                         pump::log_accept_exhausted(&e);
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
+                },
+            },
+            r = agg_listen.next() => match r {
+                Ok(incoming) => {
+                    tokio::spawn(bond::run_bonded(incoming, rt.clone(), Arc::clone(stats)));
+                },
+                Err(e) => {
+                    warn!("bond aggregator listener failed: {e}");
+                    return;
                 },
             },
             () = tokio::time::sleep(SHUTDOWN_POLL) => {},
@@ -301,27 +321,26 @@ fn spawn_heartbeat(stats: Arc<ServerStats>) {
     });
 }
 
-/// Handles one tunneled connection end to end, logging its full lifecycle.
+/// Handles one accepted connection end to end, logging its full lifecycle.
 async fn handle_conn(
     stream: tokio::net::TcpStream,
     rt: ServerRuntime,
     sid: u128,
     stats: Arc<ServerStats>,
+    agg: bond::AggServer,
 ) {
-    stats.active.fetch_add(1, Ordering::Relaxed);
-    let _guard = ActiveGuard(Arc::clone(&stats));
-
     let peer = stream
         .peer_addr()
         .map_or_else(|_| String::from("?"), |a| a.to_string());
     debug!("session {sid:016x} accepted from {peer}");
 
-    if let Err(e) = Box::pin(handle_conn_inner(stream, &rt, sid, &peer, &stats)).await {
+    if let Err(e) = Box::pin(handle_conn_inner(stream, &rt, sid, &peer, &stats, agg)).await {
         debug!("session {sid:016x} ({peer}) ended: {e:#}");
     }
 }
 
-/// Handshake (blocking pool) + mux tunnel body.
+/// Handshake (blocking pool) + role routing: mux tunnel body or bond-link
+/// registration.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn handle_conn_inner(
     stream: tokio::net::TcpStream,
@@ -329,6 +348,7 @@ async fn handle_conn_inner(
     sid: u128,
     peer: &str,
     stats: &Arc<ServerStats>,
+    agg: bond::AggServer,
 ) -> anyhow::Result<()> {
     let std_stream = stream.into_std().context("tunnel stream into_std")?;
     // The handshake runs the synchronous Transmission API with timeouts on
@@ -338,12 +358,13 @@ async fn handle_conn_inner(
         .context("blocking mode for handshake")?;
     let rt2 = rt.clone();
     let handshaking = Arc::clone(stats);
+    let allow_bond = rt.allow_bond;
     let hs = tokio::task::spawn_blocking(move || {
-        handshake_sync(std_stream, &rt2, sid, &handshaking.handshaking, true)
+        handshake_sync(std_stream, &rt2, sid, &handshaking.handshaking, allow_bond)
     })
     .await
     .context("handshake task join")?;
-    let (session, io) = match hs {
+    let (session, io, role) = match hs {
         Ok(v) => v,
         Err(e) => {
             let n = stats.handshake_failures.fetch_add(1, Ordering::Relaxed) + 1;
@@ -357,22 +378,45 @@ async fn handle_conn_inner(
             return Err(e).context("handshake");
         },
     };
-    info!("session {sid:016x} ({peer}) tunnel established");
-    io.set_nonblocking(true).context("nonblocking mode")?;
-    let stream = tokio::net::TcpStream::from_std(io).context("tunnel stream from_std")?;
-    run_tunnel(session, stream, rt, sid, peer, stats).await;
+    // One active-connection slot per authenticated session — tunnel or
+    // link — until it ends. A link's slot is bound to the aggregator's
+    // ownership (see `bond::register_link`), so it outlives this call.
+    stats.active.fetch_add(1, Ordering::Relaxed);
+    match role {
+        SessionRole::MuxTunnel => {
+            info!("session {sid:016x} ({peer}) tunnel established");
+            io.set_nonblocking(true).context("nonblocking mode")?;
+            let stream = tokio::net::TcpStream::from_std(io).context("tunnel stream from_std")?;
+            let _guard = ActiveGuard(Arc::clone(stats));
+            run_tunnel(session, stream, rt, sid, peer, stats).await;
+        },
+        SessionRole::BondLink => {
+            info!("session {sid:016x} ({peer}) bond link established");
+            Box::pin(bond::register_link(
+                session,
+                io,
+                sid,
+                peer.to_owned(),
+                agg,
+                Arc::clone(stats),
+            ))
+            .await;
+        },
+    }
     Ok(())
 }
 
-/// Synchronous server handshake on the blocking pool. `mux` advertises mux
-/// support in the negotiated flag (tunnels yes, bond links no).
+/// Synchronous server handshake on the blocking pool. `allow_bond`
+/// downgrades bond-link requests to mux tunnels (echoed as refused to the
+/// client); returns the session's effective role learned from the client's
+/// ivv, so the single-port caller can route the session.
 fn handshake_sync(
     stream: TcpStream,
     rt: &ServerRuntime,
     sid: u128,
     handshaking: &AtomicU64,
-    mux: bool,
-) -> anyhow::Result<(Session, TcpStream)> {
+    allow_bond: bool,
+) -> anyhow::Result<(Session, TcpStream, SessionRole)> {
     pump::nodelay(&stream);
     // The tunnel stream is long-lived and the data plane clears all
     // timeouts; keepalive is the only dead-peer detection it has.
@@ -381,14 +425,15 @@ fn handshake_sync(
     stream.set_write_timeout(Some(rt.handshake_timeout))?;
     let mut tx = Transmission::new(stream, Arc::clone(&rt.key));
     // The handshaking gauge covers exactly the pre-auth phase.
-    {
+    let role = {
         let _guard = HandshakingGuard::new(handshaking);
-        tx.handshake_server(sid, mux)?;
-    }
+        tx.handshake_server(sid, allow_bond)?
+    };
     // Data plane: no timeouts (kernel keepalive covers dead peers).
     tx.io_mut().set_read_timeout(None)?;
     tx.io_mut().set_write_timeout(None)?;
-    Ok(tx.into_session())
+    let (session, io) = tx.into_session();
+    Ok((session, io, role))
 }
 
 /// Mux tunnel body: one writer task + this demux loop. Per-stream events

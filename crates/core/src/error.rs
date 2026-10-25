@@ -39,6 +39,12 @@ pub enum Error {
     #[error("obfuscation flags mismatch between client and server")]
     FlagsMismatch,
 
+    /// The server's session-role echo (nmux parity) does not match the role
+    /// requested in the ivv: it refuses bond links (`bond_enabled: false`
+    /// on the server), or the endpoint serves a fixed different role.
+    #[error("server refused the requested session role")]
+    RoleRefused,
+
     /// A decoded frame length exceeds the protocol ceiling.
     #[error("frame too large: {len}")]
     FrameTooLarge {
@@ -81,6 +87,7 @@ impl PartialEq for Error {
             | (Self::ChecksumMismatch, Self::ChecksumMismatch)
             | (Self::InvalidSessionId, Self::InvalidSessionId)
             | (Self::FlagsMismatch, Self::FlagsMismatch)
+            | (Self::RoleRefused, Self::RoleRefused)
             | (Self::ZeroLength, Self::ZeroLength) => true,
             (Self::HandshakeFailed(a), Self::HandshakeFailed(b))
             | (Self::InvalidConfig(a), Self::InvalidConfig(b)) => a == b,

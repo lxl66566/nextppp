@@ -47,10 +47,8 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(200);
 /// Bonded-tunnel runtime parameters (bandwidth inbound).
 #[derive(Debug, Clone)]
 pub struct BondParams {
-    /// Server bond-listener endpoint (parsed once at startup).
-    pub host: Host,
-    pub port: u16,
-    /// Link sessions per bonded tunnel.
+    /// Link sessions per bonded tunnel; links dial the server's regular
+    /// address and declare themselves in the handshake.
     pub links: u32,
     /// Bonded tunnels kept hot by the pool.
     pub pool_size: u32,
@@ -101,23 +99,12 @@ impl ClientRuntime {
         nextppp_common::ObfuscationConfig::warn_placeholder(&key);
         let (server_host, server_port) = parse_host_port(&cfg.server.address)
             .with_context(|| format!("invalid server address {:?}", cfg.server.address))?;
-        let bond = match (&cfg.bond, &cfg.server.bond_address) {
-            (Some(bond), Some(address)) => {
-                let (host, port) = parse_host_port(address)
-                    .with_context(|| format!("invalid server bond address {address:?}"))?;
-                Some(BondParams {
-                    host,
-                    port,
-                    links: bond.links,
-                    pool_size: bond.pool_size,
-                    max_streams: bond.max_streams.max(1),
-                    target: address.clone(),
-                })
-            },
-            // Bond without an address is rejected by config validation.
-            (Some(_), None) => anyhow::bail!("bond inbound requires server.bond_address"),
-            (None, _) => None,
-        };
+        let bond = cfg.bond.as_ref().map(|bond| BondParams {
+            links: bond.links,
+            pool_size: bond.pool_size,
+            max_streams: bond.max_streams.max(1),
+            target: cfg.server.address.clone(),
+        });
         Ok(Self {
             server_host,
             server_port,

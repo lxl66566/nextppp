@@ -8,7 +8,8 @@
 //! * printable base94 envelope for the whole pre-handshake stream,
 //! * randomized headers with parity-encoded filler, length obfuscation and a first-frame checksum,
 //! * NOP noise prelude and dummy handshake packets against active probing,
-//! * per-connection key derivation (`ivv`), obfuscation-flag canary,
+//! * per-connection key derivation (`ivv`), obfuscation-flag canary, session-role tag (`ivv` high
+//!   word, echoed in `nmux` parity),
 //! * masked-XOR / shuffle / delta payload transforms.
 //!
 //! Deviations (security/perf fixes, see module docs of
@@ -17,12 +18,12 @@
 //! subtractor generator, no RC4.
 //!
 //! ```no_run
-//! use nextppp_core::{ObfuscationKey, Transmission};
+//! use nextppp_core::{ObfuscationKey, SessionRole, Transmission};
 //!
 //! # fn main() -> std::io::Result<()> {
 //! let io = std::net::TcpStream::connect("1.2.3.4:1234")?;
 //! let mut tx = Transmission::new(io, ObfuscationKey::default());
-//! let (session, mux) = tx.handshake_client().unwrap();
+//! let session = tx.handshake_client(SessionRole::MuxTunnel).unwrap();
 //! tx.write(b"hello").unwrap();
 //! let reply = tx.read().unwrap();
 //! # Ok(())
@@ -40,6 +41,7 @@ pub mod transmission;
 pub use config::ObfuscationKey;
 pub use crypto::cipher::{CipherRole, Method, SessionCipher};
 pub use error::{Error, Result};
+pub use handshake::SessionRole;
 pub use session::{Session, SessionRx, SessionTx};
 pub use transmission::{Transmission, TransmissionRx, TransmissionTx};
 

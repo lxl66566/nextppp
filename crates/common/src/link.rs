@@ -282,7 +282,7 @@ pub fn bond_cfg() -> aggligator::Cfg {
 mod tests {
     use std::{io::Write as _, net::TcpListener, sync::Arc};
 
-    use nextppp_core::Transmission;
+    use nextppp_core::{SessionRole, Transmission};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
@@ -297,11 +297,11 @@ mod tests {
             let (stream, _) = listener.accept().unwrap();
             let mut s =
                 Transmission::new(stream, Arc::new(nextppp_core::ObfuscationKey::default()));
-            s.handshake_server(0x1234, false).unwrap();
+            s.handshake_server(0x1234, true).unwrap();
             s.into_session()
         });
         let mut c = Transmission::new(client, Arc::new(nextppp_core::ObfuscationKey::default()));
-        let (_sid, _mux) = c.handshake_client().unwrap();
+        c.handshake_client(SessionRole::BondLink).unwrap();
         let (cs, cio) = c.into_session();
         let (ss, sio) = server.join().unwrap();
         (cs, cio, ss, sio)

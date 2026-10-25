@@ -1,10 +1,11 @@
 //! Bonded-tunnel dialer (bandwidth path): one mux tunnel per aggregated
-//! channel, each channel striped over `links` nextppp link sessions to
-//! the server's bond listener.
+//! channel, each channel striped over `links` nextppp link sessions dialed
+//! to the server's regular listen address (links declare their role in the
+//! handshake, so one port serves both).
 //!
 //! On the wire every link is an ordinary nextppp session, so bonding adds
-//! no DPI-visible fingerprint; the aggregator's own protocol travels
-//! inside the encrypted links. A channel tolerates link loss (unacked
+//! no DPI-visible fingerprint; the aggregator's own protocol travels inside
+//! the encrypted links. A channel tolerates link loss (unacked
 //! packets are resent over surviving links) and the pool maintainer tops
 //! lost links back up; only the loss of *all* links for
 //! `no_link_timeout` kills the channel, after which the pool redials a
@@ -25,6 +26,7 @@ use nextppp_common::{
     link::{LinkReadHalf, LinkWriteHalf, bond_cfg, split_link},
     tunnel::{FrameReader, TxWire},
 };
+use nextppp_core::{Error as CoreError, SessionRole};
 use spdlog::prelude::*;
 
 use crate::{
@@ -70,6 +72,7 @@ impl TunnelDialer for BondDialer {
             link_tasks.push(tokio::spawn(async move { dial_link(&rt).await }));
         }
         let mut live = 0u32;
+        let mut refused = false;
         for task in link_tasks {
             let link = match task.await {
                 Ok(link) => link,
@@ -85,11 +88,25 @@ impl TunnelDialer for BondDialer {
                         Err(e) => debug!("bond link refused: {e}"),
                     }
                 },
-                Err(e) => debug!("bond link dial failed: {e:#}"),
+                Err(e) => {
+                    if e.chain().any(|c| {
+                        c.downcast_ref::<CoreError>()
+                            .is_some_and(|e| *e == CoreError::RoleRefused)
+                    }) {
+                        refused = true;
+                    }
+                    debug!("bond link dial failed: {e:#}");
+                },
             }
         }
         if live == 0 {
             control.terminate();
+            if refused {
+                anyhow::bail!(
+                    "server {} refused bond links (enable bond_enabled on the server)",
+                    bond.target
+                );
+            }
             anyhow::bail!("all {} bond links failed to {}", bond.links, bond.target);
         }
         // The aggregator registers links with `Control::links` only
@@ -195,16 +212,20 @@ fn tunnel_link_control(tunnel: &Arc<Tunnel>) -> Option<AggControl> {
     ctx.as_ref()?.downcast_ref::<AggControl>().cloned()
 }
 
-/// Dials one nextppp link session to the server's bond listener.
+/// Dials one nextppp link session to the server (same address as plain
+/// tunnels; the link role is declared in the handshake).
 async fn dial_link(rt: &Arc<ClientRuntime>) -> anyhow::Result<(LinkRead, LinkWrite, String)> {
-    let bond = rt
-        .bond
-        .as_ref()
-        .expect("bond dialer requires bond runtime params");
     // Per-link whole-dial-phase cap; each attempt keeps a full
     // `connect_timeout` budget (see `PlainDialer::dial`).
     let deadline = Instant::now() + rt.connect_timeout * (rt.connect_retries + 1);
-    let (session, io) = dial_endpoint(rt, &bond.host, bond.port, deadline).await?;
+    let (session, io) = dial_endpoint(
+        rt,
+        &rt.server_host,
+        rt.server_port,
+        deadline,
+        SessionRole::BondLink,
+    )
+    .await?;
     let tag = io
         .peer_addr()
         .map_or_else(|_| String::from("?"), |a| a.to_string());

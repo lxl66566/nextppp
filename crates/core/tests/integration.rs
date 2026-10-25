@@ -10,7 +10,7 @@ use std::{
     thread::scope,
 };
 
-use nextppp_core::{Error, Method, ObfuscationKey, Transmission};
+use nextppp_core::{Error, Method, ObfuscationKey, SessionRole, Transmission};
 
 // ---------------------------------------------------------------------------
 // Minimal blocking in-memory duplex pipe (std::io::duplex is still unstable).
@@ -109,18 +109,20 @@ const TEST_SID: u128 = 0x1234_5678_9abc_def0_1234_5678_9abc_def0;
 
 type Pair = (Transmission<PipeEnd>, Transmission<PipeEnd>);
 
-/// Handshakes a client/server pair over a duplex pipe and returns both ends.
-fn make_pair(client_key: ObfuscationKey, server_key: ObfuscationKey, mux: bool) -> Pair {
+/// Handshakes a client/server pair over a duplex pipe and returns both
+/// ends. The server allows both roles; the client requests `role` and both
+/// sides must agree on it.
+fn make_pair(client_key: ObfuscationKey, server_key: ObfuscationKey, role: SessionRole) -> Pair {
     let (client_io, server_io) = duplex_pair();
     scope(|s| {
         let server = s.spawn(move || {
             let mut server = Transmission::new(server_io, server_key);
-            server.handshake_server(TEST_SID, mux).unwrap();
+            let seen = server.handshake_server(TEST_SID, true).unwrap();
+            assert_eq!(seen, role, "server must learn the requested role");
             server
         });
         let mut client = Transmission::new(client_io, client_key);
-        let (sid, client_mux) = client.handshake_client().unwrap();
-        assert_eq!(client_mux, mux);
+        let sid = client.handshake_client(role).unwrap();
         assert_eq!(sid, TEST_SID);
         let server = server.join().unwrap();
         (client, server)
@@ -128,7 +130,11 @@ fn make_pair(client_key: ObfuscationKey, server_key: ObfuscationKey, mux: bool) 
 }
 
 fn default_pair() -> Pair {
-    make_pair(ObfuscationKey::default(), ObfuscationKey::default(), false)
+    make_pair(
+        ObfuscationKey::default(),
+        ObfuscationKey::default(),
+        SessionRole::MuxTunnel,
+    )
 }
 
 #[test]
@@ -180,11 +186,36 @@ fn pre_handshake_traffic_is_printable() {
 }
 
 #[test]
-fn mux_negotiation_parity() {
-    let (mut client, mut server) =
-        make_pair(ObfuscationKey::default(), ObfuscationKey::default(), true);
-    client.write(b"post-mux").unwrap();
-    assert_eq!(server.read().unwrap(), b"post-mux");
+fn bond_link_role_negotiated_on_single_port() {
+    // The non-default parity path: a bond-link request on the same port as
+    // plain tunnels, echoed and carried through the data plane.
+    let (mut client, mut server) = make_pair(
+        ObfuscationKey::default(),
+        ObfuscationKey::default(),
+        SessionRole::BondLink,
+    );
+    client.write(b"aggregated").unwrap();
+    assert_eq!(server.read().unwrap(), b"aggregated");
+}
+
+#[test]
+fn bond_link_role_refused_when_server_disallows() {
+    // `bond_enabled: false`: the server downgrades the session to a mux
+    // tunnel and echoes that; the honest client must fail with RoleRefused
+    // instead of speaking the aggregator protocol into a mux demux.
+    let (client_io, server_io) = duplex_pair();
+    let server_thread = std::thread::spawn(move || {
+        let mut server = Transmission::new(server_io, ObfuscationKey::default());
+        let role = server.handshake_server(7, false).unwrap();
+        // No post-handshake read here: the client aborts on the echo
+        // mismatch but stays alive until the join below, so a drain read
+        // would wait for an EOF that only the join's aftermath produces.
+        assert_eq!(role, SessionRole::MuxTunnel, "refused link downgrades");
+    });
+    let mut client = Transmission::new(client_io, ObfuscationKey::default());
+    let err = client.handshake_client(SessionRole::BondLink).unwrap_err();
+    server_thread.join().unwrap();
+    assert_eq!(err, Error::RoleRefused);
 }
 
 #[test]
@@ -200,7 +231,7 @@ fn flag_canary_mismatch_client_error() {
         // Server finishes its side; the client rejects the canary instead.
         let _ = server.handshake_server(7, false);
     });
-    let err = client.handshake_client().unwrap_err();
+    let err = client.handshake_client(SessionRole::MuxTunnel).unwrap_err();
     server_thread.join().unwrap();
     assert_eq!(err, Error::FlagsMismatch);
 }
@@ -219,7 +250,7 @@ fn kf_mismatch_breaks_handshake() {
     });
     // The client must fail too (EOF after the server tears down, or a decode
     // error); a "successful" handshake is impossible with mismatched kf.
-    assert!(client.handshake_client().is_err());
+    assert!(client.handshake_client(SessionRole::MuxTunnel).is_err());
     server_thread.join().unwrap();
 }
 
@@ -295,7 +326,7 @@ fn all_cipher_methods_interop() {
             transport,
             ..ObfuscationKey::default()
         };
-        let (mut client, mut server) = make_pair(key.clone(), key, false);
+        let (mut client, mut server) = make_pair(key.clone(), key, SessionRole::MuxTunnel);
         client.write(b"cipher-interop").unwrap();
         assert_eq!(server.read().unwrap(), b"cipher-interop");
         server.write(b"ok").unwrap();
@@ -311,7 +342,7 @@ fn binary_mode_after_handshake() {
         plaintext: false,
         ..ObfuscationKey::default()
     };
-    let (mut client, mut server) = make_pair(key.clone(), key, false);
+    let (mut client, mut server) = make_pair(key.clone(), key, SessionRole::MuxTunnel);
     let payload = vec![0x5a; 4096];
     client.write(&payload).unwrap();
     assert_eq!(server.read().unwrap(), payload);
@@ -369,30 +400,32 @@ fn session_id_and_state_reported() {
 
 #[test]
 fn zero_rtt_request_flies_before_confirm() {
-    // 0-RTT client: send phase -> request frame -> confirm phase. The
-    // server (unchanged, sends sid+nmux before reading the ivv) must decode
-    // the rekeyed request, and the client must still learn the sid/mux.
+    // 0-RTT client: send phase -> request frame -> confirm phase. The server
+    // must decode the rekeyed request, and the client must still learn the
+    // sid (the role echo is verified inside the confirm).
     let (client_io, server_io) = duplex_pair();
     scope(|s| {
         let server = s.spawn(move || {
             let mut server = Transmission::new(server_io, ObfuscationKey::default());
-            server.handshake_server(TEST_SID, true).unwrap();
+            let role = server.handshake_server(TEST_SID, true).unwrap();
+            assert_eq!(role, SessionRole::MuxTunnel);
             assert_eq!(server.read().unwrap(), b"0-rtt request");
             server.write(b"0-rtt reply").unwrap();
             server
         });
 
         let mut client = Transmission::new(client_io, ObfuscationKey::default());
-        client.handshake_client_send().unwrap();
+        client
+            .handshake_client_send(SessionRole::MuxTunnel)
+            .unwrap();
         // The request flies before sid/nmux have been read: 1 RTT saved.
         client.write(b"0-rtt request").unwrap();
         assert!(
             client.is_handshaked(),
             "tx is data-plane after the send phase"
         );
-        let (sid, mux) = client.handshake_client_confirm().unwrap();
+        let sid = client.handshake_client_confirm().unwrap();
         assert_eq!(sid, TEST_SID);
-        assert!(mux);
         assert_eq!(client.read().unwrap(), b"0-rtt reply");
         server.join().unwrap();
     });
@@ -423,7 +456,9 @@ fn zero_rtt_defers_canary_mismatch_to_confirm() {
         let _ = server.read();
     });
     let mut client = Transmission::new(client_io, client_key);
-    client.handshake_client_send().unwrap();
+    client
+        .handshake_client_send(SessionRole::MuxTunnel)
+        .unwrap();
     client.write(b"doomed request").unwrap();
     let err = client.handshake_client_confirm().unwrap_err();
     server_thread.join().unwrap();
@@ -439,7 +474,7 @@ fn abrupt_close_surfaces_io_error() {
         std::thread::sleep(std::time::Duration::from_millis(50));
         drop(server_io);
     });
-    let err = client.handshake_client().unwrap_err();
+    let err = client.handshake_client(SessionRole::MuxTunnel).unwrap_err();
     server_holder.join().unwrap();
     assert!(err.is_eof(), "expected EOF, got {err:?}");
 }
@@ -458,7 +493,7 @@ fn split_halves_interop_with_unsplit_peer() {
             let server_key = key.clone();
             let server = s.spawn(move || {
                 let mut server = Transmission::new(server_io, server_key);
-                server.handshake_server(TEST_SID, false).unwrap();
+                server.handshake_server(TEST_SID, true).unwrap();
                 let (mut tx, mut rx) = {
                     let rx_io = server.io().clone();
                     server.split_with(rx_io)
@@ -477,7 +512,7 @@ fn split_halves_interop_with_unsplit_peer() {
             });
 
             let mut client = Transmission::new(client_io, key);
-            client.handshake_client().unwrap();
+            client.handshake_client(SessionRole::MuxTunnel).unwrap();
             let rx_io = client.io().clone();
             let (mut tx, mut rx) = client.split_with(rx_io);
             let pump = scope(|s2| {
@@ -509,7 +544,7 @@ fn session_pair(plaintext: bool) -> (Session, Session) {
         plaintext,
         ..ObfuscationKey::default()
     };
-    let (client, server) = make_pair(key.clone(), key, false);
+    let (client, server) = make_pair(key.clone(), key, SessionRole::MuxTunnel);
     let (client, _io) = client.into_session();
     let (server, _io) = server.into_session();
     (client, server)
@@ -594,7 +629,7 @@ fn session_interops_with_streaming_peer() {
             plaintext,
             ..ObfuscationKey::default()
         };
-        let (client, mut server) = make_pair(key.clone(), key, false);
+        let (client, mut server) = make_pair(key.clone(), key, SessionRole::MuxTunnel);
         let (mut client_session, mut client_io) = client.into_session();
 
         // Session -> streaming read.
@@ -635,7 +670,7 @@ fn split_session_halves_interop() {
             plaintext,
             ..ObfuscationKey::default()
         };
-        let (client, mut server) = make_pair(key.clone(), key, false);
+        let (client, mut server) = make_pair(key.clone(), key, SessionRole::MuxTunnel);
         let (client_session, mut client_io) = client.into_session();
         let (mut tx, mut rx) = client_session.split();
 

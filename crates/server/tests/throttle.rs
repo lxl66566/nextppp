@@ -17,7 +17,7 @@ fn start_server(max_handshakes: Option<u64>) -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     let cfg = ServerConfig {
         listen: addr.to_string(),
-        bond: None,
+        bond_enabled: true,
         password: None,
         connect_timeout: 5,
         handshake_timeout: 10,
@@ -28,7 +28,7 @@ fn start_server(max_handshakes: Option<u64>) -> SocketAddr {
     };
     let rt = ServerRuntime::from_config(&cfg).unwrap();
     thread::spawn(move || {
-        nextppp_server::serve(listener, None, rt).unwrap();
+        nextppp_server::serve(listener, rt).unwrap();
     });
     addr
 }

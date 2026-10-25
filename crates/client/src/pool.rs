@@ -45,7 +45,7 @@ use nextppp_common::{
     pump,
     tunnel::{FrameReader, OutFrame, STREAM_SEND_TIMEOUT, StreamEvent, TxWire, run_writer},
 };
-use nextppp_core::{Session, Transmission};
+use nextppp_core::{Session, SessionRole, Transmission};
 use spdlog::prelude::*;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -521,20 +521,22 @@ async fn dial(rt: &Arc<ClientRuntime>) -> anyhow::Result<(Session, TcpStream)> {
     let host = rt.server_host.clone();
     let port = rt.server_port;
     let deadline = Instant::now() + rt.connect_timeout * (rt.connect_retries + 1);
-    dial_endpoint(rt, &host, port, deadline).await
+    dial_endpoint(rt, &host, port, deadline, SessionRole::MuxTunnel).await
 }
 
-/// Shared dial body: retries routine failures toward any endpoint (plain
-/// server or bond link listener) under one whole-phase `deadline`.
+/// Shared dial body: retries routine failures toward the server under one
+/// whole-phase `deadline`, requesting `role` in the handshake (plain mux
+/// tunnel or bond link; the server answers the role in its echo).
 pub(crate) async fn dial_endpoint(
     rt: &Arc<ClientRuntime>,
     host: &Host,
     port: u16,
     deadline: Instant,
+    role: SessionRole,
 ) -> anyhow::Result<(Session, TcpStream)> {
     let rt = Arc::clone(rt);
     let host = host.clone();
-    tokio::task::spawn_blocking(move || dial_sync(&rt, &host, port, deadline))
+    tokio::task::spawn_blocking(move || dial_sync(&rt, &host, port, deadline, role))
         .await
         .context("dial task join")?
 }
@@ -544,11 +546,12 @@ fn dial_sync(
     host: &Host,
     port: u16,
     deadline: Instant,
+    role: SessionRole,
 ) -> anyhow::Result<(Session, TcpStream)> {
     let mut attempt = 0u32;
     let mut last: Option<anyhow::Error> = None;
     while Instant::now() < deadline {
-        match dial_once(rt, host, port, deadline) {
+        match dial_once(rt, host, port, deadline, role) {
             Ok(v) => return Ok(v),
             Err(e) => {
                 if attempt >= rt.connect_retries || !retryable(&e) {
@@ -575,6 +578,7 @@ fn dial_once(
     host: &Host,
     port: u16,
     deadline: Instant,
+    role: SessionRole,
 ) -> anyhow::Result<(Session, TcpStream)> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
@@ -596,7 +600,7 @@ fn dial_once(
     stream.set_read_timeout(Some(budget))?;
     stream.set_write_timeout(Some(budget))?;
     let mut tx = Transmission::new(stream, Arc::clone(&rt.server_key));
-    tx.handshake_client().context("nextppp handshake")?;
+    tx.handshake_client(role).context("nextppp handshake")?;
     // Data plane: no timeouts (kernel keepalive, set by `tcp_connect`,
     // covers dead-peer detection instead).
     tx.io_mut().set_read_timeout(None)?;

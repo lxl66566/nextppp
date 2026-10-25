@@ -5,11 +5,11 @@
 
   // Optional second SOCKS5 inbound (bandwidth path): streams ride bonded
   // tunnels — one logical channel striped over several nextppp link
-  // connections, multiplying throughput and surviving single-link loss.
+  // sessions, multiplying throughput and surviving single-link loss.
   // Aggregation adds per-message scheduling variance, so keep interactive
   // traffic on `listen` and route bulk traffic (downloads, speed tests)
-  // here per rule in the front-end proxy. Requires the server's bond
-  // listener and "server.bond_address" below.
+  // here per rule in the front-end proxy. Links dial the server's regular
+  // address below and declare their role in the handshake.
   // "bond": {
   //     "listen": "127.0.0.1:1081",
   //     "links": 3,
@@ -24,9 +24,6 @@
   // Remote nextppp server.
   "server": {
     "address": "your.server.example:6666",
-    // Link-listener address of the server's bond section; required iff
-    // "bond" is configured above.
-    // "bond_address": "your.server.example:6667",
     // "connect_timeout": 10,
     // Extra connect attempts after a routine transport failure
     // (RST/timeout). Raises the success rate on RST-bombed links

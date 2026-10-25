@@ -5,9 +5,13 @@
 //!
 //! ```text
 //! client: nop* ->          <- sid (server session id)
-//! client:      ivv ->      <- nmux (mux parity + flag canary in high 64 bits)
+//! client:      ivv ->      <- nmux (role echo in parity + flag canary in high 64 bits)
 //! both:   rekey ciphers from ivv, switch to data-plane framing
 //! ```
+//!
+//! The ivv high word doubles as the session-role request (see
+//! [`SessionRole`]): one listen port serves both plain mux tunnels and bond
+//! links, and the server answers the requested role in the nmux parity.
 //!
 //! session-id packet layout: `[kfs[4]] [4-round XOR encrypted body]` where
 //! the body starts with the decimal id, a random 0x20..0x2F separator, then
@@ -29,6 +33,53 @@ use crate::{
 pub const CANARY_MAGIC: u64 = 0xc0de_c0de_c0de;
 /// Mask selecting the 48 magic bits inside the canary's high word.
 pub const CANARY_MAGIC_MASK: u64 = 0x0000_ffff_ffff_ffff;
+
+/// Session role requested via the ivv high word and echoed in the nmux
+/// parity: one listen port serves both, so the role is a per-connection
+/// property of the handshake instead of the listener that accepted it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SessionRole {
+    /// Plain mux tunnel: the post-handshake payload is mux frames. The
+    /// default of untagged (legacy random) ivvs.
+    #[default]
+    MuxTunnel,
+    /// Bond link: the payload joins an aggregated channel of the link
+    /// aggregator.
+    BondLink,
+}
+
+/// Magic prefix of the session-role tag in the ivv high word (48 bits).
+pub const ROLE_MAGIC: u64 = 0xfeed_c0de_5eed;
+/// Mask selecting the 48 magic bits inside the ivv's high word.
+pub const ROLE_MAGIC_MASK: u64 = 0x0000_ffff_ffff_ffff;
+/// Role flag in the ivv high word (bit 48, first bit above the magic):
+/// the session wants to join an aggregated bond channel.
+pub const ROLE_BOND_LINK: u64 = 1 << 48;
+
+/// Builds the ivv high word tagging `role`.
+#[must_use]
+pub fn role_tag(role: SessionRole) -> u64 {
+    let flags = match role {
+        SessionRole::MuxTunnel => 0,
+        SessionRole::BondLink => ROLE_BOND_LINK,
+    };
+    ROLE_MAGIC | flags
+}
+
+/// Parses the session role out of a client ivv. A legacy client's random
+/// high word matches the magic with probability 2^-48, so untagged ivvs
+/// fall back to [`SessionRole::MuxTunnel`]; an unknown tag bit likewise
+/// degrades to the default and fails that client's echo check instead of
+/// guessing at an unsupported role.
+#[must_use]
+pub fn role_from_ivv(ivv: u128) -> SessionRole {
+    let high = (ivv >> 64) as u64;
+    if high & ROLE_MAGIC_MASK == ROLE_MAGIC && high & ROLE_BOND_LINK != 0 {
+        SessionRole::BondLink
+    } else {
+        SessionRole::MuxTunnel
+    }
+}
 
 /// A parsed handshake session-id packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -321,6 +372,28 @@ mod tests {
         other = key.clone();
         other.kf ^= 0x1000; // differs outside the 12 canary bits
         assert_eq!(flag_canary(&other), c);
+    }
+
+    #[test]
+    fn role_tag_roundtrip() {
+        for role in [SessionRole::MuxTunnel, SessionRole::BondLink] {
+            let ivv = (u128::from(role_tag(role)) << 64) | 0x0123_4567_89ab_cdef;
+            assert_eq!(role_from_ivv(ivv), role);
+        }
+        // Untagged high words (legacy random ivvs) and unknown tag bits
+        // both degrade to the default plain-tunnel role.
+        assert_eq!(role_from_ivv(u128::MAX), SessionRole::MuxTunnel);
+        let unknown = ROLE_MAGIC | (1 << 49); // a role this build does not know
+        let ivv = u128::from(unknown) << 64;
+        assert_eq!(role_from_ivv(ivv), SessionRole::MuxTunnel);
+        // A near-miss magic must not classify as a tag.
+        let near = (ROLE_MAGIC ^ 1) | ROLE_BOND_LINK;
+        assert_eq!(
+            role_from_ivv(u128::from(near) << 64),
+            SessionRole::MuxTunnel
+        );
+        // Tagged ivvs are never zero, whatever the nonce half.
+        assert_ne!((u128::from(role_tag(SessionRole::MuxTunnel)) << 64), 0);
     }
 
     #[test]

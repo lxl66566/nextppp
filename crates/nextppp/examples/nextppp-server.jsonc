@@ -1,12 +1,13 @@
 {
-  // Listen address for nextppp client connections.
+  // Listen address for nextppp client connections. One port serves both
+  // session roles: plain tunnels and bond links (aggregated-tunnel
+  // members), declared by the client in the handshake.
   "listen": "0.0.0.0:6666",
 
-  // Optional listen address for bonded-tunnel link connections. Links are
-  // ordinary nextppp sessions, indistinguishable from plain tunnels on
-  // the wire; the aggregator protocol travels encrypted inside them.
-  // Point the client's "server.bond_address" here.
-  // "bond": { "listen": "0.0.0.0:6667" },
+  // Accept bond links. Links are authenticated sessions like plain
+  // tunnels, indistinguishable from them on the wire; set false only to
+  // forbid the per-client link fan-out pattern on this deployment.
+  // "bond_enabled": true,
 
   // Shared tunnel password. Backs both obfuscation cipher keys when they
   // are left unset; sharing one password is safe (the core KDF separates

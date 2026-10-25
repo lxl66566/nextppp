@@ -58,8 +58,8 @@ use crate::{
         },
     },
     handshake::{
-        CANARY_MAGIC, CANARY_MAGIC_MASK, SessionPacket, flag_canary, max_nop_packets, nop_rounds,
-        pack_session_id, unpack_session_id,
+        CANARY_MAGIC, CANARY_MAGIC_MASK, SessionPacket, SessionRole, flag_canary, max_nop_packets,
+        nop_rounds, pack_session_id, role_from_ivv, role_tag, unpack_session_id,
     },
 };
 
@@ -465,10 +465,10 @@ pub struct Transmission<T, R = StdRng> {
     tx: TxCore<R>,
     rx: RxCore,
     session_id: SessionId,
-    /// Client ivv awaiting the confirm phase (`Some` between
-    /// [`Transmission::handshake_client_send`] and
+    /// Client ivv and requested role awaiting the confirm phase (`Some`
+    /// between [`Transmission::handshake_client_send`] and
     /// [`Transmission::handshake_client_confirm`]).
-    pending_ivv: Option<u128>,
+    pending: Option<(u128, SessionRole)>,
 }
 
 impl<T> Transmission<T, StdRng> {
@@ -501,7 +501,7 @@ impl<T, R: Rng> Transmission<T, R> {
             tx: TxCore::new(Arc::clone(&key), rng),
             rx: RxCore::new(key),
             session_id: 0,
-            pending_ivv: None,
+            pending: None,
         }
     }
 
@@ -573,7 +573,7 @@ impl<T, R: Rng> Transmission<T, R> {
             tx,
             rx,
             session_id,
-            pending_ivv: _,
+            pending: _,
         } = self;
         (crate::session::Session::from_cores(tx, rx, session_id), io)
     }
@@ -604,15 +604,17 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
     // Handshake
     // ------------------------------------------------------------------
 
-    /// Runs the client-side handshake. Returns `(server_session_id, mux)`;
-    /// `mux` reflects the server's multiplexing decision (parity of `nmux`).
+    /// Runs the client-side handshake. Returns the server session id; the
+    /// requested [`SessionRole`] is tagged into the ivv and the server's
+    /// echo (nmux parity) is verified, so a refused role fails here with
+    /// [`Error::RoleRefused`].
     ///
     /// This is [`Self::handshake_client_send`] + [`Self::handshake_client_confirm`]
     /// back to back; callers that want to fly a request 1 RTT earlier split
     /// the phases themselves.
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "Transmission"))]
-    pub fn handshake_client(&mut self) -> Result<(SessionId, bool)> {
-        self.handshake_client_send()?;
+    pub fn handshake_client(&mut self, role: SessionRole) -> Result<SessionId> {
+        self.handshake_client_send(role)?;
         self.handshake_client_confirm()
     }
 
@@ -627,29 +629,33 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
     /// reads the ivv, so client->server `[NOP..][ivv][rekeyed frames]` and
     /// server->client `[sid][nmux][rekeyed frames]` never interleave old
     /// and new ciphers within a direction.
-    pub fn handshake_client_send(&mut self) -> Result<()> {
+    pub fn handshake_client_send(&mut self, role: SessionRole) -> Result<()> {
         self.handshake_prelude()?;
 
-        let ivv: u128 = self.tx.rng.random();
-        if ivv == 0 {
-            return Err(Error::HandshakeFailed("ivv generated as zero"));
-        }
+        // Role-tagged ivv: the high word tells a same-port server which
+        // session role this connection wants (see [`SessionRole`]); the
+        // low 64 bits stay the rekey nonce (the magic word alone keeps
+        // the ivv non-zero). A legacy server treats the ivv as an opaque
+        // nonce and answers with its own listener-based parity, which the
+        // confirm phase checks.
+        let nonce = self.tx.rng.random::<u64>();
+        let ivv = (u128::from(role_tag(role)) << 64) | u128::from(nonce);
         self.send_session_id(ivv)?;
 
         self.tx.rekey(ivv);
         self.tx.on_handshake_complete();
-        self.pending_ivv = Some(ivv);
+        self.pending = Some((ivv, role));
         Ok(())
     }
 
     /// Client handshake, phase 2: reads the server sid and nmux (both are
     /// sent with pre-rekey ciphers, so the **rx** direction is rekeyed only
-    /// afterwards), validates the obfuscation-flag canary, and switches rx
-    /// to data-plane framing. Must run before the first read after
-    /// [`Self::handshake_client_send`].
-    pub fn handshake_client_confirm(&mut self) -> Result<(SessionId, bool)> {
-        let ivv = self
-            .pending_ivv
+    /// afterwards), validates the obfuscation-flag canary and the session
+    /// role echo, and switches rx to data-plane framing. Must run before
+    /// the first read after [`Self::handshake_client_send`].
+    pub fn handshake_client_confirm(&mut self) -> Result<SessionId> {
+        let (ivv, role) = self
+            .pending
             .take()
             .ok_or(Error::HandshakeFailed("confirm without send phase"))?;
 
@@ -675,17 +681,30 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
             }
         }
 
+        // Role echo: the server answers the ivv role tag in the nmux parity.
+        // A mismatch means it refused the role (bond links disabled, or a
+        // legacy server whose fixed listener role differs).
+        if mux != (role == SessionRole::MuxTunnel) {
+            return Err(Error::RoleRefused);
+        }
+
         self.rx.rekey(ivv);
         self.rx.on_handshake_complete();
         self.session_id = sid;
-        Ok((sid, mux))
+        Ok(sid)
     }
 
     /// Runs the server-side handshake for an upper-layer assigned non-zero
-    /// `session_id`. `mux` is the multiplexing request encoded into `nmux`'s
-    /// parity for the client.
+    /// `session_id`. The session role is read from the client's ivv tag; a
+    /// bond-link request is downgraded to [`SessionRole::MuxTunnel`] (and
+    /// echoed as such) when `allow_bond` is false. Returns the effective
+    /// role so a same-port caller can route the session.
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "Transmission"))]
-    pub fn handshake_server(&mut self, session_id: SessionId, mux: bool) -> Result<()> {
+    pub fn handshake_server(
+        &mut self,
+        session_id: SessionId,
+        allow_bond: bool,
+    ) -> Result<SessionRole> {
         if session_id == 0 {
             return Err(Error::InvalidSessionId);
         }
@@ -693,26 +712,37 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
 
         self.send_session_id(session_id)?;
 
+        // Read the client ivv before nmux so the parity can echo the role
+        // the client requested. The reorder is wire-invisible: within each
+        // direction the pre-rekey packets (`[sid][nmux]` / `[nop..][ivv]`)
+        // still precede the rekey switch, and the client never blocks on a
+        // read before sending its ivv.
+        let ivv = self.read_session_id()?;
+        if ivv == 0 {
+            return Err(Error::HandshakeFailed("client ivv is zero"));
+        }
+        let requested = role_from_ivv(ivv);
+        let effective = match requested {
+            SessionRole::BondLink if !allow_bond => SessionRole::MuxTunnel,
+            role => role,
+        };
+
         let low: u64 = self.tx.rng.random();
         let mut nmux = (u128::from(flag_canary(&self.tx.key)) << 64) | u128::from(low);
-        // Parity carries the mux decision. Bit ops instead of `+1` loops: an
+        // Parity carries the role echo. Bit ops instead of `+1` loops: an
         // increment at u64::MAX would carry into the canary word.
-        if mux {
+        if effective == SessionRole::MuxTunnel {
             nmux |= 1;
         } else {
             nmux &= !1;
         }
         self.send_session_id(nmux)?;
 
-        let ivv = self.read_session_id()?;
-        if ivv == 0 {
-            return Err(Error::HandshakeFailed("client ivv is zero"));
-        }
         self.rekey(ivv);
         self.tx.on_handshake_complete();
         self.rx.on_handshake_complete();
         self.session_id = session_id;
-        Ok(())
+        Ok(effective)
     }
 
     /// Sends the NOP noise prelude.
@@ -877,7 +907,7 @@ impl<T: Read + Write, R: Rng> Transmission<T, R> {
             tx,
             rx,
             session_id: _,
-            pending_ivv: _,
+            pending: _,
         } = self;
         (TransmissionTx { io, core: tx }, TransmissionRx {
             io: rx_io,

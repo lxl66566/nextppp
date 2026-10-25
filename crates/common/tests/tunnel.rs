@@ -14,7 +14,7 @@ use nextppp_common::{
     mux::{FrameKind, encode_varint, parse_frame},
     tunnel::{FrameReader, OutFrame, TxWire, run_writer},
 };
-use nextppp_core::{Error, ObfuscationKey, SessionRx, SessionTx, Transmission};
+use nextppp_core::{Error, ObfuscationKey, SessionRole, SessionRx, SessionTx, Transmission};
 use tokio::sync::mpsc;
 
 /// Handshakes a loopback pair and returns both ends as split async
@@ -35,7 +35,7 @@ fn tunnel_pair() -> (
         std::net::TcpStream::connect(addr).unwrap(),
         ObfuscationKey::default(),
     );
-    client.handshake_client().unwrap();
+    client.handshake_client(SessionRole::MuxTunnel).unwrap();
     let server = server.join().unwrap();
 
     let to_async = |t: Transmission<std::net::TcpStream>| {

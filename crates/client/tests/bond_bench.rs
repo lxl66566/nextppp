@@ -31,8 +31,7 @@ use std::{
 
 use nextppp_client::ClientRuntime;
 use nextppp_common::config::{
-    BondClientSection, BondServerSection, ClientConfig, MuxSection, ObfuscationConfig,
-    ServerConfig, ServerSection,
+    BondClientSection, ClientConfig, MuxSection, ObfuscationConfig, ServerConfig, ServerSection,
 };
 use nextppp_server::ServerRuntime;
 
@@ -96,17 +95,13 @@ fn start_echo() -> SocketAddr {
     addr
 }
 
-/// Server with a bond link listener; returns (plain, bond) addresses.
-fn start_bond_server() -> (SocketAddr, SocketAddr) {
+/// Server on one port serving both roles (plain tunnels and bond links).
+fn start_bond_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let bond_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let bond_addr = bond_listener.local_addr().unwrap();
     let cfg = ServerConfig {
         listen: addr.to_string(),
-        bond: Some(BondServerSection {
-            listen: bond_addr.to_string(),
-        }),
+        bond_enabled: true,
         password: None,
         connect_timeout: 5,
         handshake_timeout: 10,
@@ -119,19 +114,15 @@ fn start_bond_server() -> (SocketAddr, SocketAddr) {
     thread::Builder::new()
         .name("bond-bench-server".to_owned())
         .spawn(move || {
-            nextppp_server::serve(listener, Some(bond_listener), rt).unwrap();
+            nextppp_server::serve(listener, rt).unwrap();
         })
         .unwrap();
-    (addr, bond_addr)
+    addr
 }
 
 /// Client with both inbounds and a bond pool of `links` links per tunnel;
 /// returns (plain inbound, bond inbound).
-fn start_bond_client(
-    server: SocketAddr,
-    bond_listener: SocketAddr,
-    links: u32,
-) -> (SocketAddr, SocketAddr) {
+fn start_bond_client(server: SocketAddr, links: u32) -> (SocketAddr, SocketAddr) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let bond_in = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -148,7 +139,6 @@ fn start_bond_client(
         max_connections: None,
         server: ServerSection {
             address: server.to_string(),
-            bond_address: Some(bond_listener.to_string()),
             connect_timeout: 5,
             connect_retries: 1,
             mux: MuxSection {
@@ -388,7 +378,7 @@ fn measure(inbound: SocketAddr, echo: SocketAddr, size: usize) -> Vec<f64> {
 #[ignore = "slow multi-phase benchmark (256 + 64 MiB per run); run manually in release mode"]
 fn bond_link_scaling() {
     let echo = start_echo();
-    let (server, bond_listener) = start_bond_server();
+    let server = start_bond_server();
     let cores = thread::available_parallelism().map_or(1, std::num::NonZero::get);
     eprintln!("bond bench: loopback, {cores} logical cores");
 
@@ -398,43 +388,34 @@ fn bond_link_scaling() {
     run_matrix(
         "phase 1: unshaped (pipeline ceiling)",
         server,
-        bond_listener,
         echo,
         total_bytes(),
     );
 
-    // Phase 2: every TCP flow capped at 20 MiB/s — the per-flow WAN ceiling
-    // aggregation exists to beat.
-    let (plain_shaped, plain_log) = start_shaper(server, SHAPED_FLOW_CAP);
-    let (bond_shaped, bond_log) = start_shaper(bond_listener, SHAPED_FLOW_CAP);
+    // Phase 2: one shaper fronting the single server port caps every TCP
+    // flow (plain tunnel or bond link alike) at 20 MiB/s — the per-flow
+    // WAN ceiling aggregation exists to beat.
+    let (shaped, log) = start_shaper(server, SHAPED_FLOW_CAP);
     let phase2 = Instant::now();
     run_matrix(
         "phase 2: per-flow shaped at 20 MiB/s (WAN per-flow ceiling)",
-        plain_shaped,
-        bond_shaped,
+        shaped,
         echo,
         shaped_bytes(),
     );
-    print_flows("plain", phase2, &plain_log);
-    print_flows("bond", phase2, &bond_log);
+    print_flows("server", phase2, &log);
 }
 
-/// Runs the plain + bond-`LINKS` matrix against `plain_via`/`bond_via`
-/// (endpoints directly, or a shaping forwarder in front of them): one
-/// client per link count, one bulk stream per inbound. Prints per-run and
+/// Runs the plain + bond-`LINKS` matrix against `via` (the server
+/// endpoint directly, or a shaping forwarder in front of it): one client
+/// per link count, one bulk stream per inbound. Prints per-run and
 /// best-of rates; returns the per-path best one-way rates (plain first).
-fn run_matrix(
-    name: &str,
-    plain_via: SocketAddr,
-    bond_via: SocketAddr,
-    echo: SocketAddr,
-    size: usize,
-) -> Vec<f64> {
+fn run_matrix(name: &str, via: SocketAddr, echo: SocketAddr, size: usize) -> Vec<f64> {
     // One client per link count; the links=1 client's plain inbound doubles
     // as the no-aggregator baseline (identical config otherwise).
     let mut inbounds: Vec<(String, SocketAddr)> = Vec::new();
     for links in LINKS {
-        let (plain_in, bond_in) = start_bond_client(plain_via, bond_via, links);
+        let (plain_in, bond_in) = start_bond_client(via, links);
         if links == 1 {
             inbounds.push(("plain  1 tcp".to_owned(), plain_in));
         }

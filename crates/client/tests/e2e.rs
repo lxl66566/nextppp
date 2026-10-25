@@ -19,8 +19,7 @@ use nextppp_client::ClientRuntime;
 use nextppp_common::{
     addr::{Host, ProxyAddr},
     config::{
-        BondClientSection, BondServerSection, ClientConfig, MuxSection, ObfuscationConfig,
-        ServerConfig, ServerSection,
+        BondClientSection, ClientConfig, MuxSection, ObfuscationConfig, ServerConfig, ServerSection,
     },
     dns::DnsCache,
     mux::{FrameHeader, FrameKind, parse_frame},
@@ -68,7 +67,7 @@ fn start_server() -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     let cfg = ServerConfig {
         listen: addr.to_string(),
-        bond: None,
+        bond_enabled: true,
         password: None,
         connect_timeout: 5,
         handshake_timeout: 10,
@@ -79,7 +78,7 @@ fn start_server() -> SocketAddr {
     };
     let rt = ServerRuntime::from_config(&cfg).unwrap();
     thread::spawn(move || {
-        nextppp_server::serve(listener, None, rt).unwrap();
+        nextppp_server::serve(listener, rt).unwrap();
     });
     addr
 }
@@ -110,7 +109,6 @@ fn start_client_full(
         max_connections: None,
         server: ServerSection {
             address: server.to_string(),
-            bond_address: None,
             connect_timeout,
             connect_retries,
             mux: MuxSection {
@@ -499,17 +497,13 @@ fn echo_roundtrip(s: &mut TcpStream, payload: &[u8]) {
 // Bonded tunnels
 // ---------------------------------------------------------------------------
 
-/// Server with a bond link listener; returns (plain, bond) addresses.
-fn start_bond_server() -> (SocketAddr, SocketAddr) {
+/// Server on one port serving both roles (plain tunnels and bond links).
+fn start_bond_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let bond_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let bond_addr = bond_listener.local_addr().unwrap();
     let cfg = ServerConfig {
         listen: addr.to_string(),
-        bond: Some(BondServerSection {
-            listen: bond_addr.to_string(),
-        }),
+        bond_enabled: true,
         password: None,
         connect_timeout: 5,
         handshake_timeout: 10,
@@ -520,13 +514,13 @@ fn start_bond_server() -> (SocketAddr, SocketAddr) {
     };
     let rt = ServerRuntime::from_config(&cfg).unwrap();
     thread::spawn(move || {
-        nextppp_server::serve(listener, Some(bond_listener), rt).unwrap();
+        nextppp_server::serve(listener, rt).unwrap();
     });
-    (addr, bond_addr)
+    addr
 }
 
 /// Client with both inbounds; returns (plain inbound, bond inbound).
-fn start_bond_client(server: SocketAddr, bond_listener: SocketAddr) -> (SocketAddr, SocketAddr) {
+fn start_bond_client(server: SocketAddr) -> (SocketAddr, SocketAddr) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let bond_in = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -543,7 +537,6 @@ fn start_bond_client(server: SocketAddr, bond_listener: SocketAddr) -> (SocketAd
         max_connections: None,
         server: ServerSection {
             address: server.to_string(),
-            bond_address: Some(bond_listener.to_string()),
             connect_timeout: 5,
             connect_retries: 1,
             mux: MuxSection {
@@ -566,8 +559,8 @@ fn start_bond_client(server: SocketAddr, bond_listener: SocketAddr) -> (SocketAd
 #[test]
 fn bond_inbound_roundtrip_alongside_plain() {
     let echo = start_echo();
-    let (server, bond_listener) = start_bond_server();
-    let (plain_in, bond_in) = start_bond_client(server, bond_listener);
+    let server = start_bond_server();
+    let (plain_in, bond_in) = start_bond_client(server);
     let target = Host::Ip("127.0.0.1".parse().unwrap());
 
     // Bond inbound: several streams over one aggregated channel of 3 links.
@@ -589,20 +582,52 @@ fn bond_inbound_roundtrip_alongside_plain() {
     echo_roundtrip(&mut plain, b"plain alongside bond");
 }
 
-/// Bond config validation: an inbound without `server.bond_address` is
-/// rejected at load time.
+/// Bond config validation: `links: 0` is rejected at load time.
 #[test]
-fn bond_inbound_requires_bond_address() {
+fn bond_links_zero_rejected() {
     let cfg = r#"{
         "listen": "127.0.0.1:1080",
-        "bond": { "listen": "127.0.0.1:1081", "links": 2 },
+        "bond": { "listen": "127.0.0.1:1081", "links": 0 },
         "server": { "address": "example.com:6666" },
     }"#;
     let tmp = std::env::temp_dir().join("nextppp-bond-cfg-test.jsonc");
     std::fs::write(&tmp, cfg).unwrap();
     let err = ClientConfig::load(&tmp).unwrap_err();
     let _ = std::fs::remove_file(&tmp);
-    assert!(err.to_string().contains("bond_address"));
+    assert!(err.to_string().contains("bond.links"));
+}
+
+/// A server with `bond_enabled: false` refuses the link role at the
+/// handshake; the bond inbound must surface a SOCKS failure instead of
+/// hanging or corrupting the plain path.
+#[test]
+fn bond_links_refused_by_disabled_server() {
+    let echo = start_echo();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = listener.local_addr().unwrap();
+    let cfg = ServerConfig {
+        listen: server.to_string(),
+        bond_enabled: false,
+        password: None,
+        connect_timeout: 5,
+        handshake_timeout: 10,
+        max_connections: None,
+        max_handshakes: None,
+        max_streams_per_conn: None,
+        obfuscation: ObfuscationConfig::default(),
+    };
+    let rt = ServerRuntime::from_config(&cfg).unwrap();
+    thread::spawn(move || {
+        nextppp_server::serve(listener, rt).unwrap();
+    });
+    let (_plain_in, bond_in) = start_bond_client(server);
+
+    let rep = socks5_connect_rep(
+        bond_in,
+        &Host::Ip("127.0.0.1".parse().unwrap()),
+        echo.port(),
+    );
+    assert_eq!(rep, 0x01, "bond inbound must fail cleanly when refused");
 }
 
 // ---------------------------------------------------------------------------

@@ -68,12 +68,8 @@ fn run_server(config: &Path, init: Option<PathBuf>) -> anyhow::Result<()> {
     }
     let cfg = nextppp_common::ServerConfig::load(config)?;
     let listener = bind_listen(&cfg.listen)?;
-    let bond_listener = match &cfg.bond {
-        Some(bond) => Some(bind_listen(&bond.listen)?),
-        None => None,
-    };
     let rt = nextppp_server::ServerRuntime::from_config(&cfg)?;
-    nextppp_server::serve(listener, bond_listener, rt)
+    nextppp_server::serve(listener, rt)
 }
 
 fn run_client(config: &Path, init: Option<PathBuf>) -> anyhow::Result<()> {

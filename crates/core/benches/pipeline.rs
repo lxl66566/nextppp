@@ -19,7 +19,7 @@ use std::{
 };
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use nextppp_core::{ObfuscationKey, Transmission};
+use nextppp_core::{ObfuscationKey, SessionRole, Transmission};
 
 /// IO sink that discards writes and never reads. Retained for bench
 /// authors who want a transport-free codec loop (unused by the current
@@ -58,7 +58,9 @@ fn handshaked_pair(key: &ObfuscationKey) -> (Transmission<TcpStream>, Transmissi
         TcpStream::connect(addr).expect("loopback connect"),
         key.clone(),
     );
-    client.handshake_client().expect("handshake");
+    client
+        .handshake_client(SessionRole::MuxTunnel)
+        .expect("handshake");
     (client, server.join().expect("server thread"))
 }
 
